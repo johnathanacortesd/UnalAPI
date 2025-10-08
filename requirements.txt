@@ -1,0 +1,9 @@
+streamlit
+pandas
+openpyxl
+openai==0.28.0
+tqdm
+scikit-learn
+unidecode
+nltk
+joblib
