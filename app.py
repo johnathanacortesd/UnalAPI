@@ -37,7 +37,7 @@ OPENAI_MODEL_EMBEDDING = "text-embedding-3-small"
 OPENAI_MODEL_CLASIFICACION = "gpt-4.1-nano-2025-04-14"
 
 # Parámetros de rendimiento y similitud
-CONCURRENT_REQUESTS = 20 # Reducido para priorizar la estabilidad con el nuevo enfoque
+CONCURRENT_REQUESTS = 20
 SIMILARITY_THRESHOLD_TITULOS = 0.95 
 MAX_TOKENS_PROMPT_TXT = 6000
 NUM_TEMAS_GENERALES = 30
@@ -124,7 +124,7 @@ def corregir_texto(text: Any) -> Any:
     if not isinstance(text, str): return text if text is not None else ""
     text = re.sub(r'(<br\s*/?>|\[\.\.\.\])+', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
-    match = re.search(r"[\wÁÉÍÓÚÑ]", text) # Busca el primer caracter alfanumérico
+    match = re.search(r"[\wÁÉÍÓÚÑ]", text)
     if match: text = text[match.start():]
     if text and not text.endswith(('.', '...', '?', '!')): text = text + "..."
     return text
@@ -145,7 +145,7 @@ def get_embedding(texto: str) -> Optional[List[float]]:
     except Exception: return None
 
 # ======================================
-# Análisis con IA (v9.0 - MÁXIMA PRECISIÓN)
+# Análisis con IA (v9.1 - MÁXIMA PRECISIÓN)
 # ======================================
 class ClasificadorIA:
     def __init__(self, marca: str):
@@ -202,7 +202,7 @@ def consolidar_temas_generales(temas_especificos: List[str], p_bar) -> List[str]
         mapa_cluster_a_temas[label].append(temas_con_emb[i])
     
     for lista_temas in mapa_cluster_a_temas.values():
-        tema_general = max(lista_temas, key=len) # El más descriptivo es el general
+        tema_general = max(lista_temas, key=len)
         for tema in lista_temas:
             mapa_especifico_a_general[tema] = tema_general
             
@@ -362,22 +362,29 @@ async def run_full_process_async(dossier_file, region_file, internet_file, brand
             for i, f in enumerate(asyncio.as_completed(tasks), 1):
                 resultados.append(await f); p_bar.progress(i / total_tasks, text=f"Analizando noticia {i}/{total_tasks}")
             
-            df_unal_to_analyze['tono_ai'] = [res['tono'] for res in resultados]
+            df_unal_to_analyze[key_map["tonoai"]] = [res['tono'] for res in resultados]
             temas_especificos = [res['tema_especifico'] for res in resultados]
-            df_unal_to_analyze['tema_especifico'] = temas_especificos
+            df_unal_to_analyze[key_map["temaespecifico"]] = temas_especificos
             
             temas_generales = consolidar_temas_generales(temas_especificos, p_bar)
-            df_unal_to_analyze['tema_general'] = temas_generales
-
-            # Mapear nombres de columnas a los normalizados para la actualización
-            df_unal_to_analyze.rename(columns={'tono_ai': key_map["tonoai"], 'tema_especifico': key_map["temaespecifico"], 'tema_general': key_map["temageneral"]}, inplace=True)
+            df_unal_to_analyze[key_map["temageneral"]] = temas_generales
             
-            # Actualizar el DataFrame principal
-            df_all.set_index('original_index', inplace=True)
-            df_unal_to_analyze.set_index('original_index', inplace=True)
-            df_all.update(df_unal_to_analyze[[key_map["tonoai"], key_map["temaespecifico"], key_map["temageneral"]]])
-            df_all.reset_index(inplace=True)
+            # ==========================================================
+            # CORRECCIÓN CRÍTICA: Usar MERGE en lugar de UPDATE
+            # ==========================================================
+            df_results_only = df_unal_to_analyze[['original_index', key_map["tonoai"], key_map["temaespecifico"], key_map["temageneral"]]]
+            df_all = df_all.merge(df_results_only, on='original_index', how='left')
+
+            # Rellenar las columnas nuevas en las filas que no fueron analizadas
+            for col_key in [key_map["tonoai"], key_map["temaespecifico"], key_map["temageneral"]]:
+                # Marcar duplicados
+                df_all.loc[df_all['is_duplicate'] == True, col_key] = df_all.loc[df_all['is_duplicate'] == True, col_key].fillna('Duplicada')
+                # Dejar en blanco el resto
+                df_all[col_key] = df_all[col_key].fillna('')
+
             all_processed_rows = df_all.to_dict('records')
+            # ==========================================================
+
         s.update(label="✅ **Paso 2/3:** Análisis con IA completado", state="complete")
 
     with st.status("📊 **Paso 3/3:** Generando informe final...", expanded=True) as s:
@@ -400,7 +407,7 @@ def main():
             dossier_file = col1.file_uploader("**1. Dossier Principal** (.xlsx)", type=["xlsx"])
             region_file = col2.file_uploader("**2. Mapeo de Región** (.xlsx)", type=["xlsx"])
             internet_file = col3.file_uploader("**3. Mapeo Internet** (.xlsx)", type=["xlsx"])
-            st.info("El análisis de IA se ejecutará para la marca **'Universidad Nacional de Colombia'** con el modelo `gpt-4o` para máxima precisión.")
+            st.info("El análisis de IA se ejecutará con el modelo `gpt-4o` para máxima precisión.")
 
             if st.form_submit_button("🚀 **INICIAR ANÁLISIS COMPLETO (MÁXIMA PRECISIÓN)**", use_container_width=True, type="primary"):
                 if not all([dossier_file, region_file, internet_file]):
@@ -419,7 +426,7 @@ def main():
             st.session_state.password_correct = pwd
             st.rerun()
 
-    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v9.0 (Enfoque de Máxima Precisión) | Adaptado para la Universidad Nacional</p></div>", unsafe_allow_html=True)
+    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v9.1 (Máxima Precisión) | Adaptado para la Universidad Nacional</p></div>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
