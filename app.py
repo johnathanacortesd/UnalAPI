@@ -6,7 +6,7 @@ import pandas as pd
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font
 from collections import defaultdict, Counter
-from diflib import SequenceMatcher
+from difflib import SequenceMatcher  # <-- CORRECCIÓN APLICADA AQUÍ
 from copy import deepcopy
 import datetime
 import io
@@ -460,12 +460,11 @@ async def run_full_process_async(dossier_file, region_file, internet_file, brand
             st.info(f"💡 Optimización: {len(rows_for_unal_analysis)} noticias se procesarán en {len(comp)} llamadas únicas a la IA.")
             
             representantes_info = {}
+            textos_para_seleccionar = [(row.get(key_map.get("titulo"), "") or "") for row in rows_for_unal_analysis]
             for cid, idxs in comp.items():
-                textos_grupo = [(r.get(key_map.get("titulo"), "") or "") for i in idxs if (r := rows_for_unal_analysis[i])]
-                idx_rep_en_grupo, _ = seleccionar_representante(list(range(len(idxs))), textos_grupo)
-                if idx_rep_en_grupo != -1:
-                    original_row_index = idxs[idx_rep_en_grupo]
-                    row = rows_for_unal_analysis[original_row_index]
+                idx_rep_global, _ = seleccionar_representante(idxs, textos_para_seleccionar)
+                if idx_rep_global != -1:
+                    row = rows_for_unal_analysis[idx_rep_global]
                     representantes_info[cid] = {'titulo': row.get(key_map.get("titulo"), ""), 'resumen': row.get(key_map.get("resumen"), "")}
 
             clasificador = ClasificadorIA(brand_name, brand_aliases)
@@ -550,7 +549,7 @@ def main():
             st.session_state.password_correct = pwd
             st.rerun()
 
-    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v6.4 | Calidad de temas por extracción directa</p></div>", unsafe_allow_html=True)
+    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v6.4.1 | Calidad de temas por extracción directa</p></div>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
