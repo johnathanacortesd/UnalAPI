@@ -42,8 +42,6 @@ CONCURRENT_REQUESTS = 40
 SIMILARITY_THRESHOLD_TITULOS = 0.95 # Umbral estricto para agrupación por título
 SIMILARITY_THRESHOLD_TEMAS_CONSOLIDACION = 0.93 # Umbral para unificar temas casi idénticos
 MAX_TOKENS_PROMPT_TXT = 4000
-WINDOW = 80
-NUM_TEMAS_PRINCIPALES = 30
 
 # ======================================
 # Estilos CSS (Personalizados para la UNAL)
@@ -164,31 +162,39 @@ def get_embedding(texto: str) -> Optional[List[float]]:
 # ======================================
 # Agrupacion de textos
 # ======================================
-def group_news_by_similarity_rules(df: pd.DataFrame, key_map: Dict[str, str]) -> Dict[int, List[int]]:
+def group_news_by_title_similarity(df: pd.DataFrame, key_map: Dict[str, str]) -> Dict[int, List[int]]:
+    """
+    Agrupa noticias basándose en una ÚNICA regla estricta:
+    - Regla: Títulos con una similitud de texto >= SIMILARITY_THRESHOLD_TITULOS.
+    Esto asegura que solo noticias con encabezados prácticamente idénticos
+    compartan un mismo análisis de Tono y Tema.
+    """
     news_items = df.to_dict('records')
     num_news = len(news_items)
     titles = [normalize_title_for_comparison(item.get(key_map.get("titulo"), "")) for item in news_items]
-    summaries = [str(item.get(key_map.get("resumen"), "")) for item in news_items]
-    summary_keys = [" ".join(normalize_title_for_comparison(s).split()[:6]) for s in summaries]
+    
     parent = list(range(num_news))
     def find(i):
         if parent[i] == i: return i
         parent[i] = find(parent[i])
         return parent[i]
+
     def union(i, j):
         root_i, root_j = find(i), find(j)
         if root_i != root_j: parent[root_j] = root_i
+
     for i in range(num_news):
         for j in range(i + 1, num_news):
             title1, title2 = titles[i], titles[j]
-            titles_are_similar = (title1 and title2 and SequenceMatcher(None, title1, title2).ratio() >= SIMILARITY_THRESHOLD_TITULOS)
-            summary_key1, summary_key2 = summary_keys[i], summary_keys[j]
-            summaries_start_same = (summary_key1 and summary_key1 == summary_key2)
-            if titles_are_similar or summaries_start_same:
+            if title1 and title2 and SequenceMatcher(None, title1, title2).ratio() >= SIMILARITY_THRESHOLD_TITULOS:
                 union(i, j)
+
     final_groups = defaultdict(list)
-    for i in range(num_news): final_groups[find(i)].append(i)
+    for i in range(num_news):
+        final_groups[find(i)].append(i)
+        
     return {i: group_list for i, group_list in enumerate(final_groups.values())}
+
 
 def seleccionar_representante(indices: List[int], textos: List[str]) -> Tuple[int, str]:
     if not indices: return -1, ""
@@ -255,56 +261,28 @@ class ClasificadorIA:
                 return {"tono": "Neutro", "tema": "Fallo de Análisis"}
 
 def consolidar_temas_preciso(temas: List[str], p_bar) -> List[str]:
-    """
-    Consolida temas unificando solo aquellos que son textualmente muy similares.
-    Evita agrupar temas que son conceptualmente diferentes.
-    """
     p_bar.progress(0.85, text=f"📊 Unificando {len(set(temas))} temas generados...")
-    if not temas:
-        return []
-
-    # Contar la frecuencia para identificar los temas más comunes como "canónicos"
+    if not temas: return []
     counts = Counter(t for t in temas if t and t != "Sin tema")
-    
-    # Ordenar los temas únicos por frecuencia, de mayor a menor
     canonical_themes = [t for t, _ in counts.most_common()]
-    
-    # Mapa para almacenar la consolidación
     theme_map = {}
-    
     for theme in set(temas):
         if not theme or theme == "Sin tema":
             theme_map[theme] = theme
             continue
-        
-        # Si el tema ya ha sido mapeado, no hacer nada
-        if theme in theme_map:
-            continue
-
-        # Encontrar el mejor "tema canónico" para el tema actual
+        if theme in theme_map: continue
         best_match = theme
         highest_similarity = 1.0
-        
         for canon_theme in canonical_themes:
-            # No comparar un tema consigo mismo a menos que sea el único candidato
-            if theme == canon_theme:
-                continue
-            
+            if theme == canon_theme: continue
             similarity = SequenceMatcher(None, theme.lower(), canon_theme.lower()).ratio()
-            
             if similarity >= SIMILARITY_THRESHOLD_TEMAS_CONSOLIDACION and similarity > highest_similarity:
                 best_match = canon_theme
                 highest_similarity = similarity
-        
-        # Mapear el tema actual a su mejor coincidencia (o a sí mismo si no hay una buena)
         theme_map[theme] = best_match
-
-    # Aplicar el mapeo a la lista original de temas
     final_temas = [theme_map.get(t, t) for t in temas]
-    
     p_bar.progress(1.0, "✅ Consolidación de temas completada.")
     return final_temas
-
 
 # ======================================
 # Lógica de Duplicados y Procesamiento Base
@@ -462,10 +440,12 @@ async def run_full_process_async(dossier_file, region_file, internet_file, brand
     else:
         with st.status(f"🧠 **Paso 2/3:** Analizando Tono y Tema para {len(rows_for_unal_analysis)} noticias de '{brand_name}'...", expanded=True) as s:
             df_unal = pd.DataFrame(rows_for_unal_analysis)
-            p_bar = st.progress(0, text="🔎 Creando grupos de noticias idénticas o muy similares...")
+            p_bar = st.progress(0, text="🔎 Agrupando noticias por similitud de título...")
             
-            grupos_unal = group_news_by_similarity_rules(df_unal, key_map)
+            # LÓGICA DE AGRUPACIÓN SIMPLIFICADA Y PRECISA
+            grupos_unal = group_news_by_title_similarity(df_unal, key_map)
             
+            # Preparar el texto para la API (Título + Resumen)
             df_unal['resumen_limpio'] = df_unal[key_map["resumen"]].fillna("").astype(str).apply(corregir_texto)
             df_unal["resumen_api"] = df_unal[key_map["titulo"]].fillna("").astype(str) + ". " + df_unal['resumen_limpio']
             textos_unal = df_unal["resumen_api"].tolist()
@@ -493,7 +473,6 @@ async def run_full_process_async(dossier_file, region_file, internet_file, brand
                     df_unal.loc[original_idx, key_map["tonoai"]] = res["tono"]
                     temas_iniciales[i] = res["tema"]
             
-            # Usar la nueva función de consolidación precisa
             temas_consolidados = consolidar_temas_preciso(temas_iniciales, p_bar)
             df_unal[key_map["tema"]] = temas_consolidados
             
@@ -553,7 +532,7 @@ def main():
             st.session_state.password_correct = pwd
             st.rerun()
 
-    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v6.5.0 (Extracción-Precisa) | Adaptado para la Universidad Nacional</p></div>", unsafe_allow_html=True)
+    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v6.6.0 (Agrupación-por-Título) | Adaptado para la Universidad Nacional</p></div>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
