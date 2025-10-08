@@ -151,27 +151,22 @@ def normalizar_tipo_medio(tipo_raw: str) -> str:
     default_value = str(tipo_raw).strip().title() if str(tipo_raw).strip() else "Otro"
     return mapping.get(t, default_value)
 
-@st.cache_data(ttl=3600)
-def get_embedding(texto: str) -> Optional[List[float]]:
-    if not texto: return None
-    try:
-        resp = call_with_retries(openai.Embedding.create, input=[texto[:2000]], model=OPENAI_MODEL_EMBEDDING)
-        return resp["data"][0]["embedding"]
-    except Exception: return None
+# ======================================
+# Agrupacion de textos (Lógica a prueba de errores)
+# ======================================
+def group_news_by_title_similarity_safe(
+    unal_rows: List[Dict], key_map: Dict[str, str]
+) -> List[List[int]]:
+    """
+    Agrupa noticias basándose en similitud de títulos.
+    Devuelve una lista de grupos, donde cada grupo es una lista de 'original_index'.
+    Este enfoque es inmune a errores de re-indexación de pandas.
+    """
+    num_news = len(unal_rows)
+    if num_news == 0:
+        return []
 
-# ======================================
-# Agrupacion de textos
-# ======================================
-def group_news_by_title_similarity(df: pd.DataFrame, key_map: Dict[str, str]) -> Dict[int, List[int]]:
-    """
-    Agrupa noticias basándose en una ÚNICA regla estricta:
-    - Regla: Títulos con una similitud de texto >= SIMILARITY_THRESHOLD_TITULOS.
-    Esto asegura que solo noticias con encabezados prácticamente idénticos
-    compartan un mismo análisis de Tono y Tema.
-    """
-    news_items = df.to_dict('records')
-    num_news = len(news_items)
-    titles = [normalize_title_for_comparison(item.get(key_map.get("titulo"), "")) for item in news_items]
+    titles = [normalize_title_for_comparison(row.get(key_map.get("titulo"), "")) for row in unal_rows]
     
     parent = list(range(num_news))
     def find(i):
@@ -189,23 +184,18 @@ def group_news_by_title_similarity(df: pd.DataFrame, key_map: Dict[str, str]) ->
             if title1 and title2 and SequenceMatcher(None, title1, title2).ratio() >= SIMILARITY_THRESHOLD_TITULOS:
                 union(i, j)
 
-    final_groups = defaultdict(list)
+    # Agrupa los índices de la lista `unal_rows` (0, 1, 2...)
+    temp_groups = defaultdict(list)
     for i in range(num_news):
-        final_groups[find(i)].append(i)
+        temp_groups[find(i)].append(i)
+    
+    # Convierte los índices temporales a los `original_index` permanentes para garantizar la integridad
+    final_groups_of_indices = []
+    for group_of_temp_indices in temp_groups.values():
+        group_of_original_indices = [unal_rows[i]['original_index'] for i in group_of_temp_indices]
+        final_groups_of_indices.append(group_of_original_indices)
         
-    return {i: group_list for i, group_list in enumerate(final_groups.values())}
-
-
-def seleccionar_representante(indices: List[int], textos: List[str]) -> Tuple[int, str]:
-    if not indices: return -1, ""
-    representante_idx = -1
-    max_len = -1
-    for i in indices:
-        if len(textos[i]) > max_len:
-            max_len = len(textos[i])
-            representante_idx = i
-    if representante_idx != -1: return representante_idx, textos[representante_idx]
-    return indices[0], textos[indices[0]]
+    return final_groups_of_indices
 
 # ======================================
 # Análisis de tono y tema con IA
@@ -219,34 +209,33 @@ class ClasificadorIA:
         async with semaphore:
             aliases_str = ", ".join(self.aliases) if self.aliases else "ninguno"
             prompt = f"""
-            Tu tarea es extraer el tema principal y el tono de la siguiente noticia sobre '{self.marca}'.
+            Tu tarea es actuar como un analista de medios extremadamente literal y preciso. Extrae el tema y tono de la siguiente noticia sobre '{self.marca}'.
 
-            **Reglas Estrictas:**
-            1.  **Tema:** Crea un tema corto (3 a 5 palabras) que resuma el evento o dato principal de la noticia. El tema DEBE estar compuesto por palabras y conceptos EXTRAÍDOS DIRECTAMENTE del texto. NO inventes ni generalices.
-            2.  **Tono:** Evalúa el tono hacia la marca (Positivo, Negativo, Neutro). Negativo solo si hay crítica explícita. Informativo es Neutro.
+            Sigue este proceso de razonamiento de forma OBLIGATORIA:
+            1.  **Paso 1 (Extracción de Claves):** Lee el texto e identifica 3-5 palabras o frases cortas que describan el evento principal. Estas claves deben ser copiadas y pegadas DIRECTAMENTE del texto.
+            2.  **Paso 2 (Síntesis de Tema):** Combina las claves extraídas en el Paso 1 para formar un tema descriptivo de 3 a 5 palabras. NO añadas palabras o conceptos que no estén en las claves.
+            3.  **Paso 3 (Análisis de Tono):** Basado en el texto, determina si el tono hacia la marca es Positivo, Negativo o Neutro. Un tono es Negativo solo si hay una crítica, protesta o controversia explícita. Si solo informa un hecho (incluso uno problemático), es Neutro.
 
-            **Ejemplo Positivo:**
-            - **Texto:** "La Universidad Nacional anunció la creación de 500 nuevas becas para estudiantes de bajos recursos, una iniciativa aplaudida por el gobierno."
-            - **Respuesta Correcta:** {{"tono": "Positivo", "tema": "Creación de 500 nuevas becas"}}
-
-            **Ejemplo Negativo (Qué NO hacer):**
+            **Ejemplo de tu razonamiento interno:**
             - **Texto:** "El rector de la UNAL, Ismael Peña, se posesionó en una notaría. Hubo protestas de estudiantes en el campus."
-            - **Respuesta INCORRECTA:** {{"tono": "Negativo", "tema": "Crisis en la Universidad"}}  (MAL, "Crisis" no está en el texto)
-            - **Respuesta CORRECTA:** {{"tono": "Negativo", "tema": "Posesión del rector Ismael Peña"}} (BIEN, extraído del texto)
+            - **Paso 1 (Claves):** ["rector Ismael Peña", "se posesionó", "protestas de estudiantes"]
+            - **Paso 2 (Tema):** "Posesión de rector y protestas"
+            - **Paso 3 (Tono):** "Negativo" (por la palabra "protestas")
+            - **Respuesta Final JSON:** {{"tono": "Negativo", "tema": "Posesión de rector y protestas"}}
 
             **Noticia a Analizar:**
             ---
             {texto_representante[:MAX_TOKENS_PROMPT_TXT]}
             ---
 
-            **Proporciona tu respuesta final únicamente en el formato JSON solicitado.**
+            Proporciona tu respuesta final únicamente en el formato JSON solicitado, basado en tu razonamiento.
             """
             try:
                 resp = await acall_with_retries(
                     openai.ChatCompletion.acreate,
                     model=OPENAI_MODEL_CLASIFICACION,
                     messages=[
-                        {"role": "system", "content": "Eres un analista de medios experto en extraer información clave de textos de noticias de forma precisa y literal."},
+                        {"role": "system", "content": "Eres un analista de medios que extrae información de forma literal y precisa. Tu única fuente es el texto proporcionado. No generalizas ni infieres."},
                         {"role": "user", "content": prompt}
                     ],
                     max_tokens=80,
@@ -272,13 +261,11 @@ def consolidar_temas_preciso(temas: List[str], p_bar) -> List[str]:
             continue
         if theme in theme_map: continue
         best_match = theme
-        highest_similarity = 1.0
         for canon_theme in canonical_themes:
             if theme == canon_theme: continue
-            similarity = SequenceMatcher(None, theme.lower(), canon_theme.lower()).ratio()
-            if similarity >= SIMILARITY_THRESHOLD_TEMAS_CONSOLIDACION and similarity > highest_similarity:
+            if SequenceMatcher(None, theme.lower(), canon_theme.lower()).ratio() >= SIMILARITY_THRESHOLD_TEMAS_CONSOLIDACION:
                 best_match = canon_theme
-                highest_similarity = similarity
+                break
         theme_map[theme] = best_match
     final_temas = [theme_map.get(t, t) for t in temas]
     p_bar.progress(1.0, "✅ Consolidación de temas completada.")
@@ -439,51 +426,73 @@ async def run_full_process_async(dossier_file, region_file, internet_file, brand
         st.warning(f"No se encontraron noticias únicas para la marca '{brand_name}' para analizar con IA. El informe se generará sin análisis de Tono/Tema.")
     else:
         with st.status(f"🧠 **Paso 2/3:** Analizando Tono y Tema para {len(rows_for_unal_analysis)} noticias de '{brand_name}'...", expanded=True) as s:
-            df_unal = pd.DataFrame(rows_for_unal_analysis)
             p_bar = st.progress(0, text="🔎 Agrupando noticias por similitud de título...")
             
-            # LÓGICA DE AGRUPACIÓN SIMPLIFICADA Y PRECISA
-            grupos_unal = group_news_by_title_similarity(df_unal, key_map)
+            # Crear un mapa de original_index -> fila para una búsqueda rápida y segura
+            index_to_row_map = {row['original_index']: row for row in all_processed_rows}
+
+            # La agrupación ahora es segura y devuelve grupos de original_index
+            groups_of_indices = group_news_by_title_similarity_safe(rows_for_unal_analysis, key_map)
             
-            # Preparar el texto para la API (Título + Resumen)
-            df_unal['resumen_limpio'] = df_unal[key_map["resumen"]].fillna("").astype(str).apply(corregir_texto)
-            df_unal["resumen_api"] = df_unal[key_map["titulo"]].fillna("").astype(str) + ". " + df_unal['resumen_limpio']
-            textos_unal = df_unal["resumen_api"].tolist()
+            num_grupos = len(groups_of_indices)
+            st.info(f"💡 Se procesarán {len(rows_for_unal_analysis)} noticias en {num_grupos} lotes únicos enviados a la IA.")
             
-            num_grupos = len(grupos_unal)
-            st.info(f"💡 Optimización: Se procesarán {len(textos_unal)} noticias en {num_grupos} grupos únicos para análisis.")
-            
-            representantes = {cid: seleccionar_representante(idxs, textos_unal)[1] for cid, idxs in grupos_unal.items()}
             clasificador = ClasificadorIA(brand_name, brand_aliases)
             semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
-            tasks = [clasificador._analizar_grupo_async(rep_texto, semaphore) for rep_texto in representantes.values()]
+            tasks = []
             
-            resultados_brutos = []
-            for i, f in enumerate(asyncio.as_completed(tasks), 1):
-                resultados_brutos.append(await f)
-                p_bar.progress(i / num_grupos, text=f"Analizando grupo {i}/{num_grupos} con IA")
+            # Mapear cada grupo a su futuro resultado de IA
+            group_to_future_map = {}
+
+            for group in groups_of_indices:
+                # Seleccionar representante del grupo
+                representative_index = -1
+                max_len = -1
+                for original_index in group:
+                    # Usar el mapa seguro para obtener el texto
+                    row = index_to_row_map[original_index]
+                    text = str(row.get(key_map.get("titulo"),"")) + ". " + str(row.get(key_map.get("resumen"),""))
+                    if len(text) > max_len:
+                        max_len = len(text)
+                        representative_index = original_index
+                
+                # Obtener el texto completo del representante para la API
+                rep_row = index_to_row_map[representative_index]
+                text_to_analyze = corregir_texto(str(rep_row.get(key_map.get("titulo"),""))) + ". " + corregir_texto(str(rep_row.get(key_map.get("resumen"),"")))
+                
+                # Crear tarea y asociarla al grupo
+                future = asyncio.create_task(clasificador._analizar_grupo_async(text_to_analyze, semaphore))
+                group_to_future_map[tuple(group)] = future
+
+            # Ejecutar todas las tareas y asignar resultados
+            processed_count = 0
+            all_temas_generated = []
+            for group, future in group_to_future_map.items():
+                result = await future
+                all_temas_generated.append(result['tema'])
+                processed_count += 1
+                p_bar.progress(processed_count / num_grupos, text=f"Analizando lote {processed_count}/{num_grupos} con IA")
+
+                # Asignar el mismo resultado a todas las noticias del grupo usando el mapa seguro
+                for original_index in group:
+                    index_to_row_map[original_index][key_map["tonoai"]] = result["tono"]
+                    index_to_row_map[original_index]["tema_temp"] = result["tema"] # Usar campo temporal
             
-            resultados_por_grupo = {list(representantes.keys())[i]: res for i, res in enumerate(resultados_brutos)}
+            # Consolidar temas similares (ej. "Elección de rector" y "Elecciones de rector")
+            temas_consolidados = consolidar_temas_preciso(all_temas_generated, p_bar)
+            mapa_tema_consolidado = {tema_orig: tema_consol for tema_orig, tema_consol in zip(all_temas_generated, temas_consolidados)}
             
-            temas_iniciales = [""] * len(textos_unal)
-            for cid, idxs in grupos_unal.items():
-                res = resultados_por_grupo.get(cid, {"tono": "Neutro", "tema": "Sin Análisis"})
-                for i in idxs:
-                    original_idx = df_unal.index[i]
-                    df_unal.loc[original_idx, key_map["tonoai"]] = res["tono"]
-                    temas_iniciales[i] = res["tema"]
-            
-            temas_consolidados = consolidar_temas_preciso(temas_iniciales, p_bar)
-            df_unal[key_map["tema"]] = temas_consolidados
-            
-            results_map = df_unal.set_index("original_index").to_dict("index")
-            for row in all_processed_rows:
-                if row["original_index"] in results_map:
-                    row.update(results_map[row["original_index"]])
+            # Asignar temas consolidados finales
+            for row in rows_for_unal_analysis:
+                temp_tema = row.pop("tema_temp", "Sin tema")
+                index_to_row_map[row['original_index']][key_map["tema"]] = mapa_tema_consolidado.get(temp_tema, temp_tema)
+
         s.update(label="✅ **Paso 2/3:** Análisis con IA completado", state="complete")
 
     with st.status("📊 **Paso 3/3:** Generando informe final...", expanded=True) as s:
-        st.session_state["output_data"] = generate_two_sheet_excel(all_processed_rows, key_map)
+        # Reconstruir la lista final a partir del mapa actualizado
+        final_processed_rows = list(index_to_row_map.values())
+        st.session_state["output_data"] = generate_two_sheet_excel(final_processed_rows, key_map)
         st.session_state["output_filename"] = f"Informe_Analisis_UNAL_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
         st.session_state["processing_complete"] = True
         s.update(label="✅ **Paso 3/3:** Informe generado exitosamente", state="complete")
@@ -532,7 +541,7 @@ def main():
             st.session_state.password_correct = pwd
             st.rerun()
 
-    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v6.6.0 (Agrupación-por-Título) | Adaptado para la Universidad Nacional</p></div>", unsafe_allow_html=True)
+    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v7.0.0 (Integrity-Lock) | Adaptado para la Universidad Nacional</p></div>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
