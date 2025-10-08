@@ -40,6 +40,7 @@ OPENAI_MODEL_CLASIFICACION = "gpt-4.1-nano-2025-04-14"
 # Parámetros de rendimiento y similitud
 CONCURRENT_REQUESTS = 40
 SIMILARITY_THRESHOLD_TITULOS = 0.95 # Umbral estricto para agrupación por título
+SIMILARITY_THRESHOLD_TEMAS_CONSOLIDACION = 0.93 # Umbral para unificar temas casi idénticos
 MAX_TOKENS_PROMPT_TXT = 4000
 WINDOW = 80
 NUM_TEMAS_PRINCIPALES = 30
@@ -164,73 +165,40 @@ def get_embedding(texto: str) -> Optional[List[float]]:
 # Agrupacion de textos
 # ======================================
 def group_news_by_similarity_rules(df: pd.DataFrame, key_map: Dict[str, str]) -> Dict[int, List[int]]:
-    """
-    Agrupa noticias basándose en reglas estrictas para asegurar una muy alta similitud.
-    - Regla 1: Títulos con similitud de texto >= SIMILARITY_THRESHOLD_TITULOS.
-    - Regla 2: Resúmenes que inician con las mismas 6 palabras.
-    Dos noticias se agrupan si CUALQUIERA de las reglas se cumple.
-    Esto asegura que solo noticias prácticamente idénticas compartan un análisis de IA.
-    """
     news_items = df.to_dict('records')
     num_news = len(news_items)
-    
-    # Extraer y normalizar los datos necesarios de antemano para eficiencia
     titles = [normalize_title_for_comparison(item.get(key_map.get("titulo"), "")) for item in news_items]
     summaries = [str(item.get(key_map.get("resumen"), "")) for item in news_items]
     summary_keys = [" ".join(normalize_title_for_comparison(s).split()[:6]) for s in summaries]
-
-    # Usar una estructura de Disjoint Set Union (DSU) para agrupar eficientemente
     parent = list(range(num_news))
     def find(i):
-        if parent[i] == i:
-            return i
+        if parent[i] == i: return i
         parent[i] = find(parent[i])
         return parent[i]
-
     def union(i, j):
-        root_i = find(i)
-        root_j = find(j)
-        if root_i != root_j:
-            parent[root_j] = root_i
-
-    # Comparar cada par de noticias una sola vez
+        root_i, root_j = find(i), find(j)
+        if root_i != root_j: parent[root_j] = root_i
     for i in range(num_news):
         for j in range(i + 1, num_news):
-            # Regla 1: Títulos muy similares
             title1, title2 = titles[i], titles[j]
             titles_are_similar = (title1 and title2 and SequenceMatcher(None, title1, title2).ratio() >= SIMILARITY_THRESHOLD_TITULOS)
-
-            # Regla 2: Inicio de resumen idéntico (y no vacío)
             summary_key1, summary_key2 = summary_keys[i], summary_keys[j]
             summaries_start_same = (summary_key1 and summary_key1 == summary_key2)
-
             if titles_are_similar or summaries_start_same:
                 union(i, j)
-
-    # Reconstruir los grupos finales a partir de la estructura DSU
     final_groups = defaultdict(list)
-    for i in range(num_news):
-        root = find(i)
-        final_groups[root].append(i)
-
-    # Devolver en el formato requerido: {id_grupo: [indice1, indice2, ...]}
+    for i in range(num_news): final_groups[find(i)].append(i)
     return {i: group_list for i, group_list in enumerate(final_groups.values())}
 
 def seleccionar_representante(indices: List[int], textos: List[str]) -> Tuple[int, str]:
     if not indices: return -1, ""
-    # Para grupos basados en texto, el más largo suele ser el más informativo.
-    # Se podría volver a la similitud por embedding si fuera necesario, pero esto es más simple y rápido.
     representante_idx = -1
     max_len = -1
     for i in indices:
         if len(textos[i]) > max_len:
             max_len = len(textos[i])
             representante_idx = i
-    
-    if representante_idx != -1:
-        return representante_idx, textos[representante_idx]
-    
-    # Fallback por si todos los textos son vacíos
+    if representante_idx != -1: return representante_idx, textos[representante_idx]
     return indices[0], textos[indices[0]]
 
 # ======================================
@@ -245,32 +213,36 @@ class ClasificadorIA:
         async with semaphore:
             aliases_str = ", ".join(self.aliases) if self.aliases else "ninguno"
             prompt = f"""
-            Analiza el siguiente texto de una noticia sobre la marca '{self.marca}' (que también puede aparecer como {aliases_str}). Sigue estos pasos de razonamiento de forma estricta:
+            Tu tarea es extraer el tema principal y el tono de la siguiente noticia sobre '{self.marca}'.
 
-            1.  **Identificación del Foco Principal:** Lee el texto para entender el evento o concepto central que involucra a la marca.
-            2.  **Extracción de Palabras Clave:** Extrae de 3 a 5 palabras o frases clave DIRECTAMENTE DEL TEXTO que capturen la esencia de la noticia.
-            3.  **Síntesis del Tema:** Basándote EXCLUSIVAMENTE en las palabras clave extraídas, sintetiza un tema descriptivo de 2 a 5 palabras.
-            4.  **Análisis de Tono:** Evalúa el sentimiento del texto hacia la marca (Positivo, Negativo, Neutro). Un tono es Negativo solo si hay una crítica o controversia explícita. Si solo informa un hecho, es Neutro.
+            **Reglas Estrictas:**
+            1.  **Tema:** Crea un tema corto (3 a 5 palabras) que resuma el evento o dato principal de la noticia. El tema DEBE estar compuesto por palabras y conceptos EXTRAÍDOS DIRECTAMENTE del texto. NO inventes ni generalices.
+            2.  **Tono:** Evalúa el tono hacia la marca (Positivo, Negativo, Neutro). Negativo solo si hay crítica explícita. Informativo es Neutro.
 
-            **Texto de la Noticia:**
+            **Ejemplo Positivo:**
+            - **Texto:** "La Universidad Nacional anunció la creación de 500 nuevas becas para estudiantes de bajos recursos, una iniciativa aplaudida por el gobierno."
+            - **Respuesta Correcta:** {{"tono": "Positivo", "tema": "Creación de 500 nuevas becas"}}
+
+            **Ejemplo Negativo (Qué NO hacer):**
+            - **Texto:** "El rector de la UNAL, Ismael Peña, se posesionó en una notaría. Hubo protestas de estudiantes en el campus."
+            - **Respuesta INCORRECTA:** {{"tono": "Negativo", "tema": "Crisis en la Universidad"}}  (MAL, "Crisis" no está en el texto)
+            - **Respuesta CORRECTA:** {{"tono": "Negativo", "tema": "Posesión del rector Ismael Peña"}} (BIEN, extraído del texto)
+
+            **Noticia a Analizar:**
             ---
             {texto_representante[:MAX_TOKENS_PROMPT_TXT]}
             ---
 
-            **REGLA DE ORO:** Si una palabra o concepto no está en el 'Texto de la Noticia', NO PUEDE estar en el 'tema'. El tema debe derivarse directamente del texto.
-
-            **Respuesta Final (solo el JSON):**
-            Proporciona tu respuesta final únicamente en formato JSON.
-            {{
-              "tono": "...",
-              "tema": "..."
-            }}
+            **Proporciona tu respuesta final únicamente en el formato JSON solicitado.**
             """
             try:
                 resp = await acall_with_retries(
                     openai.ChatCompletion.acreate,
                     model=OPENAI_MODEL_CLASIFICACION,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=[
+                        {"role": "system", "content": "Eres un analista de medios experto en extraer información clave de textos de noticias de forma precisa y literal."},
+                        {"role": "user", "content": prompt}
+                    ],
                     max_tokens=80,
                     temperature=0.0,
                     response_format={"type": "json_object"}
@@ -282,58 +254,57 @@ class ClasificadorIA:
             except Exception:
                 return {"tono": "Neutro", "tema": "Fallo de Análisis"}
 
-def consolidar_temas(temas: List[str], p_bar) -> List[str]:
-    p_bar.progress(0.7, text=f"📊 Consolidando {len(set(temas))} temas únicos...")
-    tema_counts = Counter(t for t in temas if t != "Sin tema")
+def consolidar_temas_preciso(temas: List[str], p_bar) -> List[str]:
+    """
+    Consolida temas unificando solo aquellos que son textualmente muy similares.
+    Evita agrupar temas que son conceptualmente diferentes.
+    """
+    p_bar.progress(0.85, text=f"📊 Unificando {len(set(temas))} temas generados...")
+    if not temas:
+        return []
+
+    # Contar la frecuencia para identificar los temas más comunes como "canónicos"
+    counts = Counter(t for t in temas if t and t != "Sin tema")
     
-    temas_a_clusterizar = [t for t, count in tema_counts.items() if count > 1]
-    singletons = {t for t, count in tema_counts.items() if count == 1}
-    mapa_tema_a_consolidado = {t: t for t in singletons}
-    mapa_tema_a_consolidado["Sin tema"] = "Sin tema"
-
-    if not temas_a_clusterizar or len(temas_a_clusterizar) <= 1:
-        for t in temas_a_clusterizar: mapa_tema_a_consolidado[t] = t
-        return [mapa_tema_a_consolidado.get(t, t) for t in temas]
-
-    emb_temas = {t: get_embedding(t) for t in temas_a_clusterizar}
-    temas_validos = [t for t, emb in emb_temas.items() if emb is not None]
-    if len(temas_validos) <= 1:
-        for t in temas_a_clusterizar: mapa_tema_a_consolidado[t] = t
-        return [mapa_tema_a_consolidado.get(t, t) for t in temas]
-
-    n_clusters = min(NUM_TEMAS_PRINCIPALES, len(temas_validos))
+    # Ordenar los temas únicos por frecuencia, de mayor a menor
+    canonical_themes = [t for t, _ in counts.most_common()]
     
-    if n_clusters <= 1:
-        for t in temas_a_clusterizar: mapa_tema_a_consolidado[t] = t
-        return [mapa_tema_a_consolidado.get(t, t) for t in temas]
-
-    emb_matrix = np.array([emb_temas[t] for t in temas_validos])
-    clustering = AgglomerativeClustering(n_clusters=n_clusters, metric="cosine", linkage="average").fit(emb_matrix)
+    # Mapa para almacenar la consolidación
+    theme_map = {}
     
-    mapa_cluster_a_temas = defaultdict(list)
-    for i, label in enumerate(clustering.labels_):
-        mapa_cluster_a_temas[label].append(temas_validos[i])
-
-    p_bar.progress(0.85, "🧠 Generando nombres para los temas consolidados...")
-    for cluster_id, lista_temas in mapa_cluster_a_temas.items():
-        if not lista_temas: continue
+    for theme in set(temas):
+        if not theme or theme == "Sin tema":
+            theme_map[theme] = theme
+            continue
         
-        if len(lista_temas) == 1:
-            tema_principal = lista_temas[0]
-        else:
-            emb_list = [emb_temas.get(t) for t in lista_temas if emb_temas.get(t) is not None]
-            if not emb_list: tema_principal = max(lista_temas, key=len)
-            else:
-                M = np.array(emb_list)
-                centro = M.mean(axis=0, keepdims=True)
-                sims = cosine_similarity(M, centro).reshape(-1)
-                tema_principal = lista_temas[int(np.argmax(sims))]
+        # Si el tema ya ha sido mapeado, no hacer nada
+        if theme in theme_map:
+            continue
+
+        # Encontrar el mejor "tema canónico" para el tema actual
+        best_match = theme
+        highest_similarity = 1.0
         
-        for tema in lista_temas:
-            mapa_tema_a_consolidado[tema] = tema_principal
+        for canon_theme in canonical_themes:
+            # No comparar un tema consigo mismo a menos que sea el único candidato
+            if theme == canon_theme:
+                continue
+            
+            similarity = SequenceMatcher(None, theme.lower(), canon_theme.lower()).ratio()
+            
+            if similarity >= SIMILARITY_THRESHOLD_TEMAS_CONSOLIDACION and similarity > highest_similarity:
+                best_match = canon_theme
+                highest_similarity = similarity
+        
+        # Mapear el tema actual a su mejor coincidencia (o a sí mismo si no hay una buena)
+        theme_map[theme] = best_match
+
+    # Aplicar el mapeo a la lista original de temas
+    final_temas = [theme_map.get(t, t) for t in temas]
     
     p_bar.progress(1.0, "✅ Consolidación de temas completada.")
-    return [mapa_tema_a_consolidado.get(t, t) for t in temas]
+    return final_temas
+
 
 # ======================================
 # Lógica de Duplicados y Procesamiento Base
@@ -493,10 +464,8 @@ async def run_full_process_async(dossier_file, region_file, internet_file, brand
             df_unal = pd.DataFrame(rows_for_unal_analysis)
             p_bar = st.progress(0, text="🔎 Creando grupos de noticias idénticas o muy similares...")
             
-            # NUEVA LÓGICA DE AGRUPACIÓN: Precisa y basada en reglas de texto.
             grupos_unal = group_news_by_similarity_rules(df_unal, key_map)
             
-            # Preparar el texto completo que se enviará a la API (solo para los representantes del grupo)
             df_unal['resumen_limpio'] = df_unal[key_map["resumen"]].fillna("").astype(str).apply(corregir_texto)
             df_unal["resumen_api"] = df_unal[key_map["titulo"]].fillna("").astype(str) + ". " + df_unal['resumen_limpio']
             textos_unal = df_unal["resumen_api"].tolist()
@@ -504,7 +473,6 @@ async def run_full_process_async(dossier_file, region_file, internet_file, brand
             num_grupos = len(grupos_unal)
             st.info(f"💡 Optimización: Se procesarán {len(textos_unal)} noticias en {num_grupos} grupos únicos para análisis.")
             
-            # Procesamiento asíncrono de cada grupo
             representantes = {cid: seleccionar_representante(idxs, textos_unal)[1] for cid, idxs in grupos_unal.items()}
             clasificador = ClasificadorIA(brand_name, brand_aliases)
             semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
@@ -518,7 +486,6 @@ async def run_full_process_async(dossier_file, region_file, internet_file, brand
             resultados_por_grupo = {list(representantes.keys())[i]: res for i, res in enumerate(resultados_brutos)}
             
             temas_iniciales = [""] * len(textos_unal)
-            # Asignar resultados a todas las noticias dentro de cada grupo
             for cid, idxs in grupos_unal.items():
                 res = resultados_por_grupo.get(cid, {"tono": "Neutro", "tema": "Sin Análisis"})
                 for i in idxs:
@@ -526,11 +493,10 @@ async def run_full_process_async(dossier_file, region_file, internet_file, brand
                     df_unal.loc[original_idx, key_map["tonoai"]] = res["tono"]
                     temas_iniciales[i] = res["tema"]
             
-            # La consolidación de temas ahora es más efectiva al unificar pequeñas variaciones de la IA
-            temas_consolidados = consolidar_temas(temas_iniciales, p_bar)
+            # Usar la nueva función de consolidación precisa
+            temas_consolidados = consolidar_temas_preciso(temas_iniciales, p_bar)
             df_unal[key_map["tema"]] = temas_consolidados
             
-            # Actualizar las filas originales con los resultados del análisis
             results_map = df_unal.set_index("original_index").to_dict("index")
             for row in all_processed_rows:
                 if row["original_index"] in results_map:
@@ -560,7 +526,7 @@ def main():
             
             st.info("El análisis de IA se ejecutará automáticamente para la marca **'Universidad Nacional de Colombia'**.")
             
-            brand_aliases_text = st.text_area("**Alias y voceros de la UNAL** (separados por ;)", value="UNAL;UN;U. Nacional;Universidad Nacional", height=80)
+            brand_aliases_text = st.text_area("**Alias y voceros de la UNAL** (separados por ;)", value="UNAL;UN;U. Nacional;Universidad Nacional;Ismael Peña", height=80)
 
             if st.form_submit_button("🚀 **INICIAR ANÁLISIS COMPLETO**", use_container_width=True, type="primary"):
                 if not all([dossier_file, region_file, internet_file]):
@@ -587,7 +553,7 @@ def main():
             st.session_state.password_correct = pwd
             st.rerun()
 
-    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v6.4.0 (Precisión-Foco) | Adaptado para la Universidad Nacional</p></div>", unsafe_allow_html=True)
+    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v6.5.0 (Extracción-Precisa) | Adaptado para la Universidad Nacional</p></div>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
