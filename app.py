@@ -124,6 +124,34 @@ def normalize_title_for_comparison(title: Any) -> str:
     cleaned = tmp[0] if tmp else title
     return re.sub(r"\W+", " ", cleaned).lower().strip()
 
+def clean_title_for_output(title: Any) -> str:
+    """Limpia el título eliminando sufijos comunes como '| El Tiempo'."""
+    if not isinstance(title, str):
+        return str(title if title is not None else "")
+    return re.sub(r"\s*\|\s*[\w\s]+$", "", title).strip()
+
+def corregir_texto(text: Any) -> Any:
+    """Limpia el texto del resumen, eliminando etiquetas HTML, placeholders y espacios extra."""
+    if not isinstance(text, str):
+        return text if text is not None else ""
+    
+    # Reemplazar secuencias de <br>, <br/>, [...] por un solo espacio
+    text = re.sub(r'(<br\s*/?>|\[\.\.\.\])+', ' ', text)
+    
+    # Colapsar cualquier espacio en blanco múltiple a un solo espacio y limpiar los extremos
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    # Asegurarse de que el texto útil comience (elimina caracteres basura al inicio)
+    match = re.search(r"[A-ZÁÉÍÓÚÑ]", text) # Busca la primera mayúscula
+    if match:
+        text = text[match.start():]
+        
+    # Añadir puntos suspensivos para indicar que es un resumen, si no tiene puntuación final
+    if text and not text.endswith(('.', '...', '?', '!')):
+        text = text + "..."
+        
+    return text
+
 def normalizar_tipo_medio(tipo_raw: str) -> str:
     if not isinstance(tipo_raw, str): return str(tipo_raw)
     t = unidecode(tipo_raw.strip().lower())
@@ -331,13 +359,22 @@ def process_mappings_and_links(all_processed_rows, key_map, region_file, interne
 # ======================================
 def _append_rows_to_sheet(sheet, rows_data, key_map, include_ai_columns):
     base_order = ["ID Noticia","Fecha","Hora","Medio","Tipo de Medio","Seccion - Programa","Region","Titulo","Autor - Conductor","Nro. Pagina","Dimension","Duracion - Nro. Caracteres","CPE","Tier","Audiencia","Tono","Resumen - Aclaracion","Link Nota","Link (Streaming - Imagen)","Menciones - Empresa","ID duplicada"]
-    ai_order = ["Tono AI", "Tema", "Justificacion Tono"]
+    ai_order = ["Tono AI", "Tema"] # Justificacion ya no es necesaria con el prompt unificado
     final_order = base_order[:16] + ai_order + base_order[16:] if include_ai_columns else base_order
     
     sheet.append(final_order)
     numeric_columns = {"ID Noticia", "Nro. Pagina", "Dimension", "Duracion - Nro. Caracteres", "CPE", "Tier", "Audiencia"}
     
     for row_data in rows_data:
+        # Limpiar texto de título y resumen antes de escribir
+        titulo_key = key_map.get("titulo")
+        if titulo_key in row_data:
+            row_data[titulo_key] = clean_title_for_output(row_data.get(titulo_key))
+
+        resumen_key = key_map.get("resumen")
+        if resumen_key in row_data:
+            row_data[resumen_key] = corregir_texto(row_data.get(resumen_key))
+
         row_to_append, links_to_add = [], {}
         for col_idx, header in enumerate(final_order, 1):
             nk_header = norm_key(header)
@@ -448,13 +485,12 @@ async def run_full_process_async(dossier_file, region_file, internet_file, brand
         st.session_state["processing_complete"] = True
         s.update(label="✅ **Paso 3/3:** Informe generado exitosamente", state="complete")
 
-
 def main():
     load_custom_css()
     if not check_password(): return
 
     st.markdown('<div class="main-header">🎓 Sistema de Análisis de Noticias para la Universidad Nacional</div>', unsafe_allow_html=True)
-    st.markdown("Esta herramienta procesa su dossier de noticias para deduplicar menciones y, opcionalmente, aplicar análisis de Tono y Tema con IA **exclusivamente a la marca 'Universidad Nacional de Colombia'**.")
+    st.markdown("Esta herramienta procesa su dossier de noticias para deduplicar menciones y aplicar análisis de Tono y Tema con IA **exclusivamente a la marca 'Universidad Nacional de Colombia'**.")
 
     if not st.session_state.get("processing_complete", False):
         with st.form("input_form"):
@@ -493,7 +529,7 @@ def main():
             st.session_state.password_correct = pwd
             st.rerun()
 
-    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v6.0 | Adaptado para la Universidad Nacional</p></div>", unsafe_allow_html=True)
+    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v6.1 | Adaptado para la Universidad Nacional</p></div>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
