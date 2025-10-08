@@ -16,7 +16,7 @@ import time
 from unidecode import unidecode
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.cluster import AgglomerativeClustering
+# from sklearn.cluster import AgglomerativeClustering  # no usado
 import json
 import asyncio
 import hashlib
@@ -36,6 +36,9 @@ st.set_page_config(
 # Modelos y parámetros de la IA
 OPENAI_MODEL_EMBEDDING = "text-embedding-3-small"
 OPENAI_MODEL_CLASIFICACION = "gpt-4.1-nano-2025-04-14"
+
+# Marcas objetivo a analizar con IA (solo estas)
+TARGET_BRANDS = ["U. Nacional de Colombia", "Universidad Nacional de Colombia"]
 
 # Parámetros de rendimiento y similitud
 CONCURRENT_REQUESTS = 40
@@ -535,7 +538,6 @@ def process_sov_mapping_final(all_rows: List[Dict], key_map: Dict[str, str], sov
         df_sov = pd.read_excel(sov_file)
         if df_sov.empty:
             return all_rows
-        # detectar columnas con robustez
         cols_by_norm = {norm_key(c): c for c in df_sov.columns}
         menc_col = cols_by_norm.get(norm_key("Menciones - Empresa"))
         name_col = cols_by_norm.get(norm_key("Nombre"))
@@ -543,7 +545,6 @@ def process_sov_mapping_final(all_rows: List[Dict], key_map: Dict[str, str], sov
             st.warning("⚠️ El archivo SOV no contiene columnas 'Menciones - Empresa' y 'Nombre' reconocibles.")
             return all_rows
 
-        # construir mapa
         sov_map = {}
         for _, row in df_sov.iterrows():
             mk = str(row.get(menc_col, "")).strip().lower()
@@ -616,7 +617,8 @@ def generate_two_sheet_excel(all_processed_rows, key_map):
     out_wb = Workbook()
     sheet1 = out_wb.active
     sheet1.title = "UNAL con IA"
-    unal_rows = [row for row in all_processed_rows if row.get(key_map.get("menciones")) == "Universidad Nacional de Colombia"]
+    # Ahora usamos la marca interna '__is_target_brand' para que no dependa de SOV
+    unal_rows = [row for row in all_processed_rows if row.get("__is_target_brand")]
     _append_rows_to_sheet(sheet1, unal_rows, key_map, include_ai_columns=True)
     sheet2 = out_wb.create_sheet("Todas las Marcas")
     _append_rows_to_sheet(sheet2, all_processed_rows, key_map, include_ai_columns=False)
@@ -627,7 +629,7 @@ def generate_two_sheet_excel(all_processed_rows, key_map):
 # ======================================
 # Proceso Principal y UI
 # ======================================
-async def run_full_process_async(dossier_file, region_file, internet_file, sov_file, brand_name, brand_aliases, emb_cos_thr):
+async def run_full_process_async(dossier_file, region_file, internet_file, sov_file, brand_aliases, emb_cos_thr):
     try:
         openai.api_key = st.secrets["OPENAI_API_KEY"]
         openai.aiosession.set(None)
@@ -640,61 +642,88 @@ async def run_full_process_async(dossier_file, region_file, internet_file, sov_f
         all_processed_rows = process_mappings_and_links(all_processed_rows, key_map, region_file, internet_file)
         s.update(label="✅ **Paso 1/3:** Base de datos preparada", state="complete")
     
+    # Marcar filas de marcas objetivo (para filtrar hoja y análisis), antes de SOV
+    for row in all_processed_rows:
+        row["__is_target_brand"] = (row.get(key_map.get("menciones")) in TARGET_BRANDS)
+
     index_to_row_map = {row['original_index']: row for row in all_processed_rows}
 
-    rows_for_unal_analysis = [
+    # Filas objetivo para análisis (no duplicadas y marca objetivo)
+    target_rows_all = [
         row for row in all_processed_rows 
-        if not row.get("is_duplicate") and row.get(key_map.get("menciones")) == brand_name
+        if row.get("__is_target_brand") and not row.get("is_duplicate")
     ]
 
-    if not rows_for_unal_analysis:
-        st.warning(f"No se encontraron noticias únicas para la marca '{brand_name}' para analizar con IA. El informe se generará sin análisis de Tono/Tema.")
+    if not target_rows_all:
+        st.warning("No se encontraron noticias únicas para las marcas objetivo para analizar con IA. El informe se generará sin análisis de Tono/Tema.")
     else:
-        with st.status(f"🧠 **Paso 2/3:** Analizando Tono y Tema para {len(rows_for_unal_analysis)} noticias de '{brand_name}'...", expanded=True) as s:
-            p_bar = st.progress(0, text="🔎 Agrupando noticias por similitud de título...")
-            groups_of_indices = group_news_by_title_similarity_safe(rows_for_unal_analysis, key_map)
-            num_grupos = len(groups_of_indices)
-            st.info(f"💡 Se procesarán {len(rows_for_unal_analysis)} noticias en {num_grupos} lotes únicos enviados a la IA.")
-            clasificador = ClasificadorIA(brand_name, brand_aliases)
-            semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
-            group_to_future_map = {}
-            for group in groups_of_indices:
-                representative_index = -1
-                max_len = -1
-                for original_index in group:
-                    row = index_to_row_map[original_index]
-                    text = str(row.get(key_map.get("titulo"),"")) + ". " + str(row.get(key_map.get("resumen"),""))
-                    if len(text) > max_len:
-                        max_len = len(text)
-                        representative_index = original_index
-                rep_row = index_to_row_map[representative_index]
-                text_to_analyze = corregir_texto(str(rep_row.get(key_map.get("titulo"),""))) + ". " + corregir_texto(str(rep_row.get(key_map.get("resumen"),"")))
-                future = asyncio.create_task(clasificador._analizar_grupo_async(text_to_analyze, semaphore))
-                group_to_future_map[tuple(group)] = future
-
-            processed_count = 0
-            all_temas_generated = []
-            for group, future in group_to_future_map.items():
-                result = await future
-                all_temas_generated.append(result['tema'])
-                processed_count += 1
-                p_bar.progress(processed_count / max(1, num_grupos), text=f"Analizando lote {processed_count}/{num_grupos} con IA")
-                for original_index in group:
-                    index_to_row_map[original_index][key_map["tonoai"]] = result["tono"]
-                    index_to_row_map[original_index]["tema_temp"] = result["tema"]
-
-            temas_consolidados = consolidar_temas_hibrido(all_temas_generated, p_bar, cos_threshold=emb_cos_thr)
-            mapa_tema_consolidado = {tema_orig: tema_consol for tema_orig, tema_consol in zip(all_temas_generated, temas_consolidados)}
+        with st.status("🧠 **Paso 2/3:** Analizando Tono y Tema (solo marcas objetivo)...", expanded=True) as s:
+            p_bar = st.progress(0, text="🔎 Preparando lotes por marca...")
             
-            for row in rows_for_unal_analysis:
-                temp_tema = row.pop("tema_temp", "Sin tema")
-                index_to_row_map[row['original_index']][key_map["tema"]] = mapa_tema_consolidado.get(temp_tema, temp_tema)
+            # Pre-calcular grupos por marca para totalizar progreso y evitar mezclar marcas
+            brand_groups_map: Dict[str, Tuple[List[Dict], List[List[int]]]] = {}
+            total_groups = 0
+            for brand in TARGET_BRANDS:
+                rows_brand = [r for r in target_rows_all if r.get(key_map.get("menciones")) == brand]
+                groups = group_news_by_title_similarity_safe(rows_brand, key_map)
+                brand_groups_map[brand] = (rows_brand, groups)
+                total_groups += len(groups)
+
+            if total_groups == 0:
+                st.info("No hay lotes para enviar a IA (posibles duplicados).")
+            else:
+                st.info(f"💡 Se procesarán {len(target_rows_all)} noticias en {total_groups} lotes únicos enviados a la IA (separados por marca).")
+
+                semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
+                processed_groups = 0
+                all_temas_generated: List[str] = []
+
+                # Procesar por marca, manteniendo prompts con el nombre correcto
+                for brand in TARGET_BRANDS:
+                    rows_brand, groups = brand_groups_map[brand]
+                    if not groups:
+                        continue
+                    clasificador = ClasificadorIA(brand, brand_aliases)
+                    group_to_future_map = {}
+
+                    for group in groups:
+                        representative_index = -1
+                        max_len = -1
+                        for original_index in group:
+                            row = index_to_row_map[original_index]
+                            text = str(row.get(key_map.get("titulo"),"")) + ". " + str(row.get(key_map.get("resumen"),""))
+                            if len(text) > max_len:
+                                max_len = len(text)
+                                representative_index = original_index
+                        rep_row = index_to_row_map[representative_index]
+                        text_to_analyze = corregir_texto(str(rep_row.get(key_map.get("titulo"),""))) + ". " + corregir_texto(str(rep_row.get(key_map.get("resumen"),"")))
+                        future = asyncio.create_task(clasificador._analizar_grupo_async(text_to_analyze, semaphore))
+                        group_to_future_map[tuple(group)] = future
+
+                    # Ejecutar y actualizar avances
+                    for group, future in group_to_future_map.items():
+                        result = await future
+                        all_temas_generated.append(result['tema'])
+                        processed_groups += 1
+                        p_bar.progress(processed_groups / max(1, total_groups), text=f"Analizando lote {processed_groups}/{total_groups} con IA")
+                        for original_index in group:
+                            index_to_row_map[original_index][key_map["tonoai"]] = result["tono"]
+                            index_to_row_map[original_index]["tema_temp"] = result["tema"]
+
+                # Consolidación híbrida de todos los temas generados para ambas marcas
+                temas_consolidados = consolidar_temas_hibrido(all_temas_generated, p_bar, cos_threshold=emb_cos_thr)
+                mapa_tema_consolidado = {tema_orig: tema_consol for tema_orig, tema_consol in zip(all_temas_generated, temas_consolidados)}
+                
+                # Asignar temas consolidados finales a filas objetivo
+                for row in target_rows_all:
+                    temp_tema = row.pop("tema_temp", "Sin tema")
+                    index_to_row_map[row['original_index']][key_map["tema"]] = mapa_tema_consolidado.get(temp_tema, temp_tema)
 
             s.update(label="✅ **Paso 2/3:** Análisis con IA completado", state="complete")
 
     with st.status("📊 **Paso 3/3:** Aplicando SOV y generando informe final...", expanded=True) as s:
         final_processed_rows = list(index_to_row_map.values())
-        # NUEVO: aplicar SOV como paso final a ambas hojas
+        # SOV como último paso (afecta ambas hojas)
         final_processed_rows = process_sov_mapping_final(final_processed_rows, key_map, sov_file)
         st.session_state["output_data"] = generate_two_sheet_excel(final_processed_rows, key_map)
         st.session_state["output_filename"] = f"Informe_Analisis_UNAL_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
@@ -707,7 +736,11 @@ def main():
         return
 
     st.markdown('<div class="main-header">🎓 Sistema de Análisis de Noticias para la Universidad Nacional</div>', unsafe_allow_html=True)
-    st.markdown("Esta herramienta procesa su dossier de noticias para deduplicar menciones y aplicar análisis de Tono y Tema con IA exclusivamente a la marca 'Universidad Nacional de Colombia'.")
+    st.markdown(
+        "Esta herramienta procesa su dossier de noticias para deduplicar menciones y aplicar análisis de Tono y Tema con IA "
+        "exclusivamente a las marcas objetivo: 'U. Nacional de Colombia' y 'Universidad Nacional de Colombia'. "
+        "El mapeo SOV se aplica al final al campo 'Menciones - Empresa' en ambas hojas del Excel."
+    )
 
     if not st.session_state.get("processing_complete", False):
         with st.form("input_form"):
@@ -718,8 +751,12 @@ def main():
             internet_file = col3.file_uploader("**3. Mapeo Internet** (.xlsx)", type=["xlsx"])
             sov_file = col4.file_uploader("**4. Mapeo SOV** (.xlsx)", type=["xlsx"])
 
-            st.info("El análisis de IA se ejecutará automáticamente para la marca **'Universidad Nacional de Colombia'**.")
-            brand_aliases_text = st.text_area("**Alias y voceros de la UNAL** (separados por ;)", value="UNAL;UN;U. Nacional;Universidad Nacional;Ismael Peña", height=80)
+            st.info("El análisis de IA se ejecutará automáticamente solo para 'U. Nacional de Colombia' y 'Universidad Nacional de Colombia'.")
+            brand_aliases_text = st.text_area(
+                "**Alias y voceros (separados por ;)**",
+                value="UNAL;UN;U. Nacional;Universidad Nacional;Ismael Peña",
+                height=80
+            )
 
             st.markdown("### ⚙️ Parámetros de Consolidación de Temas")
             emb_cos_thr = st.slider(
@@ -732,13 +769,12 @@ def main():
                 if not all([dossier_file, region_file, internet_file, sov_file]):
                     st.error("❌ Faltan archivos obligatorios (incluya el Mapeo SOV).")
                 else:
-                    brand_name = "Universidad Nacional de Colombia"
                     aliases = [a.strip() for a in brand_aliases_text.split(";") if a.strip()]
-                    asyncio.run(run_full_process_async(dossier_file, region_file, internet_file, sov_file, brand_name, aliases, emb_cos_thr))
+                    asyncio.run(run_full_process_async(dossier_file, region_file, internet_file, sov_file, aliases, emb_cos_thr))
                     st.rerun()
     else:
         st.success("## 🎉 Análisis Completado Exitosamente")
-        st.markdown("El informe en Excel ha sido generado con dos pestañas: **'UNAL con IA'** y **'Todas las Marcas'**.")
+        st.markdown("El informe en Excel ha sido generado con dos pestañas: **'UNAL con IA'** (solo marcas objetivo) y **'Todas las Marcas'**.")
         st.download_button(
             label="📥 **DESCARGAR INFORME**",
             data=st.session_state.output_data,
@@ -753,7 +789,7 @@ def main():
             st.session_state.password_correct = pwd
             st.rerun()
 
-    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v7.2.0 (Hybrid-Topic+SOV) | Adaptado para la Universidad Nacional</p></div>", unsafe_allow_html=True)
+    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v7.3.0 (Dual-Brand + Hybrid-Topic + SOV-Final) | Adaptado para la Universidad Nacional</p></div>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
