@@ -39,9 +39,7 @@ OPENAI_MODEL_CLASIFICACION = "gpt-4.1-nano-2025-04-14"
 
 # Parámetros de rendimiento y similitud
 CONCURRENT_REQUESTS = 40
-SIMILARITY_THRESHOLD_TONO = 0.92
-SIMILARITY_THRESHOLD_TEMAS = 0.93 # Umbral estricto para alta calidad de grupos
-SIMILARITY_THRESHOLD_TITULOS = 0.95
+SIMILARITY_THRESHOLD_TITULOS = 0.95 # Umbral estricto para agrupación por título
 MAX_TOKENS_PROMPT_TXT = 4000
 WINDOW = 80
 NUM_TEMAS_PRINCIPALES = 30
@@ -165,28 +163,75 @@ def get_embedding(texto: str) -> Optional[List[float]]:
 # ======================================
 # Agrupacion de textos
 # ======================================
-def agrupar_textos_similares(textos: List[str], umbral_similitud: float) -> Dict[int, List[int]]:
-    if not textos: return {}
-    embs = [get_embedding(t) for t in textos]
-    valid_indices = [i for i, e in enumerate(embs) if e is not None]
-    if len(valid_indices) < 2: return {i: [idx] for i, idx in enumerate(valid_indices)}
-    emb_matrix = np.array([embs[i] for i in valid_indices])
-    clustering = AgglomerativeClustering(n_clusters=None, distance_threshold=1 - umbral_similitud, metric="cosine", linkage="average").fit(emb_matrix)
-    grupos = defaultdict(list)
-    for i, label in enumerate(clustering.labels_): grupos[label].append(valid_indices[i])
-    return {gid: g for gid, g in enumerate(grupos.values())}
+def group_news_by_similarity_rules(df: pd.DataFrame, key_map: Dict[str, str]) -> Dict[int, List[int]]:
+    """
+    Agrupa noticias basándose en reglas estrictas para asegurar una muy alta similitud.
+    - Regla 1: Títulos con similitud de texto >= SIMILARITY_THRESHOLD_TITULOS.
+    - Regla 2: Resúmenes que inician con las mismas 6 palabras.
+    Dos noticias se agrupan si CUALQUIERA de las reglas se cumple.
+    Esto asegura que solo noticias prácticamente idénticas compartan un análisis de IA.
+    """
+    news_items = df.to_dict('records')
+    num_news = len(news_items)
+    
+    # Extraer y normalizar los datos necesarios de antemano para eficiencia
+    titles = [normalize_title_for_comparison(item.get(key_map.get("titulo"), "")) for item in news_items]
+    summaries = [str(item.get(key_map.get("resumen"), "")) for item in news_items]
+    summary_keys = [" ".join(normalize_title_for_comparison(s).split()[:6]) for s in summaries]
+
+    # Usar una estructura de Disjoint Set Union (DSU) para agrupar eficientemente
+    parent = list(range(num_news))
+    def find(i):
+        if parent[i] == i:
+            return i
+        parent[i] = find(parent[i])
+        return parent[i]
+
+    def union(i, j):
+        root_i = find(i)
+        root_j = find(j)
+        if root_i != root_j:
+            parent[root_j] = root_i
+
+    # Comparar cada par de noticias una sola vez
+    for i in range(num_news):
+        for j in range(i + 1, num_news):
+            # Regla 1: Títulos muy similares
+            title1, title2 = titles[i], titles[j]
+            titles_are_similar = (title1 and title2 and SequenceMatcher(None, title1, title2).ratio() >= SIMILARITY_THRESHOLD_TITULOS)
+
+            # Regla 2: Inicio de resumen idéntico (y no vacío)
+            summary_key1, summary_key2 = summary_keys[i], summary_keys[j]
+            summaries_start_same = (summary_key1 and summary_key1 == summary_key2)
+
+            if titles_are_similar or summaries_start_same:
+                union(i, j)
+
+    # Reconstruir los grupos finales a partir de la estructura DSU
+    final_groups = defaultdict(list)
+    for i in range(num_news):
+        root = find(i)
+        final_groups[root].append(i)
+
+    # Devolver en el formato requerido: {id_grupo: [indice1, indice2, ...]}
+    return {i: group_list for i, group_list in enumerate(final_groups.values())}
 
 def seleccionar_representante(indices: List[int], textos: List[str]) -> Tuple[int, str]:
-    emb_list, valid = [], []
+    if not indices: return -1, ""
+    # Para grupos basados en texto, el más largo suele ser el más informativo.
+    # Se podría volver a la similitud por embedding si fuera necesario, pero esto es más simple y rápido.
+    representante_idx = -1
+    max_len = -1
     for i in indices:
-        e = get_embedding(textos[i])
-        if e is not None: emb_list.append(e); valid.append(i)
-    if not emb_list: return indices[0], textos[indices[0]]
-    M = np.array(emb_list)
-    centro = M.mean(axis=0, keepdims=True)
-    sims = cosine_similarity(M, centro).reshape(-1)
-    idx = valid[int(np.argmax(sims))]
-    return idx, textos[idx]
+        if len(textos[i]) > max_len:
+            max_len = len(textos[i])
+            representante_idx = i
+    
+    if representante_idx != -1:
+        return representante_idx, textos[representante_idx]
+    
+    # Fallback por si todos los textos son vacíos
+    return indices[0], textos[indices[0]]
 
 # ======================================
 # Análisis de tono y tema con IA
@@ -347,7 +392,6 @@ def run_base_logic(sheet):
     for idx, row in enumerate(split_rows): row.update({"original_index": idx, "is_duplicate": False})
     processed_rows = detectar_duplicados_avanzado(split_rows, key_map)
     for row in processed_rows:
-        # --- LÍNEA CORREGIDA ---
         if row["is_duplicate"]: row.update({key_map["tonoai"]: "Duplicada", key_map["tema"]: "Duplicada", key_map["justificaciontono"]: "Noticia duplicada."})
     return processed_rows, key_map
 
@@ -447,55 +491,46 @@ async def run_full_process_async(dossier_file, region_file, internet_file, brand
     else:
         with st.status(f"🧠 **Paso 2/3:** Analizando Tono y Tema para {len(rows_for_unal_analysis)} noticias de '{brand_name}'...", expanded=True) as s:
             df_unal = pd.DataFrame(rows_for_unal_analysis)
+            p_bar = st.progress(0, text="🔎 Creando grupos de noticias idénticas o muy similares...")
             
-            def get_first_sentence(text):
-                if not isinstance(text, str): return ""
-                match = re.match(r'([^.?!]*[.?!])', text)
-                return match.group(0) if match else text
-
+            # NUEVA LÓGICA DE AGRUPACIÓN: Precisa y basada en reglas de texto.
+            grupos_unal = group_news_by_similarity_rules(df_unal, key_map)
+            
+            # Preparar el texto completo que se enviará a la API (solo para los representantes del grupo)
             df_unal['resumen_limpio'] = df_unal[key_map["resumen"]].fillna("").astype(str).apply(corregir_texto)
-            df_unal['primera_oracion'] = df_unal['resumen_limpio'].apply(get_first_sentence)
-            df_unal["texto_para_agrupar"] = df_unal[key_map["titulo"]].fillna("").astype(str) + ". " + df_unal['primera_oracion']
-            textos_para_agrupar = df_unal["texto_para_agrupar"].tolist()
-
             df_unal["resumen_api"] = df_unal[key_map["titulo"]].fillna("").astype(str) + ". " + df_unal['resumen_limpio']
             textos_unal = df_unal["resumen_api"].tolist()
             
-            p_bar = st.progress(0, text="Creando grupos de noticias de alta similitud...")
-            grupos_unal = agrupar_textos_similares(textos_para_agrupar, SIMILARITY_THRESHOLD_TEMAS)
+            num_grupos = len(grupos_unal)
+            st.info(f"💡 Optimización: Se procesarán {len(textos_unal)} noticias en {num_grupos} grupos únicos para análisis.")
             
-            comp = defaultdict(list); dsu = list(range(len(textos_unal)))
-            for _, idxs in grupos_unal.items():
-                if not idxs: continue
-                for j in idxs[1:]: dsu[j] = idxs[0]
-            for i in range(len(textos_unal)): comp[dsu[i]].append(i)
-
-            st.info(f"💡 Optimización: Se procesarán {len(textos_unal)} noticias en {len(comp)} grupos únicos de alta similitud.")
-            
-            representantes = {cid: seleccionar_representante(idxs, textos_unal)[1] for cid, idxs in comp.items()}
+            # Procesamiento asíncrono de cada grupo
+            representantes = {cid: seleccionar_representante(idxs, textos_unal)[1] for cid, idxs in grupos_unal.items()}
             clasificador = ClasificadorIA(brand_name, brand_aliases)
             semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
             tasks = [clasificador._analizar_grupo_async(rep_texto, semaphore) for rep_texto in representantes.values()]
             
             resultados_brutos = []
-            total_tasks = len(tasks)
             for i, f in enumerate(asyncio.as_completed(tasks), 1):
                 resultados_brutos.append(await f)
-                p_bar.progress(i / total_tasks, text=f"Analizando grupo {i}/{total_tasks} con IA")
+                p_bar.progress(i / num_grupos, text=f"Analizando grupo {i}/{num_grupos} con IA")
             
             resultados_por_grupo = {list(representantes.keys())[i]: res for i, res in enumerate(resultados_brutos)}
             
             temas_iniciales = [""] * len(textos_unal)
-            for cid, idxs in comp.items():
+            # Asignar resultados a todas las noticias dentro de cada grupo
+            for cid, idxs in grupos_unal.items():
                 res = resultados_por_grupo.get(cid, {"tono": "Neutro", "tema": "Sin Análisis"})
                 for i in idxs:
                     original_idx = df_unal.index[i]
                     df_unal.loc[original_idx, key_map["tonoai"]] = res["tono"]
                     temas_iniciales[i] = res["tema"]
             
+            # La consolidación de temas ahora es más efectiva al unificar pequeñas variaciones de la IA
             temas_consolidados = consolidar_temas(temas_iniciales, p_bar)
             df_unal[key_map["tema"]] = temas_consolidados
             
+            # Actualizar las filas originales con los resultados del análisis
             results_map = df_unal.set_index("original_index").to_dict("index")
             for row in all_processed_rows:
                 if row["original_index"] in results_map:
@@ -552,7 +587,7 @@ def main():
             st.session_state.password_correct = pwd
             st.rerun()
 
-    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v6.3.1 (Hiper-Foco) | Adaptado para la Universidad Nacional</p></div>", unsafe_allow_html=True)
+    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v6.4.0 (Precisión-Foco) | Adaptado para la Universidad Nacional</p></div>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
