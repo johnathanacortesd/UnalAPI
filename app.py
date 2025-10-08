@@ -407,7 +407,7 @@ def main():
             dossier_file = col1.file_uploader("**1. Dossier Principal** (.xlsx)", type=["xlsx"])
             region_file = col2.file_uploader("**2. Mapeo de Región** (.xlsx)", type=["xlsx"])
             internet_file = col3.file_uploader("**3. Mapeo Internet** (.xlsx)", type=["xlsx"])
-            st.info("El análisis de IA se ejecutará con el modelo `gpt-4o` para máxima precisión.")
+            st.info("El análisis de IA se ejecutará con el modelo `gpt-4.1 nano` para máxima precisión.")
 
             if st.form_submit_button("🚀 **INICIAR ANÁLISIS COMPLETO (MÁXIMA PRECISIÓN)**", use_container_width=True, type="primary"):
                 if not all([dossier_file, region_file, internet_file]):
