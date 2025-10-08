@@ -37,14 +37,14 @@ st.set_page_config(
 OPENAI_MODEL_EMBEDDING = "text-embedding-3-small"
 OPENAI_MODEL_CLASIFICACION = "gpt-4.1-nano-2025-04-14"
 
-# Parámetros de rendimiento y similitud
+# Parámetros de rendimiento y similitud (valores del usuario aplicados)
 CONCURRENT_REQUESTS = 40
 SIMILARITY_THRESHOLD_TONO = 0.92
-SIMILARITY_THRESHOLD_TEMAS = 0.90  # ⬅️ CAMBIADO: antes era 0.85
+SIMILARITY_THRESHOLD_TEMAS = 0.90
 SIMILARITY_THRESHOLD_TITULOS = 0.95 
-MAX_TOKENS_PROMPT_TXT = 2000  # ⬅️ CAMBIADO: antes era 4000
+MAX_TOKENS_PROMPT_TXT = 2000
 WINDOW = 80
-NUM_TEMAS_PRINCIPALES = 40  # ⬅️ CAMBIADO: antes era 30
+NUM_TEMAS_PRINCIPALES = 40
 
 # ======================================
 # Estilos CSS (Personalizados para la UNAL)
@@ -100,18 +100,18 @@ def norm_key(text: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "", unidecode(str(text).strip().lower()))
 
 def limpiar_tema_mejorado(tema: str, titulo_referencia: str = "", marca: str = "Universidad Nacional de Colombia", aliases: List[str] = []) -> str:
-    """Limpia y valida el tema generado con múltiples verificaciones."""
-    if not tema or tema.lower() in ["sin tema", "n/a", "na"]:
+    """Limpia y valida el tema generado, con un fallback basado en el título si no es relevante."""
+    if not tema or tema.lower() in ["sin tema", "n/a", "na", "error de análisis", "error de api", "error formato json"]:
         return "Sin tema"
     
     tema = tema.strip().strip('"').strip("'").strip()
     if tema:
         tema = tema[0].upper() + tema[1:]
     
-    # Lista expandida de palabras prohibidas
     palabras_prohibidas = {
         "en", "de", "del", "la", "el", "y", "o", "con", "sin", "por", "para", 
-        "sobre", "un", "una", "los", "las", "al", "a", "ante", "bajo",
+        "sobre", "un", "una", "los", "las", "al", "a", "ante", "bajo", "desde", "hacia", "hasta",
+        "universidad", "anuncio", "noticia", "comunicado",
         marca.lower(), *[a.lower() for a in aliases],
         "bogota", "bogotá", "medellin", "medellín", "cali", "barranquilla",
         "colombiano", "colombiana", "colombianos", "colombianas",
@@ -121,31 +121,34 @@ def limpiar_tema_mejorado(tema: str, titulo_referencia: str = "", marca: str = "
     palabras = tema.split()
     palabras_filtradas = [p for p in palabras if p.lower() not in palabras_prohibidas]
     
+    while palabras_filtradas and palabras_filtradas[0].lower() in palabras_prohibidas:
+        palabras_filtradas.pop(0)
     while palabras_filtradas and palabras_filtradas[-1].lower() in palabras_prohibidas:
         palabras_filtradas.pop()
     
     tema_limpio = " ".join(palabras_filtradas)
     
-    if len(tema_limpio.split()) > 6:
-        tema_limpio = " ".join(tema_limpio.split()[:6])
+    if len(tema_limpio.split()) > 5:
+        tema_limpio = " ".join(tema_limpio.split()[:5])
     
-    # Validación: el tema debe tener relación con el título
     if titulo_referencia and tema_limpio:
         titulo_norm = normalize_title_for_comparison(titulo_referencia)
         tema_norm = tema_limpio.lower()
         
-        palabras_titulo = set(titulo_norm.split())
+        palabras_titulo = set(p for p in titulo_norm.split() if len(p) > 3 and p.lower() not in palabras_prohibidas)
         palabras_tema = set(tema_norm.split())
-        overlap = palabras_titulo.intersection(palabras_tema)
         
-        if len(overlap) == 0 and palabras_titulo:
-            palabras_relevantes = [p for p in palabras_titulo if len(p) > 4 and p not in palabras_prohibidas]
-            if palabras_relevantes:
-                tema_limpio = palabras_relevantes[0].title()
+        if not palabras_tema:
+            palabras_clave_titulo = sorted(list(palabras_titulo), key=len, reverse=True)
+            return " ".join(palabras_clave_titulo[:4]).title() or "Sin tema"
+
+        if len(palabras_titulo.intersection(palabras_tema)) == 0:
+            palabras_clave_titulo = sorted(list(palabras_titulo), key=len, reverse=True)
+            fallback_tema = " ".join(palabras_clave_titulo[:4]).title()
+            return fallback_tema if fallback_tema else "Sin tema"
     
     return tema_limpio if tema_limpio else "Sin tema"
 
-# Mantener compatibilidad con código antiguo
 def limpiar_tema(tema: str) -> str:
     return limpiar_tema_mejorado(tema)
 
@@ -164,31 +167,20 @@ def normalize_title_for_comparison(title: Any) -> str:
     return re.sub(r"\W+", " ", cleaned).lower().strip()
 
 def clean_title_for_output(title: Any) -> str:
-    """Limpia el título eliminando sufijos comunes como '| El Tiempo'."""
     if not isinstance(title, str):
         return str(title if title is not None else "")
     return re.sub(r"\s*\|\s*[\w\s]+$", "", title).strip()
 
 def corregir_texto(text: Any) -> Any:
-    """Limpia el texto del resumen, eliminando etiquetas HTML, placeholders y espacios extra."""
     if not isinstance(text, str):
         return text if text is not None else ""
-    
-    # Reemplazar secuencias de <br>, <br/>, [...] por un solo espacio
     text = re.sub(r'(<br\s*/?>|\[\.\.\.\])+', ' ', text)
-    
-    # Colapsar cualquier espacio en blanco múltiple a un solo espacio y limpiar los extremos
     text = re.sub(r'\s+', ' ', text).strip()
-    
-    # Asegurarse de que el texto útil comience (elimina caracteres basura al inicio)
-    match = re.search(r"[A-ZÁÉÍÓÚÑ]", text) # Busca la primera mayúscula
+    match = re.search(r"[A-ZÁÉÍÓÚÑ]", text)
     if match:
         text = text[match.start():]
-        
-    # Añadir puntos suspensivos para indicar que es un resumen, si no tiene puntuación final
     if text and not text.endswith(('.', '...', '?', '!')):
         text = text + "..."
-        
     return text
 
 def normalizar_tipo_medio(tipo_raw: str) -> str:
@@ -224,14 +216,10 @@ def agrupar_noticias_por_similitud_inteligente(rows: List[Dict], key_map: Dict[s
     for row in rows:
         titulo = str(row.get(key_map.get("titulo"), "")).strip()
         resumen = str(row.get(key_map.get("resumen"), "")).strip()
-        
         titulo_limpio = re.sub(r'\s*\|.*$', '', titulo)
         titulo_limpio = re.sub(r'[^\w\s]', ' ', titulo_limpio).strip()
-        
         oraciones = re.split(r'[.!?]+', resumen)
         resumen_corto = '. '.join([o.strip() for o in oraciones[:2] if o.strip()])
-        
-        # Título con doble peso
         texto_clave = f"{titulo_limpio} {titulo_limpio} {resumen_corto}"
         textos_comparacion.append(texto_clave)
     
@@ -244,12 +232,12 @@ def agrupar_noticias_por_similitud_inteligente(rows: List[Dict], key_map: Dict[s
                 valid_indices.append(i)
     
     if len(valid_indices) < 2:
-        return {}
+        return {i: [i] for i in range(len(rows))}
     
     emb_matrix = np.array(embs)
     clustering = AgglomerativeClustering(
         n_clusters=None,
-        distance_threshold=0.10,  # 1 - 0.90
+        distance_threshold=1 - SIMILARITY_THRESHOLD_TEMAS,
         metric="cosine",
         linkage="average"
     ).fit(emb_matrix)
@@ -258,22 +246,11 @@ def agrupar_noticias_por_similitud_inteligente(rows: List[Dict], key_map: Dict[s
     for i, label in enumerate(clustering.labels_):
         grupos[label].append(valid_indices[i])
     
-    # Verificar similitud de títulos dentro de grupos
     grupos_filtrados = {}
     for gid, indices in grupos.items():
         if len(indices) >= 2:
-            titulos_grupo = [
-                normalize_title_for_comparison(rows[i].get(key_map.get("titulo")))
-                for i in indices
-            ]
-            
-            similitudes = []
-            for i in range(len(titulos_grupo)):
-                for j in range(i+1, len(titulos_grupo)):
-                    if titulos_grupo[i] and titulos_grupo[j]:
-                        sim = SequenceMatcher(None, titulos_grupo[i], titulos_grupo[j]).ratio()
-                        similitudes.append(sim)
-            
+            titulos_grupo = [normalize_title_for_comparison(rows[i].get(key_map.get("titulo"))) for i in indices]
+            similitudes = [SequenceMatcher(None, titulos_grupo[i], titulos_grupo[j]).ratio() for i in range(len(titulos_grupo)) for j in range(i + 1, len(titulos_grupo)) if titulos_grupo[i] and titulos_grupo[j]]
             if similitudes and np.mean(similitudes) >= 0.65:
                 grupos_filtrados[len(grupos_filtrados)] = indices
             else:
@@ -284,22 +261,15 @@ def agrupar_noticias_por_similitud_inteligente(rows: List[Dict], key_map: Dict[s
     
     return grupos_filtrados
 
-def agrupar_textos_similares(textos: List[str], umbral_similitud: float) -> Dict[int, List[int]]:
-    if not textos: return {}
-    embs = [get_embedding(t) for t in textos]
-    valid_indices = [i for i, e in enumerate(embs) if e is not None]
-    if len(valid_indices) < 2: return {}
-    emb_matrix = np.array([embs[i] for i in valid_indices])
-    clustering = AgglomerativeClustering(n_clusters=None, distance_threshold=1 - umbral_similitud, metric="cosine", linkage="average").fit(emb_matrix)
-    grupos = defaultdict(list)
-    for i, label in enumerate(clustering.labels_): grupos[label].append(valid_indices[i])
-    return {gid: g for gid, g in enumerate(grupos.values())}
-
 def seleccionar_representante(indices: List[int], textos: List[str]) -> Tuple[int, str]:
+    if not indices: return -1, ""
     emb_list, valid = [], []
     for i in indices:
-        e = get_embedding(textos[i])
-        if e is not None: emb_list.append(e); valid.append(i)
+        if i < len(textos):
+            e = get_embedding(textos[i])
+            if e is not None:
+                emb_list.append(e)
+                valid.append(i)
     if not emb_list: return indices[0], textos[indices[0]]
     M = np.array(emb_list)
     centro = M.mean(axis=0, keepdims=True)
@@ -318,40 +288,36 @@ class ClasificadorIA:
     async def _analizar_grupo_async(self, titulo: str, resumen: str, semaphore: asyncio.Semaphore) -> Dict[str, str]:
         async with semaphore:
             titulo_limpio = clean_title_for_output(titulo)
-            
             oraciones_resumen = re.split(r'[.!?]+', resumen)
             contexto_resumen = '. '.join([o.strip() for o in oraciones_resumen[:3] if o.strip()])
-            
             aliases_str = ", ".join(self.aliases) if self.aliases else "ninguno"
-            prompt = f"""Analiza esta noticia sobre '{self.marca}' (alias: {aliases_str}).
+            
+            prompt = f"""Tu tarea es analizar una noticia sobre '{self.marca}' (alias: {aliases_str}) y devolver un análisis en formato JSON.
 
-TÍTULO (PRIORIDAD MÁXIMA): {titulo_limpio}
+Sigue estos pasos rigurosamente:
+1.  **Lee el TÍTULO con máxima atención.** Es la fuente de verdad principal.
+2.  **Identifica el sujeto y la acción principal del TÍTULO.**
+3.  **Crea un TEMA de 2 a 5 palabras que describa ese sujeto y acción.** El tema DEBE ser un reflejo directo del título. Usa el contexto adicional solo para aclarar, no para cambiar el tema principal.
+4.  **Verifica las reglas del TEMA:**
+    - NO debe contener '{self.marca}' ni sus alias.
+    - NO debe contener nombres de ciudades (Bogotá, Medellín, etc.) ni gentilicios (colombiano).
+    - DEBE ser específico. Evita palabras genéricas como "Anuncio", "Noticia", "Universidad".
+5.  **Determina el TONO (Positivo, Negativo, Neutro)** de la noticia hacia la marca.
+6.  **Construye el JSON final.**
 
-CONTEXTO ADICIONAL: {contexto_resumen[:500]}
+---
+**TÍTULO (PRIORIDAD MÁXIMA):** {titulo_limpio}
 
-Genera UN TEMA ESPECÍFICO que:
-1. Refleje fielmente el TÍTULO (es lo más importante)
-2. Sea concreto y descriptivo (2-5 palabras)
-3. NO incluya: nombre de la marca, ciudades, gentilicios colombianos
-4. Capture el asunto principal de la noticia
+**CONTEXTO ADICIONAL:** {contexto_resumen[:500]}
+---
 
-Ejemplos de BUENOS temas:
-- "Investigación científica"
-- "Presupuesto educativo"
-- "Admisiones estudiantes"
-- "Infraestructura campus"
-- "Convenios internacionales"
+**Ejemplos de temas CORRECTOS:**
+- Título: "UNAL abre nueva carrera de Ingeniería Aeroespacial" -> Tema: "Nueva carrera aeroespacial"
+- Título: "Recorte presupuestal afecta laboratorios de la U. Nacional" -> Tema: "Recorte presupuestal laboratorios"
+- Título: "Estudiante de la Nacional gana premio de física" -> Tema: "Premio de física para estudiante"
 
-Ejemplos de MALOS temas (evitar):
-- "Nacional" (demasiado genérico)
-- "Bogotá universidad" (incluye ciudad)
-- "UNAL investigación" (incluye marca)
-
-Clasifica también el TONO hacia la marca: Positivo, Negativo o Neutro.
-
-Responde SOLO con JSON:
+**Responde exclusivamente con el objeto JSON, sin texto adicional.**
 {{"tono": "...", "tema": "..."}}"""
-
             try:
                 resp = await acall_with_retries(
                     openai.ChatCompletion.acreate,
@@ -364,25 +330,61 @@ Responde SOLO con JSON:
                 data = json.loads(resp.choices[0].message.content.strip())
                 tono = str(data.get("tono", "Neutro")).title()
                 tema_bruto = data.get("tema", "Sin tema")
-                
-                # Usar limpieza mejorada
                 tema = limpiar_tema_mejorado(tema_bruto, titulo_limpio, self.marca, self.aliases)
-                
                 return {
                     "tono": tono if tono in ["Positivo", "Negativo", "Neutro"] else "Neutro",
                     "tema": tema
                 }
+            except json.JSONDecodeError:
+                return {"tono": "Neutro", "tema": "Error Formato JSON"}
             except Exception:
-                return {"tono": "Neutro", "tema": "Error de Análisis"}
+                return {"tono": "Neutro", "tema": "Error de API"}
 
-def consolidar_temas(temas: List[str], p_bar) -> List[str]:
-    p_bar.progress(0.7, text=f"📊 Consolidando {len(set(temas))} temas únicos en {NUM_TEMAS_PRINCIPALES} grupos principales...")
-    tema_counts = Counter(t for t in temas if t != "Sin tema")
+async def _generar_tema_consolidado_async(temas_grupo: List[str], semaphore: asyncio.Semaphore) -> str:
+    """Usa un LLM para generar un nombre de tema consolidado para un grupo de temas."""
+    async with semaphore:
+        if not temas_grupo: return "Tema General"
+        if len(temas_grupo) == 1: return temas_grupo[0]
+            
+        lista_temas_str = "\n".join(f"- {t}" for t in temas_grupo)
+        prompt = f"""Dada la siguiente lista de temas específicos de noticias, genera un único TEMA CONSOLIDADO que los represente a todos.
+
+REGLAS:
+1. El tema debe ser conciso (2-4 palabras).
+2. Debe capturar la idea central del grupo.
+3. El resultado debe ser un nombre de categoría, no una frase.
+
+LISTA DE TEMAS:
+{lista_temas_str}
+
+Ejemplo 1:
+- Lista: ["Nueva carrera aeroespacial", "Admisiones ingeniería mecatrónica", "Apertura de posgrados"]
+- Tema Consolidado: "Oferta Académica"
+
+Ejemplo 2:
+- Lista: ["Recorte presupuestal laboratorios", "Crisis financiera universitaria", "Déficit de presupuesto"]
+- Tema Consolidado: "Finanzas y Presupuesto"
+
+TEMA CONSOLIDADO:"""
+        try:
+            resp = await acall_with_retries(
+                openai.ChatCompletion.acreate,
+                model=OPENAI_MODEL_CLASIFICACION,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=20,
+                temperature=0.2,
+            )
+            tema_consolidado = resp.choices[0].message.content.strip().strip('"')
+            return limpiar_tema_mejorado(tema_consolidado)
+        except Exception:
+            return max(Counter(temas_grupo).most_common(), key=lambda x: (x[1], len(x[0])))[0]
+
+async def consolidar_temas(temas: List[str], p_bar) -> List[str]:
+    p_bar.progress(0.7, text=f"📊 Consolidando {len(set(temas))} temas únicos en hasta {NUM_TEMAS_PRINCIPALES} grupos principales...")
+    tema_counts = Counter(t for t in temas if t not in ["Sin tema", "Error de Análisis", "Error de API", "Error Formato JSON"])
     
-    temas_a_clusterizar = [t for t, count in tema_counts.items() if count > 1]
-    singletons = {t for t, count in tema_counts.items() if count == 1}
-    mapa_tema_a_consolidado = {t: t for t in singletons}
-    mapa_tema_a_consolidado["Sin tema"] = "Sin tema"
+    temas_a_clusterizar = list(tema_counts.keys())
+    mapa_tema_a_consolidado = {t: t for t in temas if t not in temas_a_clusterizar}
 
     if not temas_a_clusterizar or len(temas_a_clusterizar) <= NUM_TEMAS_PRINCIPALES:
         p_bar.progress(1.0, "ℹ️ No se requiere consolidación adicional. Usando temas específicos.")
@@ -391,27 +393,37 @@ def consolidar_temas(temas: List[str], p_bar) -> List[str]:
 
     emb_temas = {t: get_embedding(t) for t in temas_a_clusterizar}
     temas_validos = [t for t, emb in emb_temas.items() if emb is not None]
+    
     if len(temas_validos) <= NUM_TEMAS_PRINCIPALES:
         p_bar.progress(1.0, "ℹ️ No hay suficientes temas para una consolidación significativa.")
         for t in temas_a_clusterizar: mapa_tema_a_consolidado[t] = t
         return [mapa_tema_a_consolidado.get(t, t) for t in temas]
 
+    n_clusters = min(NUM_TEMAS_PRINCIPALES, len(temas_validos))
     emb_matrix = np.array([emb_temas[t] for t in temas_validos])
-    clustering = AgglomerativeClustering(n_clusters=NUM_TEMAS_PRINCIPALES, metric="cosine", linkage="average").fit(emb_matrix)
+    clustering = AgglomerativeClustering(n_clusters=n_clusters, metric="cosine", linkage="average").fit(emb_matrix)
     
     mapa_cluster_a_temas = defaultdict(list)
     for i, label in enumerate(clustering.labels_):
         mapa_cluster_a_temas[label].append(temas_validos[i])
 
-    p_bar.progress(0.85, "🧠 Generando nombres para los temas consolidados...")
+    p_bar.progress(0.85, f"🧠 Generando nombres para los {n_clusters} temas consolidados con IA...")
+    semaphore = asyncio.Semaphore(10)
+    tasks = [_generar_tema_consolidado_async(lista_temas, semaphore) for lista_temas in mapa_cluster_a_temas.values()]
+    nombres_consolidados = await asyncio.gather(*tasks)
+
+    mapa_cluster_id_a_nombre = {list(mapa_cluster_a_temas.keys())[i]: nombre for i, nombre in enumerate(nombres_consolidados)}
     for cluster_id, lista_temas in mapa_cluster_a_temas.items():
-        # Usa el tema más largo y representativo como el nombre del cluster
-        tema_principal = max(lista_temas, key=len)
+        tema_principal = mapa_cluster_id_a_nombre[cluster_id]
         for tema in lista_temas:
             mapa_tema_a_consolidado[tema] = tema_principal
     
+    temas_no_validos = set(temas_a_clusterizar) - set(temas_validos)
+    for t in temas_no_validos:
+        mapa_tema_a_consolidado[t] = t
+
     p_bar.progress(1.0, "✅ Consolidación de temas completada.")
-    return [mapa_tema_a_consolidado.get(t, t) for t in temas]
+    return [mapa_tema_a_consolidado.get(t, "Sin tema") for t in temas]
 
 # ======================================
 # Lógica de Duplicados y Procesamiento Base
@@ -500,22 +512,19 @@ def process_mappings_and_links(all_processed_rows, key_map, region_file, interne
 # ======================================
 def _append_rows_to_sheet(sheet, rows_data, key_map, include_ai_columns):
     base_order = ["ID Noticia","Fecha","Hora","Medio","Tipo de Medio","Seccion - Programa","Region","Titulo","Autor - Conductor","Nro. Pagina","Dimension","Duracion - Nro. Caracteres","CPE","Tier","Audiencia","Tono","Resumen - Aclaracion","Link Nota","Link (Streaming - Imagen)","Menciones - Empresa","ID duplicada"]
-    ai_order = ["Tono AI", "Tema"] # Justificacion ya no es necesaria con el prompt unificado
+    ai_order = ["Tono AI", "Tema"]
     final_order = base_order[:16] + ai_order + base_order[16:] if include_ai_columns else base_order
     
     sheet.append(final_order)
     numeric_columns = {"ID Noticia", "Nro. Pagina", "Dimension", "Duracion - Nro. Caracteres", "CPE", "Tier", "Audiencia"}
     
     for row_data in rows_data:
-        # Limpiar texto de título y resumen antes de escribir
         titulo_key = key_map.get("titulo")
         if titulo_key in row_data:
             row_data[titulo_key] = clean_title_for_output(row_data.get(titulo_key))
-
         resumen_key = key_map.get("resumen")
         if resumen_key in row_data:
             row_data[resumen_key] = corregir_texto(row_data.get(resumen_key))
-
         row_to_append, links_to_add = [], {}
         for col_idx, header in enumerate(final_order, 1):
             nk_header = norm_key(header)
@@ -537,17 +546,12 @@ def _append_rows_to_sheet(sheet, rows_data, key_map, include_ai_columns):
 
 def generate_two_sheet_excel(all_processed_rows, key_map):
     out_wb = Workbook()
-    
-    # Pestaña 1: UNAL con IA
     sheet1 = out_wb.active
     sheet1.title = "UNAL con IA"
     unal_rows = [row for row in all_processed_rows if row.get(key_map.get("menciones")) == "Universidad Nacional de Colombia"]
     _append_rows_to_sheet(sheet1, unal_rows, key_map, include_ai_columns=True)
-    
-    # Pestaña 2: Todas las Marcas (sin IA)
     sheet2 = out_wb.create_sheet("Todas las Marcas")
     _append_rows_to_sheet(sheet2, all_processed_rows, key_map, include_ai_columns=False)
-
     output = io.BytesIO()
     out_wb.save(output)
     return output.getvalue()
@@ -568,56 +572,40 @@ async def run_full_process_async(dossier_file, region_file, internet_file, brand
         all_processed_rows = process_mappings_and_links(all_processed_rows, key_map, region_file, internet_file)
         s.update(label="✅ **Paso 1/3:** Base de datos preparada", state="complete")
     
-    rows_for_unal_analysis = [
-        row for row in all_processed_rows 
-        if not row.get("is_duplicate") and row.get(key_map.get("menciones")) == brand_name
-    ]
+    rows_for_unal_analysis = [row for row in all_processed_rows if not row.get("is_duplicate") and row.get(key_map.get("menciones")) == brand_name]
 
     if not rows_for_unal_analysis:
         st.warning(f"No se encontraron noticias únicas para la marca '{brand_name}' para analizar con IA. El informe se generará sin análisis de Tono/Tema.")
     else:
         with st.status(f"🧠 **Paso 2/3:** Analizando Tono y Tema para {len(rows_for_unal_analysis)} noticias de '{brand_name}'...", expanded=True) as s:
             df_unal = pd.DataFrame(rows_for_unal_analysis)
-            # La siguiente línea es necesaria para seleccionar_representante
             df_unal["resumen_api"] = df_unal[key_map["titulo"]].fillna("").astype(str) + ". " + df_unal[key_map["resumen"]].fillna("").astype(str)
             textos_unal = df_unal["resumen_api"].tolist()
             
             p_bar = st.progress(0, text="Agrupando noticias por similitud inteligente...")
             grupos_unal = agrupar_noticias_por_similitud_inteligente(rows_for_unal_analysis, key_map)
             
-            comp = defaultdict(list); dsu = list(range(len(textos_unal)))
+            comp = defaultdict(list)
+            dsu = list(range(len(textos_unal)))
             for _, idxs in grupos_unal.items():
-                if not idxs: continue
-                # Asegurarse de que todos los índices están dentro del rango de dsu
-                valid_idxs = [i for i in idxs if i < len(dsu)]
-                if len(valid_idxs) > 1:
-                    for j in valid_idxs[1:]: dsu[j] = valid_idxs[0]
-
+                if idxs:
+                    for j in idxs[1:]:
+                        if j < len(dsu): dsu[j] = idxs[0]
             for i in range(len(textos_unal)): comp[dsu[i]].append(i)
             
             st.info(f"💡 Optimización: Se procesarán {len(textos_unal)} noticias en {len(comp)} grupos únicos.")
             
-            # Preparar info completa para cada grupo
             representantes_info = {}
             for cid, idxs in comp.items():
-                idx_rep = seleccionar_representante(idxs, textos_unal)[0]
-                row = rows_for_unal_analysis[idx_rep]
-                representantes_info[cid] = {
-                    'titulo': row.get(key_map.get("titulo"), ""),
-                    'resumen': row.get(key_map.get("resumen"), "")
-                }
-            
+                idx_rep, _ = seleccionar_representante(idxs, textos_unal)
+                if idx_rep != -1 and idx_rep < len(rows_for_unal_analysis):
+                    row = rows_for_unal_analysis[idx_rep]
+                    representantes_info[cid] = {'titulo': row.get(key_map.get("titulo"), ""), 'resumen': row.get(key_map.get("resumen"), "")}
+
             clasificador = ClasificadorIA(brand_name, brand_aliases)
             semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
-            tasks = [
-                clasificador._analizar_grupo_async(
-                    info['titulo'],
-                    info['resumen'],
-                    semaphore
-                )
-                for info in representantes_info.values()
-            ]
-
+            tasks = [clasificador._analizar_grupo_async(info['titulo'], info['resumen'], semaphore) for info in representantes_info.values()]
+            
             resultados_brutos = []
             total_tasks = len(tasks)
             for i, f in enumerate(asyncio.as_completed(tasks), 1):
@@ -630,11 +618,12 @@ async def run_full_process_async(dossier_file, region_file, internet_file, brand
             for cid, idxs in comp.items():
                 res = resultados_por_grupo.get(cid, {"tono": "Neutro", "tema": "Sin Análisis"})
                 for i in idxs:
-                    original_idx = df_unal.index[i]
-                    df_unal.loc[original_idx, key_map["tonoai"]] = res["tono"]
-                    temas_iniciales[i] = res["tema"]
+                    if i < len(df_unal):
+                        original_idx = df_unal.index[i]
+                        df_unal.loc[original_idx, key_map["tonoai"]] = res["tono"]
+                        temas_iniciales[i] = res["tema"]
             
-            temas_consolidados = consolidar_temas(temas_iniciales, p_bar)
+            temas_consolidados = await consolidar_temas(temas_iniciales, p_bar)
             df_unal[key_map["tema"]] = temas_consolidados
             
             results_map = df_unal.set_index("original_index").to_dict("index")
@@ -693,7 +682,7 @@ def main():
             st.session_state.password_correct = pwd
             st.rerun()
 
-    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v6.1 | Adaptado para la Universidad Nacional</p></div>", unsafe_allow_html=True)
+    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v6.2 | Calidad de análisis mejorada</p></div>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
