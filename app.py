@@ -33,18 +33,16 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# ===================================================================
-# CAMBIO ESTRATÉGICO: Ascenso al modelo más potente para máxima precisión
-# ===================================================================
+# Modelo de IA de alta precisión
 OPENAI_MODEL_EMBEDDING = "text-embedding-3-small"
-OPENAI_MODEL_CLASIFICACION = "gpt-4.1-nano-2025-04-14" # Modelo actualizado para razonamiento superior
+OPENAI_MODEL_CLASIFICACION = "gpt-4.1-nano-2025-04-14"
 
 # Parámetros de rendimiento y similitud
-CONCURRENT_REQUESTS = 25 # Reducido ligeramente para acomodar la mayor carga de gpt-4o
-SIMILARITY_THRESHOLD_TEMAS = 0.90 # Aumentado para ser más estricto
+CONCURRENT_REQUESTS = 25
+SIMILARITY_THRESHOLD_TEMAS = 0.90
 SIMILARITY_THRESHOLD_TITULOS = 0.95 
 SIMILARITY_THRESHOLD_RESUMEN = 0.92
-MAX_TOKENS_PROMPT_TXT = 6000 # gpt-4o maneja más contexto
+MAX_TOKENS_PROMPT_TXT = 6000
 NUM_TEMAS_GENERALES = 30
 
 # ======================================
@@ -189,7 +187,7 @@ def seleccionar_representante_mejorado(indices: List[int], df: pd.DataFrame, key
     return {"index": mejor_idx, "texto_completo": texto_combinado}
 
 # ======================================
-# Análisis con IA (v8.0 - ALTA PRECISIÓN)
+# Análisis con IA (v8.1 - ALTA PRECISIÓN)
 # ======================================
 class ClasificadorIA:
     def __init__(self, marca: str, aliases: List[str]):
@@ -264,6 +262,46 @@ def consolidar_temas_generales(temas_especificos: List[str], p_bar) -> List[str]
 # ======================================
 # Lógica de Duplicados, Mapeos y Excel
 # ======================================
+# ======================================
+# *** FUNCIÓN RESTAURADA ***
+# ======================================
+def detectar_duplicados_avanzado(rows: List[Dict], key_map: Dict[str, str]) -> List[Dict]:
+    processed_rows = deepcopy(rows)
+    seen_online_url, seen_broadcast, online_title_buckets = {}, {}, defaultdict(list)
+    for i, row in enumerate(processed_rows):
+        if row.get("is_duplicate"): continue
+        tipo_medio = normalizar_tipo_medio(str(row.get(key_map.get("tipodemedio"))))
+        mencion_norm = norm_key(row.get(key_map.get("menciones")))
+        medio_norm = norm_key(row.get(key_map.get("medio")))
+        if tipo_medio == "Internet":
+            url = (row.get(key_map.get("link_nota"), {}) or {}).get("url")
+            if url and mencion_norm:
+                key = (url, mencion_norm)
+                if key in seen_online_url:
+                    row["is_duplicate"], row["idduplicada"] = True, processed_rows[seen_online_url[key]].get(key_map.get("idnoticia"), "")
+                    continue
+                else: seen_online_url[key] = i
+            if medio_norm and mencion_norm: online_title_buckets[(medio_norm, mencion_norm)].append(i)
+        elif tipo_medio in ["Radio", "Televisión"]:
+            hora = str(row.get(key_map.get("hora"), "")).strip()
+            if mencion_norm and medio_norm and hora:
+                key = (mencion_norm, medio_norm, hora)
+                if key in seen_broadcast:
+                    row["is_duplicate"], row["idduplicada"] = True, processed_rows[seen_broadcast[key]].get(key_map.get("idnoticia"), "")
+                else: seen_broadcast[key] = i
+    for _, indices in online_title_buckets.items():
+        if len(indices) < 2: continue
+        for i in range(len(indices)):
+            for j in range(i + 1, len(indices)):
+                idx1, idx2 = indices[i], indices[j]
+                if processed_rows[idx1].get("is_duplicate") or processed_rows[idx2].get("is_duplicate"): continue
+                t1 = normalize_text_for_comparison(processed_rows[idx1].get(key_map.get("titulo")))
+                t2 = normalize_text_for_comparison(processed_rows[idx2].get(key_map.get("titulo")))
+                if t1 and t2 and SequenceMatcher(None, t1, t2).ratio() >= SIMILARITY_THRESHOLD_TITULOS:
+                    winner, loser = (idx2, idx1) if len(t1) < len(t2) else (idx1, idx2)
+                    processed_rows[loser]["is_duplicate"], processed_rows[loser]["idduplicada"] = True, processed_rows[winner].get(key_map.get("idnoticia"), "")
+    return processed_rows
+
 def run_base_logic(sheet):
     headers = [c.value for c in sheet[1] if c.value]
     norm_keys = [norm_key(h) for h in headers]
@@ -279,6 +317,9 @@ def run_base_logic(sheet):
             new = deepcopy(base); new[key_map["menciones"]] = m
             split_rows.append(new)
     for idx, row in enumerate(split_rows): row.update({"original_index": idx, "is_duplicate": False})
+    # =================================================================
+    # La llamada que causaba el error ahora funcionará correctamente
+    # =================================================================
     processed_rows = detectar_duplicados_avanzado(split_rows, key_map)
     for row in processed_rows:
         if row["is_duplicate"]: row.update({key_map["tonoai"]: "Duplicada", key_map["temageneral"]: "Duplicada", key_map["temaespecifico"]: "Duplicada"})
@@ -441,7 +482,7 @@ def main():
             st.session_state.password_correct = pwd
             st.rerun()
 
-    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v8.0 (Alta Precisión) | Adaptado para la Universidad Nacional</p></div>", unsafe_allow_html=True)
+    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v8.1 (Alta Precisión) | Adaptado para la Universidad Nacional</p></div>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
