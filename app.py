@@ -16,6 +16,7 @@ import time
 from unidecode import unidecode
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.cluster import AgglomerativeClustering
 import json
 import asyncio
 import hashlib
@@ -207,14 +208,11 @@ def _embed_texts(texts: List[str]) -> List[List[float]]:
     """
     if not texts:
         return []
-    # Llamada en lotes prudentes (OpenAI Embedding soporta lotes)
-    # Por simplicidad, un solo batch mientras no sea masivo.
     resp = call_with_retries(
         openai.Embedding.create,
         model=OPENAI_MODEL_EMBEDDING,
         input=texts
     )
-    # Orden viene alineada al input
     return [d["embedding"] for d in resp["data"]]
 
 def consolidar_temas_hibrido(temas: List[str], p_bar=None, cos_threshold: float = SIMILARITY_THRESHOLD_TEMAS_CONSOLIDACION_EMB) -> List[str]:
@@ -229,50 +227,34 @@ def consolidar_temas_hibrido(temas: List[str], p_bar=None, cos_threshold: float 
     if not temas:
         return []
 
-    # Contar y ordenar temas por frecuencia (más frecuentes primero)
     counts = Counter(temas)
     unique_temas = list(counts.keys())
-
-    # Ignorar valores "ruido" para canónicos
     excl_set = set(["", "Sin tema", "Fallo de Análisis", "Duplicada"])
-    # Pre-normalización
     norm_map = {t: normalizar_tema_para_comparacion(t) for t in unique_temas}
-    # Orden por frecuencia descendente
-    unique_temas_sorted = sorted(unique_temas, key=lambda x: (-counts[x], x))
+    unique_temas_sorted = sorted(unique_temas, key=lambda x: (-counts[x], len(x), x))
 
-    # Embeddings por tema normalizado (para estabilidad semántica)
-    # Embeddar solo los que no son ruido
     emb_input = [norm_map[t] if t not in excl_set else "" for t in unique_temas_sorted]
     embeddings = []
     if any(s for s in emb_input):
-        # Reemplazar entradas vacías con un valor no vacío mínimo para alinear con API
-        # Construimos una lista con "" y cadenas reales; API permite "", pero mejor evitar
-        # Para mantener alineación, hacemos llamada tal cual (OpenAI permite strings vacíos).
         embeddings = _embed_texts(emb_input)
     else:
-        embeddings = [[0.0] * 10 for _ in emb_input]  # dummy
+        embeddings = [[0.0] * 10 for _ in emb_input]
 
-    # Construir canonizadores incrementales
-    canonicos: List[str] = []                 # temas canónicos elegidos (originales)
-    canonicos_norm: List[str] = []            # sus normalizados
-    canonicos_emb: List[np.ndarray] = []      # embeddings de canónicos
-    mapping: Dict[str, str] = {}              # tema -> tema canónico (original)
+    canonicos: List[str] = []
+    canonicos_norm: List[str] = []
+    canonicos_emb: List[np.ndarray] = []
+    mapping: Dict[str, str] = {}
 
-    # Parámetros de fusión
-    lex_threshold = SIMILARITY_THRESHOLD_TEMAS_CONSOLIDACION  # p.ej. 0.93
-    cos_thr = cos_threshold                                   # p.ej. 0.88
+    lex_threshold = SIMILARITY_THRESHOLD_TEMAS_CONSOLIDACION
+    cos_thr = cos_threshold
 
     for idx, tema in enumerate(unique_temas_sorted):
         if tema in mapping:
-            continue  # ya mapeado por un similar previo
-
+            continue
         if tema in excl_set or not norm_map[tema]:
-            # Ruido o vacío: se mapea a sí mismo
             mapping[tema] = tema
-            # No se añade a canónicos para no contaminar fusiones
             continue
 
-        # Intentar unir con algun canónico existente
         t_norm = norm_map[tema]
         t_emb = np.array(embeddings[idx]) if embeddings and idx < len(embeddings) else None
 
@@ -282,19 +264,15 @@ def consolidar_temas_hibrido(temas: List[str], p_bar=None, cos_threshold: float 
 
         for ci, ctema in enumerate(canonicos):
             c_norm = canonicos_norm[ci]
-            # 1) chequeo léxico fuerte
             lex_score = _sim_lexica(t_norm, c_norm)
             if lex_score >= lex_threshold and lex_score > best_score:
                 best_target = ctema
                 best_score = lex_score
                 found_match = True
-                # si es casi idéntico, no hace falta seguir
                 if lex_score >= 0.98:
                     break
-            # 2) chequeo semántico (siembeddings)
             if not found_match and t_emb is not None and len(canonicos_emb) > ci and canonicos_emb[ci] is not None:
                 c_emb = canonicos_emb[ci]
-                # cos_sim = (a·b)/(|a||b|), usamos sklearn si quisiéramos; aquí manual
                 num = float(np.dot(t_emb, c_emb))
                 den = float(np.linalg.norm(t_emb) * np.linalg.norm(c_emb) + 1e-8)
                 cos_sim = num / den if den > 0 else 0.0
@@ -306,30 +284,24 @@ def consolidar_temas_hibrido(temas: List[str], p_bar=None, cos_threshold: float 
         if found_match and best_target:
             mapping[tema] = best_target
         else:
-            # nuevo canónico
             mapping[tema] = tema
             canonicos.append(tema)
             canonicos_norm.append(t_norm)
             canonicos_emb.append(t_emb if t_emb is not None else None)
 
-    # Asegurar que siempre mapeamos a la forma más frecuente por cluster:
-    # Recalcular por cada canónico cuál es el tema más frecuente que apunta a él y usarlo de etiqueta final.
     cluster_members: Dict[str, List[str]] = defaultdict(list)
     for t, c in mapping.items():
         cluster_members[c].append(t)
 
     final_label_for_cluster: Dict[str, str] = {}
     for can_key, members in cluster_members.items():
-        # escoger el miembro más frecuente (y más corto como desempate)
         best = sorted(members, key=lambda x: (-counts[x], len(x), x))[0]
         final_label_for_cluster[can_key] = best
 
-    # Construir mapa final tema->etiqueta canonical elegida
     final_map: Dict[str, str] = {}
     for t, c in mapping.items():
         final_map[t] = final_label_for_cluster.get(c, c)
 
-    # Aplicar al listado original
     final_temas = [final_map.get(t, t) for t in temas]
 
     if p_bar:
@@ -551,6 +523,49 @@ def process_mappings_and_links(all_processed_rows, key_map, region_file, interne
     return all_processed_rows
 
 # ======================================
+# Nuevo: Mapeo SOV final sobre "Menciones - Empresa"
+# ======================================
+def process_sov_mapping_final(all_rows: List[Dict], key_map: Dict[str, str], sov_file) -> List[Dict]:
+    """
+    Aplica un mapeo final a la columna 'Menciones - Empresa' usando el archivo SOV.
+    El archivo SOV debe tener columnas: 'Menciones - Empresa' y 'Nombre'.
+    Reemplaza el valor de 'Menciones - Empresa' por el 'Nombre' estandarizado.
+    """
+    try:
+        df_sov = pd.read_excel(sov_file)
+        if df_sov.empty:
+            return all_rows
+        # detectar columnas con robustez
+        cols_by_norm = {norm_key(c): c for c in df_sov.columns}
+        menc_col = cols_by_norm.get(norm_key("Menciones - Empresa"))
+        name_col = cols_by_norm.get(norm_key("Nombre"))
+        if not menc_col or not name_col:
+            st.warning("⚠️ El archivo SOV no contiene columnas 'Menciones - Empresa' y 'Nombre' reconocibles.")
+            return all_rows
+
+        # construir mapa
+        sov_map = {}
+        for _, row in df_sov.iterrows():
+            mk = str(row.get(menc_col, "")).strip().lower()
+            mv = row.get(name_col, None)
+            if mk and mv is not None and str(mv).strip():
+                sov_map[mk] = str(mv).strip()
+
+        if not sov_map:
+            return all_rows
+
+        menc_key = key_map.get("menciones")
+        for r in all_rows:
+            current = r.get(menc_key, "")
+            mk = str(current).strip().lower()
+            if mk in sov_map:
+                r[menc_key] = sov_map[mk]
+        return all_rows
+    except Exception as e:
+        st.warning(f"⚠️ No se pudo aplicar el mapeo SOV: {e}")
+        return all_rows
+
+# ======================================
 # Generación de Excel con dos pestañas
 # ======================================
 def _append_rows_to_sheet(sheet, rows_data, key_map, include_ai_columns):
@@ -612,10 +627,9 @@ def generate_two_sheet_excel(all_processed_rows, key_map):
 # ======================================
 # Proceso Principal y UI
 # ======================================
-async def run_full_process_async(dossier_file, region_file, internet_file, brand_name, brand_aliases, emb_cos_thr):
+async def run_full_process_async(dossier_file, region_file, internet_file, sov_file, brand_name, brand_aliases, emb_cos_thr):
     try:
         openai.api_key = st.secrets["OPENAI_API_KEY"]
-        # Para compatibilidad con openai.ChatCompletion.acreate
         openai.aiosession.set(None)
     except Exception:
         st.error("❌ Error: OPENAI_API_KEY no encontrado en los Secrets de Streamlit.")
@@ -626,7 +640,6 @@ async def run_full_process_async(dossier_file, region_file, internet_file, brand
         all_processed_rows = process_mappings_and_links(all_processed_rows, key_map, region_file, internet_file)
         s.update(label="✅ **Paso 1/3:** Base de datos preparada", state="complete")
     
-    # Definir SIEMPRE el mapa índice->fila para evitar fallos cuando no hay noticias UNAL
     index_to_row_map = {row['original_index']: row for row in all_processed_rows}
 
     rows_for_unal_analysis = [
@@ -639,18 +652,13 @@ async def run_full_process_async(dossier_file, region_file, internet_file, brand
     else:
         with st.status(f"🧠 **Paso 2/3:** Analizando Tono y Tema para {len(rows_for_unal_analysis)} noticias de '{brand_name}'...", expanded=True) as s:
             p_bar = st.progress(0, text="🔎 Agrupando noticias por similitud de título...")
-            
-            # La agrupación ahora es segura y devuelve grupos de original_index
             groups_of_indices = group_news_by_title_similarity_safe(rows_for_unal_analysis, key_map)
             num_grupos = len(groups_of_indices)
             st.info(f"💡 Se procesarán {len(rows_for_unal_analysis)} noticias en {num_grupos} lotes únicos enviados a la IA.")
             clasificador = ClasificadorIA(brand_name, brand_aliases)
             semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
-            
-            # Mapear cada grupo a su futuro resultado de IA
             group_to_future_map = {}
             for group in groups_of_indices:
-                # Seleccionar representante del grupo (texto más largo)
                 representative_index = -1
                 max_len = -1
                 for original_index in group:
@@ -664,7 +672,6 @@ async def run_full_process_async(dossier_file, region_file, internet_file, brand
                 future = asyncio.create_task(clasificador._analizar_grupo_async(text_to_analyze, semaphore))
                 group_to_future_map[tuple(group)] = future
 
-            # Ejecutar todas las tareas y asignar resultados
             processed_count = 0
             all_temas_generated = []
             for group, future in group_to_future_map.items():
@@ -674,22 +681,21 @@ async def run_full_process_async(dossier_file, region_file, internet_file, brand
                 p_bar.progress(processed_count / max(1, num_grupos), text=f"Analizando lote {processed_count}/{num_grupos} con IA")
                 for original_index in group:
                     index_to_row_map[original_index][key_map["tonoai"]] = result["tono"]
-                    index_to_row_map[original_index]["tema_temp"] = result["tema"]  # temporal
+                    index_to_row_map[original_index]["tema_temp"] = result["tema"]
 
-            # Consolidación de temas (HÍBRIDA) para reducir drásticamente el número de temas preservando exactitud
             temas_consolidados = consolidar_temas_hibrido(all_temas_generated, p_bar, cos_threshold=emb_cos_thr)
             mapa_tema_consolidado = {tema_orig: tema_consol for tema_orig, tema_consol in zip(all_temas_generated, temas_consolidados)}
             
-            # Asignar temas consolidados finales
             for row in rows_for_unal_analysis:
                 temp_tema = row.pop("tema_temp", "Sin tema")
                 index_to_row_map[row['original_index']][key_map["tema"]] = mapa_tema_consolidado.get(temp_tema, temp_tema)
 
             s.update(label="✅ **Paso 2/3:** Análisis con IA completado", state="complete")
 
-    with st.status("📊 **Paso 3/3:** Generando informe final...", expanded=True) as s:
-        # Reconstruir la lista final a partir del mapa actualizado
+    with st.status("📊 **Paso 3/3:** Aplicando SOV y generando informe final...", expanded=True) as s:
         final_processed_rows = list(index_to_row_map.values())
+        # NUEVO: aplicar SOV como paso final a ambas hojas
+        final_processed_rows = process_sov_mapping_final(final_processed_rows, key_map, sov_file)
         st.session_state["output_data"] = generate_two_sheet_excel(final_processed_rows, key_map)
         st.session_state["output_filename"] = f"Informe_Analisis_UNAL_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
         st.session_state["processing_complete"] = True
@@ -706,16 +712,15 @@ def main():
     if not st.session_state.get("processing_complete", False):
         with st.form("input_form"):
             st.markdown("### 📂 Archivos de Entrada")
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
             dossier_file = col1.file_uploader("**1. Dossier Principal** (.xlsx)", type=["xlsx"])
             region_file = col2.file_uploader("**2. Mapeo de Región** (.xlsx)", type=["xlsx"])
             internet_file = col3.file_uploader("**3. Mapeo Internet** (.xlsx)", type=["xlsx"])
-            
+            sov_file = col4.file_uploader("**4. Mapeo SOV** (.xlsx)", type=["xlsx"])
+
             st.info("El análisis de IA se ejecutará automáticamente para la marca **'Universidad Nacional de Colombia'**.")
-            
             brand_aliases_text = st.text_area("**Alias y voceros de la UNAL** (separados por ;)", value="UNAL;UN;U. Nacional;Universidad Nacional;Ismael Peña", height=80)
 
-            # Nuevo: control de fuerza de consolidación (similitud coseno de embeddings)
             st.markdown("### ⚙️ Parámetros de Consolidación de Temas")
             emb_cos_thr = st.slider(
                 "Fuerza de consolidación semántica (mayor = menos temas)",
@@ -724,12 +729,12 @@ def main():
             st.caption("Sugerencia: 0.86–0.90 suele reducir bastante los temas manteniendo precisión.")
 
             if st.form_submit_button("🚀 **INICIAR ANÁLISIS COMPLETO**", use_container_width=True, type="primary"):
-                if not all([dossier_file, region_file, internet_file]):
-                    st.error("❌ Faltan archivos obligatorios.")
+                if not all([dossier_file, region_file, internet_file, sov_file]):
+                    st.error("❌ Faltan archivos obligatorios (incluya el Mapeo SOV).")
                 else:
                     brand_name = "Universidad Nacional de Colombia"
                     aliases = [a.strip() for a in brand_aliases_text.split(";") if a.strip()]
-                    asyncio.run(run_full_process_async(dossier_file, region_file, internet_file, brand_name, aliases, emb_cos_thr))
+                    asyncio.run(run_full_process_async(dossier_file, region_file, internet_file, sov_file, brand_name, aliases, emb_cos_thr))
                     st.rerun()
     else:
         st.success("## 🎉 Análisis Completado Exitosamente")
@@ -748,7 +753,7 @@ def main():
             st.session_state.password_correct = pwd
             st.rerun()
 
-    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v7.1.0 (Hybrid-Topic-Consolidation) | Adaptado para la Universidad Nacional</p></div>", unsafe_allow_html=True)
+    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v7.2.0 (Hybrid-Topic+SOV) | Adaptado para la Universidad Nacional</p></div>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
