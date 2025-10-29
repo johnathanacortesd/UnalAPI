@@ -43,7 +43,8 @@ MODELO_EMBEDDINGS_LOCAL = "sentence-transformers/paraphrase-multilingual-mpnet-b
 TARGET_BRANDS = ["U. Nacional de Colombia", "Universidad Nacional de Colombia"]
 
 # Parámetros
-SIMILARITY_THRESHOLD_TITULOS = 0.95
+SIMILARITY_THRESHOLD_TITULOS = 0.90  # Umbral para considerar títulos similares
+SIMILARITY_THRESHOLD_RESUMENES = 0.85  # Umbral para considerar resúmenes similares
 
 # 30 TEMAS PREDEFINIDOS (4-6 palabras cada uno)
 TEMAS_PREDEFINIDOS = [
@@ -148,7 +149,63 @@ def corregir_texto(text: Any) -> Any:
     if text and not text.endswith(('.', '...', '?', '!')): text = text + "..."
     return text
 
-def normalizar_tipo_medio(tipo_raw: str) -> str:
+def normalizar_texto_para_comparacion(texto: Any) -> str:
+    """Normaliza texto para comparación de similitud"""
+    if not isinstance(texto, str): return ""
+    # Remover puntuación, espacios extra y convertir a minúsculas
+    texto = re.sub(r'[^\w\s]', '', unidecode(texto.lower()))
+    texto = re.sub(r'\s+', ' ', texto).strip()
+    return texto
+
+def calcular_similitud_textos(texto1: str, texto2: str) -> float:
+    """Calcula similitud entre dos textos usando SequenceMatcher"""
+    if not texto1 or not texto2:
+        return 0.0
+    norm1 = normalizar_texto_para_comparacion(texto1)
+    norm2 = normalizar_texto_para_comparacion(texto2)
+    if not norm1 or not norm2:
+        return 0.0
+    return SequenceMatcher(None, norm1, norm2).ratio()
+
+def agrupar_noticias_similares(noticias: List[Dict], key_map: Dict[str, str]) -> Dict[int, List[int]]:
+    """
+    Agrupa noticias que tienen títulos o resúmenes similares.
+    Retorna un diccionario: {representante_idx: [lista de índices similares]}
+    """
+    grupos = {}  # {representante_idx: [idx1, idx2, ...]}
+    procesados = set()
+    
+    for i, noticia_i in enumerate(noticias):
+        if i in procesados:
+            continue
+            
+        titulo_i = str(noticia_i.get(key_map.get('titulo'), ''))
+        resumen_i = str(noticia_i.get(key_map.get('resumen'), ''))
+        
+        # Esta noticia será el representante de su grupo
+        grupo_actual = [i]
+        procesados.add(i)
+        
+        # Buscar noticias similares
+        for j, noticia_j in enumerate(noticias):
+            if j <= i or j in procesados:
+                continue
+                
+            titulo_j = str(noticia_j.get(key_map.get('titulo'), ''))
+            resumen_j = str(noticia_j.get(key_map.get('resumen'), ''))
+            
+            # Calcular similitud de títulos y resúmenes
+            sim_titulo = calcular_similitud_textos(titulo_i, titulo_j)
+            sim_resumen = calcular_similitud_textos(resumen_i, resumen_j)
+            
+            # Si el título O el resumen son muy similares, agregar al grupo
+            if sim_titulo >= SIMILARITY_THRESHOLD_TITULOS or sim_resumen >= SIMILARITY_THRESHOLD_RESUMENES:
+                grupo_actual.append(j)
+                procesados.add(j)
+        
+        grupos[i] = grupo_actual
+    
+    return grupos
     if not isinstance(tipo_raw, str): return str(tipo_raw)
     t = unidecode(tipo_raw.strip().lower())
     mapping = {"fm": "Radio", "am": "Radio", "radio": "Radio", "aire": "Televisión", "cable": "Televisión", "tv": "Televisión", "television": "Televisión", "televisión": "Televisión", "senal abierta": "Televisión", "señal abierta": "Televisión", "diario": "Prensa", "prensa": "Prensa", "revista": "Revista", "revistas": "Revista", "online": "Internet", "internet": "Internet", "digital": "Internet", "web": "Internet"}
@@ -191,7 +248,7 @@ def generar_embeddings_temas():
 # ======================================
 # Lógica de Análisis de Tono y Tema con Modelos Locales
 # ======================================
-def analizar_tono_local(texto: str, tokenizer, model) -> str:
+def analizar_tono_local(texto: str, tokenizer, model, progress_bar=None, current=0, total=0) -> str:
     """Analiza el tono usando el modelo de 1-5 estrellas y lo mapea a etiquetas."""
     if not texto or not isinstance(texto, str):
         return "Neutro"
@@ -357,10 +414,21 @@ def run_full_process(dossier_file, region_file, internet_file, sov_file):
     # Iniciar temporizador
     tiempo_inicio = time.time()
     
-    with st.status("📋 **Paso 1/3:** Limpieza y preparación de datos...", expanded=True) as s:
-        all_processed_rows, key_map = run_base_logic(load_workbook(dossier_file, data_only=True).active)
-        all_processed_rows = process_mappings_and_links(all_processed_rows, key_map, region_file, internet_file)
-        s.update(label="✅ **Paso 1/3:** Base de datos preparada", state="complete")
+    # Crear contenedor para la barra de progreso general
+    progress_container = st.empty()
+    status_text = st.empty()
+    
+    # Paso 1: Limpieza y preparación (0-30%)
+    progress_container.progress(0.0)
+    status_text.markdown("### 📋 **Paso 1/3:** Limpieza y preparación de datos...")
+    
+    all_processed_rows, key_map = run_base_logic(load_workbook(dossier_file, data_only=True).active)
+    progress_container.progress(0.15)
+    
+    all_processed_rows = process_mappings_and_links(all_processed_rows, key_map, region_file, internet_file)
+    progress_container.progress(0.30)
+    status_text.markdown("### ✅ **Paso 1/3:** Base de datos preparada")
+    time.sleep(0.5)
     
     for row in all_processed_rows: row["__is_target_brand"] = (row.get(key_map.get("menciones")) in TARGET_BRANDS)
     index_to_row_map = {row['original_index']: row for row in all_processed_rows}
@@ -369,33 +437,104 @@ def run_full_process(dossier_file, region_file, internet_file, sov_file):
     if not target_rows_all:
         st.warning("No se encontraron noticias únicas para las marcas objetivo para analizar.")
     else:
-        with st.status("🧠 **Paso 2/3:** Analizando Tono y Tema con modelos locales...", expanded=True) as s:
-            p_bar = st.progress(0, text="🚀 Preparando modelos locales (esto puede tardar la primera vez)...")
-            tokenizer_sent, model_sent = cargar_modelo_sentimiento()
+        # Paso 2: Análisis de IA (30-80%)
+        status_text.markdown("### 🧠 **Paso 2/3:** Analizando Tono y Tema con modelos locales...")
+        progress_container.progress(0.30)
+        
+        # Agrupar noticias similares
+        status_text.markdown("### 🔗 **Paso 2/3:** Identificando noticias similares...")
+        grupos_similares = agrupar_noticias_similares(target_rows_all, key_map)
+        progress_container.progress(0.33)
+        
+        # Obtener solo los representantes de cada grupo
+        representantes_indices = list(grupos_similares.keys())
+        noticias_representantes = [target_rows_all[i] for i in representantes_indices]
+        
+        status_text.markdown(f"### 📊 **Paso 2/3:** {len(noticias_representantes)} grupos únicos identificados de {len(target_rows_all)} noticias")
+        time.sleep(0.3)
+        
+        # Cargar modelos
+        tokenizer_sent, model_sent = cargar_modelo_sentimiento()
+        progress_container.progress(0.38)
+        
+        # Análisis de tono SOLO para representantes
+        status_text.markdown(f"### 📊 **Paso 2/3:** Analizando tono para {len(noticias_representantes)} grupos únicos...")
+        cache_tonos = {}  # {idx_representante: tono}
+        
+        for i, idx_rep in enumerate(representantes_indices):
+            row = target_rows_all[idx_rep]
+            texto = f"{corregir_texto(row.get(key_map.get('titulo'), ''))}. {corregir_texto(row.get(key_map.get('resumen'), ''))}"
+            tono = analizar_tono_local(texto, tokenizer_sent, model_sent)
+            cache_tonos[idx_rep] = tono
             
-            p_bar.progress(0.05, text=f"📊 Analizando tono para {len(target_rows_all)} noticias...")
-            for i, row in enumerate(target_rows_all):
-                texto = f"{corregir_texto(row.get(key_map.get('titulo'), ''))}. {corregir_texto(row.get(key_map.get('resumen'), ''))}"
-                tono = analizar_tono_local(texto, tokenizer_sent, model_sent)
-                index_to_row_map[row['original_index']][key_map.get("tonoai")] = tono
+            # Actualizar progreso (38% - 52%)
+            if (i + 1) % 3 == 0 or i == len(noticias_representantes) - 1:
+                progreso = 0.38 + (0.14 * (i + 1) / len(noticias_representantes))
+                progress_container.progress(progreso)
+                status_text.markdown(f"### 📊 **Paso 2/3:** Tono analizado: {i+1}/{len(noticias_representantes)} grupos")
+        
+        # Aplicar tonos a todos los miembros del grupo
+        for idx_rep, grupo in grupos_similares.items():
+            tono = cache_tonos[idx_rep]
+            for idx in grupo:
+                index_to_row_map[target_rows_all[idx]['original_index']][key_map.get("tonoai")] = tono
+        
+        progress_container.progress(0.55)
+        time.sleep(0.3)
+        
+        # Análisis de temas SOLO para representantes
+        status_text.markdown("### 🔍 **Paso 2/3:** Asignando temas a grupos únicos...")
+        progress_container.progress(0.55)
+        
+        modelo_emb = cargar_modelo_embeddings()
+        progress_container.progress(0.60)
+        
+        embeddings_temas = generar_embeddings_temas()
+        progress_container.progress(0.65)
+        
+        cache_temas = {}  # {idx_representante: tema}
+        for i, idx_rep in enumerate(representantes_indices):
+            noticia = target_rows_all[idx_rep]
+            texto = f"{corregir_texto(noticia.get(key_map.get('titulo'), ''))}. {corregir_texto(noticia.get(key_map.get('resumen'), ''))}"
+            tema = asignar_tema_por_similitud(texto, modelo_emb, embeddings_temas)
+            cache_temas[idx_rep] = tema
             
-            mapa_idx_a_tema = generar_temas_sin_api(target_rows_all, key_map, p_bar)
-            for idx, tema in mapa_idx_a_tema.items():
-                if idx in index_to_row_map: index_to_row_map[idx][key_map.get("tema")] = tema
-            s.update(label="✅ **Paso 2/3:** Análisis de IA completado", state="complete")
+            # Actualizar progreso (65% - 80%)
+            if (i + 1) % 3 == 0 or i == len(noticias_representantes) - 1:
+                progreso = 0.65 + (0.15 * (i + 1) / len(noticias_representantes))
+                progress_container.progress(progreso)
+                status_text.markdown(f"### 🔍 **Paso 2/3:** Temas asignados: {i+1}/{len(noticias_representantes)} grupos")
+        
+        # Aplicar temas a todos los miembros del grupo
+        for idx_rep, grupo in grupos_similares.items():
+            tema = cache_temas[idx_rep]
+            for idx in grupo:
+                index_to_row_map[target_rows_all[idx]['original_index']][key_map.get("tema")] = tema
+        
+        progress_container.progress(0.80)
+        status_text.markdown("### ✅ **Paso 2/3:** Análisis de IA completado")
+        time.sleep(0.5)
 
-    with st.status("📊 **Paso 3/3:** Aplicando mapeo SOV y generando informe...", expanded=True) as s:
-        final_processed_rows = list(index_to_row_map.values())
-        final_processed_rows = process_sov_mapping_final(final_processed_rows, key_map, sov_file)
-        st.session_state["output_data"] = generate_two_sheet_excel(final_processed_rows, key_map)
-        st.session_state["output_filename"] = f"Informe_Analisis_UNAL_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-        st.session_state["processing_complete"] = True
-        
-        # Calcular tiempo total
-        tiempo_total = time.time() - tiempo_inicio
-        st.session_state["tiempo_procesamiento"] = tiempo_total
-        
-        s.update(label="✅ **Paso 3/3:** Informe generado exitosamente", state="complete")
+    # Paso 3: Generación de informe (80-100%)
+    status_text.markdown("### 📊 **Paso 3/3:** Aplicando mapeo SOV...")
+    progress_container.progress(0.80)
+    
+    final_processed_rows = list(index_to_row_map.values())
+    final_processed_rows = process_sov_mapping_final(final_processed_rows, key_map, sov_file)
+    progress_container.progress(0.90)
+    
+    status_text.markdown("### 📊 **Paso 3/3:** Generando archivo Excel...")
+    st.session_state["output_data"] = generate_two_sheet_excel(final_processed_rows, key_map)
+    st.session_state["output_filename"] = f"Informe_Analisis_UNAL_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    st.session_state["processing_complete"] = True
+    
+    # Calcular tiempo total
+    tiempo_total = time.time() - tiempo_inicio
+    st.session_state["tiempo_procesamiento"] = tiempo_total
+    
+    progress_container.progress(1.0)
+    status_text.markdown("### ✅ **Paso 3/3:** Informe generado exitosamente")
+    time.sleep(0.5)
 
 def main():
     load_custom_css()
