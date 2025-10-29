@@ -42,6 +42,7 @@ TARGET_BRANDS = ["U. Nacional de Colombia", "Universidad Nacional de Colombia"]
 
 # Parámetros de rendimiento y similitud
 CONCURRENT_REQUESTS = 40
+EMBEDDING_BATCH_SIZE = 1000  # <<< SOLUCIÓN 1: Constante para el tamaño del lote de embeddings
 SIMILARITY_THRESHOLD_TITULOS = 0.95  # Umbral estricto para agrupación por título
 SIMILARITY_THRESHOLD_TEMAS_CONSOLIDACION = 0.93  # Umbral léxico para unificar temas casi idénticos (SequenceMatcher)
 SIMILARITY_THRESHOLD_TEMAS_CONSOLIDACION_EMB = 0.88  # Umbral de similitud coseno sobre embeddings para fusionar temas
@@ -205,18 +206,38 @@ def normalizar_tema_para_comparacion(tema: str) -> str:
 def _sim_lexica(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
+# <<< SOLUCIÓN 2: Reemplazar esta función por la versión con procesamiento por lotes
 def _embed_texts(texts: List[str]) -> List[List[float]]:
     """
-    Obtiene embeddings (sincrónico con reintentos) para una lista de textos.
+    Obtiene embeddings (sincrónico con reintentos) para una lista de textos,
+    manejando la paginación en lotes para evitar errores de límite de la API.
     """
     if not texts:
         return []
-    resp = call_with_retries(
-        openai.Embedding.create,
-        model=OPENAI_MODEL_EMBEDDING,
-        input=texts
-    )
-    return [d["embedding"] for d in resp["data"]]
+
+    all_embeddings = []
+    # Iterar sobre la lista de textos en trozos del tamaño definido
+    for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+        # Crear un lote (batch) con una porción de la lista
+        batch = texts[i:i + EMBEDDING_BATCH_SIZE]
+        
+        try:
+            resp = call_with_retries(
+                openai.Embedding.create,
+                model=OPENAI_MODEL_EMBEDDING,
+                input=batch
+            )
+            batch_embeddings = [d["embedding"] for d in resp.get("data", [])]
+            all_embeddings.extend(batch_embeddings)
+        except Exception as e:
+            st.warning(f"⚠️ Error al procesar un lote de embeddings: {e}. Se usarán vectores nulos para este lote.")
+            # Si un lote falla, añadir vectores nulos del tamaño correcto para no romper el proceso.
+            embedding_dim = 1536  # Dimensión para text-embedding-3-small
+            all_embeddings.extend([[0.0] * embedding_dim] * len(batch))
+        
+        time.sleep(0.05)  # Pequeña pausa para ser cortés con la API
+
+    return all_embeddings
 
 def consolidar_temas_hibrido(temas: List[str], p_bar=None, cos_threshold: float = SIMILARITY_THRESHOLD_TEMAS_CONSOLIDACION_EMB) -> List[str]:
     """
@@ -241,7 +262,9 @@ def consolidar_temas_hibrido(temas: List[str], p_bar=None, cos_threshold: float 
     if any(s for s in emb_input):
         embeddings = _embed_texts(emb_input)
     else:
-        embeddings = [[0.0] * 10 for _ in emb_input]
+        # <<< SOLUCIÓN 3: Corregir la dimensión del vector en el caso de fallback
+        embedding_dim = 1536  # Dimensión correcta para el modelo
+        embeddings = [[0.0] * embedding_dim for _ in emb_input]
 
     canonicos: List[str] = []
     canonicos_norm: List[str] = []
