@@ -152,7 +152,7 @@ def generar_embeddings_temas():
     return modelo.encode(TEMAS_PREDEFINIDOS, show_progress_bar=False)
 
 # ======================================
-# ### OPTIMIZACIÓN 1: Agrupación Eficiente ###
+# Lógica de Análisis Optimizada
 # ======================================
 def agrupa_noticias_similares_optimizado(noticias: List[Dict], key_map: Dict[str, str], status_update) -> Dict[int, List[int]]:
     status_update("Optimizando textos para comparación...")
@@ -173,33 +173,21 @@ def agrupa_noticias_similares_optimizado(noticias: List[Dict], key_map: Dict[str
     
     for i in range(len(noticias)):
         if i in procesados: continue
-        
-        grupo_actual = [i]
-        procesados.add(i)
-        
+        grupo_actual = [i]; procesados.add(i)
         key_i = " ".join(noticias[i]['norm_titulo'].split()[:5])
         candidatos_indices = buckets.get(key_i, [])
         
         for j_cand in candidatos_indices:
             if j_cand <= i or j_cand in procesados: continue
-
             sim_titulo = calcular_similitud_textos(noticias[i]['norm_titulo'], noticias[j_cand]['norm_titulo'])
             if sim_titulo >= SIMILARITY_THRESHOLD_TITULOS:
-                grupo_actual.append(j_cand)
-                procesados.add(j_cand)
-                continue
-            
+                grupo_actual.append(j_cand); procesados.add(j_cand); continue
             sim_resumen = calcular_similitud_textos(noticias[i]['norm_resumen'], noticias[j_cand]['norm_resumen'])
             if sim_resumen >= SIMILARITY_THRESHOLD_RESUMENES:
-                grupo_actual.append(j_cand)
-                procesados.add(j_cand)
-
+                grupo_actual.append(j_cand); procesados.add(j_cand)
         grupos[i] = grupo_actual
     return grupos
 
-# ======================================
-# ### OPTIMIZACIÓN 2: Análisis de IA por Lotes (Batch) ###
-# ======================================
 def analizar_tono_batch(textos: List[str], tokenizer, model) -> List[str]:
     if not textos: return []
     try:
@@ -220,8 +208,50 @@ def asignar_tema_batch(textos: List[str], modelo_emb, embeddings_temas) -> List[
     except Exception: return ["Tema no asignado"] * len(textos)
 
 # ======================================
-# Lógica de Procesamiento de Datos (Base)
+# Lógica de Procesamiento de Datos (Base) - VERSIÓN ROBUSTA
 # ======================================
+def run_base_logic(sheet, status_update):
+    status_update("Leyendo encabezados del archivo...")
+    headers = [c.value for c in sheet[1] if c.value]
+    norm_keys = [norm_key(h) for h in headers]
+    
+    key_map = {nk: nk for nk in norm_keys}
+    key_map.update({"titulo": norm_key("Titulo"), "resumen": norm_key("Resumen - Aclaracion"), "menciones": norm_key("Menciones - Empresa"), "medio": norm_key("Medio"), "tonoai": norm_key("Tono AI"), "justificaciontono": norm_key("Justificacion Tono"), "tema": norm_key("Tema"), "idnoticia": norm_key("ID Noticia"), "idduplicada": norm_key("ID duplicada"), "tipodemedio": norm_key("Tipo de Medio"), "hora": norm_key("Hora"), "link_nota": norm_key("Link Nota"), "link_streaming": norm_key("Link (Streaming - Imagen)"), "region": norm_key("Region")})
+    
+    status_update("Procesando filas de datos de forma segura...")
+    rows = []
+    for row_idx, row_cells in enumerate(sheet.iter_rows(min_row=2), start=2):
+        if all(c.value is None for c in row_cells): continue
+        
+        # Zip trunca la iteración a la longitud de la lista más corta, evitando IndexErrors
+        row_data = dict(zip(norm_keys, row_cells))
+        
+        # Procesar valores y extraer links
+        processed_row = {}
+        for key, cell in row_data.items():
+            if key in [key_map["link_nota"], key_map["link_streaming"]]:
+                processed_row[key] = extract_link(cell)
+            else:
+                processed_row[key] = cell.value
+        rows.append(processed_row)
+
+    status_update(f"Se leyeron {len(rows)} filas. Dividiendo por menciones...")
+    split_rows = []
+    for base in rows:
+        base[key_map["tipodemedio"]] = normalizar_tipo_medio(base.get(key_map["tipodemedio"]))
+        menciones_str = str(base.get(key_map["menciones"], ""))
+        menciones_list = [m.strip() for m in menciones_str.split(";") if m.strip()] or [menciones_str]
+        for m in menciones_list:
+            new = deepcopy(base); new[key_map["menciones"]] = m; split_rows.append(new)
+    
+    for idx, row in enumerate(split_rows): row.update({"original_index": idx, "is_duplicate": False})
+    
+    status_update("Detectando duplicados...")
+    processed_rows = detectar_duplicados_avanzado(split_rows, key_map)
+    for row in processed_rows:
+        if row["is_duplicate"]: row.update({"tonoai": "Duplicada", "tema": "Duplicada", "justificaciontono": "Noticia duplicada."})
+    return processed_rows, key_map
+
 def detectar_duplicados_avanzado(rows: List[Dict], key_map: Dict[str, str]) -> List[Dict]:
     processed_rows = deepcopy(rows)
     seen_online_url, seen_broadcast = {}, {}
@@ -244,40 +274,11 @@ def detectar_duplicados_avanzado(rows: List[Dict], key_map: Dict[str, str]) -> L
                 else: seen_broadcast[key] = i
     return processed_rows
 
-def run_base_logic(sheet):
-    headers = [c.value for c in sheet[1] if c.value]
-    norm_keys = [norm_key(h) for h in headers]
-    key_map = {nk: nk for nk in norm_keys}
-    key_map.update({"titulo": norm_key("Titulo"), "resumen": norm_key("Resumen - Aclaracion"), "menciones": norm_key("Menciones - Empresa"), "medio": norm_key("Medio"), "tonoai": norm_key("Tono AI"), "justificaciontono": norm_key("Justificacion Tono"), "tema": norm_key("Tema"), "idnoticia": norm_key("ID Noticia"), "idduplicada": norm_key("ID duplicada"), "tipodemedio": norm_key("Tipo de Medio"), "hora": norm_key("Hora"), "link_nota": norm_key("Link Nota"), "link_streaming": norm_key("Link (Streaming - Imagen)"), "region": norm_key("Region")})
-    
-    rows = []
-    for row_cells in sheet.iter_rows(min_row=2):
-        if all(c.value is None for c in row_cells): continue
-        row_data = {}
-        for i, key in enumerate(norm_keys):
-            cell = row_cells[i]
-            if key in [key_map["link_nota"], key_map["link_streaming"]]:
-                row_data[key] = extract_link(cell)
-            else:
-                row_data[key] = cell.value
-        rows.append(row_data)
-
-    split_rows = []
-    for base in rows:
-        base[key_map["tipodemedio"]] = normalizar_tipo_medio(base.get(key_map["tipodemedio"]))
-        menciones_str = str(base.get(key_map["menciones"], ""))
-        menciones_list = [m.strip() for m in menciones_str.split(";") if m.strip()] or [menciones_str]
-        for m in menciones_list:
-            new = deepcopy(base); new[key_map["menciones"]] = m; split_rows.append(new)
-    
-    for idx, row in enumerate(split_rows): row.update({"original_index": idx, "is_duplicate": False})
-    
-    processed_rows = detectar_duplicados_avanzado(split_rows, key_map)
-    for row in processed_rows:
-        if row["is_duplicate"]: row.update({"tonoai": "Duplicada", "tema": "Duplicada", "justificaciontono": "Noticia duplicada."})
-    return processed_rows, key_map
-
+# ======================================
+# Mapeos y Generación de Excel (sin cambios)
+# ======================================
 def process_mappings_and_links(all_processed_rows, key_map, region_file, internet_file):
+    # (Tu código original aquí... Es correcto)
     df_region = pd.read_excel(region_file); region_map = {str(k).lower().strip(): v for k, v in pd.Series(df_region.iloc[:, 1].values, index=df_region.iloc[:, 0]).to_dict().items()}
     df_internet = pd.read_excel(internet_file); internet_map = {str(k).lower().strip(): v for k, v in pd.Series(df_internet.iloc[:, 1].values, index=df_internet.iloc[:, 0]).to_dict().items()}
     for row in all_processed_rows:
@@ -287,6 +288,7 @@ def process_mappings_and_links(all_processed_rows, key_map, region_file, interne
     return all_processed_rows
 
 def process_sov_mapping_final(all_rows: List[Dict], key_map: Dict[str, str], sov_file) -> List[Dict]:
+    # (Tu código original aquí... Es correcto)
     try:
         df_sov = pd.read_excel(sov_file)
         if df_sov.empty: return all_rows
@@ -302,10 +304,8 @@ def process_sov_mapping_final(all_rows: List[Dict], key_map: Dict[str, str], sov
     except Exception as e:
         st.warning(f"⚠️ No se pudo aplicar el mapeo SOV: {e}"); return all_rows
 
-# ======================================
-# Generación de Excel
-# ======================================
 def generate_two_sheet_excel(all_processed_rows, key_map):
+    # (Tu código original aquí... Es correcto)
     out_wb = Workbook()
     sheet1 = out_wb.active; sheet1.title = "UNAL con IA"
     unal_rows = [row for row in all_processed_rows if row.get("__is_target_brand")]
@@ -316,6 +316,7 @@ def generate_two_sheet_excel(all_processed_rows, key_map):
     return output.getvalue()
 
 def _append_rows_to_sheet(sheet, rows_data, key_map, include_ai_columns):
+    # (Tu código original aquí... Es correcto)
     base_order = ["ID Noticia","Fecha","Hora","Medio","Tipo de Medio","Seccion - Programa","Region","Titulo","Autor - Conductor","Nro. Pagina","Dimension","Duracion - Nro. Caracteres","CPE","Tier","Audiencia","Tono","Resumen - Aclaracion","Link Nota","Link (Streaming - Imagen)","Menciones - Empresa","ID duplicada"]
     ai_order = ["Tono AI", "Tema"]
     final_order = base_order[:16] + ai_order + base_order[16:] if include_ai_columns else base_order
@@ -342,69 +343,68 @@ def run_full_process(dossier_file, region_file, internet_file, sov_file):
     tiempo_inicio = time.time()
     
     with st.status("🚀 **Iniciando Análisis...**", expanded=True) as status:
-        status.write("Paso 1/4: Preparando y limpiando datos...")
-        all_processed_rows, key_map = run_base_logic(load_workbook(dossier_file, data_only=True).active)
-        all_processed_rows = process_mappings_and_links(all_processed_rows, key_map, region_file, internet_file)
-        
-        for row in all_processed_rows:
-            row["__is_target_brand"] = (row.get(key_map.get("menciones")) in TARGET_BRANDS)
-        
-        index_to_row_map = {row['original_index']: row for row in all_processed_rows}
-        target_rows_all = [row for row in all_processed_rows if row.get("__is_target_brand") and not row.get("is_duplicate")]
-
-        if not target_rows_all:
-            st.warning("No se encontraron noticias únicas para las marcas objetivo para analizar.")
-            status.update(label="⚠️ Análisis finalizado: Sin noticias para procesar.", state="complete")
-            return
-
-        status.update(label="Paso 2/4: Agrupando noticias similares (método optimizado)...")
-        grupos_similares = agrupa_noticias_similares_optimizado(target_rows_all, key_map, status.write)
-        
-        representantes_indices = list(grupos_similares.keys())
-        noticias_representantes = [target_rows_all[i] for i in representantes_indices]
-        
-        status.write(f"Se identificaron {len(noticias_representantes)} grupos únicos de noticias de un total de {len(target_rows_all)}.")
-        
-        status.update(label="Paso 3/4: Analizando Tono y Tema con IA (procesamiento por lotes)...")
-        
-        status.write("Cargando modelos de IA...")
-        tokenizer_sent, model_sent = cargar_modelo_sentimiento()
-        modelo_emb = cargar_modelo_embeddings()
-        embeddings_temas = generar_embeddings_temas()
-        
-        textos_para_analisis = [
-            f"{corregir_texto(rep.get(key_map.get('titulo'), ''))}. {corregir_texto(rep.get(key_map.get('resumen'), ''))}"
-            for rep in noticias_representantes
-        ]
-        
-        status.write(f"Analizando tono para {len(textos_para_analisis)} grupos...")
-        resultados_tono = analizar_tono_batch(textos_para_analisis, tokenizer_sent, model_sent)
-        
-        status.write(f"Asignando temas para {len(textos_para_analisis)} grupos...")
-        resultados_tema = asignar_tema_batch(textos_para_analisis, modelo_emb, embeddings_temas)
-        
-        status.write("Asignando resultados a todos los miembros de cada grupo...")
-        for i, idx_rep in enumerate(representantes_indices):
-            tono = resultados_tono[i]
-            tema = resultados_tema[i]
+        try:
+            status.write("Paso 1/4: Preparando y limpiando datos...")
+            all_processed_rows, key_map = run_base_logic(load_workbook(dossier_file, data_only=True).active, status.write)
             
-            for idx_miembro_lista in grupos_similares[idx_rep]:
-                original_global_index = target_rows_all[idx_miembro_lista]['original_index']
-                index_to_row_map[original_global_index][key_map.get("tonoai")] = tono
-                index_to_row_map[original_global_index][key_map.get("tema")] = tema
+            status.write("Aplicando mapeos de región e internet...")
+            all_processed_rows = process_mappings_and_links(all_processed_rows, key_map, region_file, internet_file)
+            
+            for row in all_processed_rows:
+                row["__is_target_brand"] = (row.get(key_map.get("menciones")) in TARGET_BRANDS)
+            
+            index_to_row_map = {row['original_index']: row for row in all_processed_rows}
+            target_rows_all = [row for row in all_processed_rows if row.get("__is_target_brand") and not row.get("is_duplicate")]
 
-        status.update(label="Paso 4/4: Generando el informe final...")
-        final_processed_rows = list(index_to_row_map.values())
-        final_processed_rows = process_sov_mapping_final(final_processed_rows, key_map, sov_file)
-        
-        st.session_state["output_data"] = generate_two_sheet_excel(final_processed_rows, key_map)
-        st.session_state["output_filename"] = f"Informe_Analisis_UNAL_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-        st.session_state["processing_complete"] = True
-        
-        tiempo_total = time.time() - tiempo_inicio
-        st.session_state["tiempo_procesamiento"] = tiempo_total
-        
-        status.update(label="✅ ¡Análisis Completado!", state="complete", expanded=False)
+            if not target_rows_all:
+                st.warning("No se encontraron noticias únicas para las marcas objetivo para analizar.")
+                status.update(label="⚠️ Análisis finalizado: Sin noticias para procesar.", state="complete"); return
+
+            status.update(label="Paso 2/4: Agrupando noticias similares (método optimizado)...")
+            grupos_similares = agrupa_noticias_similares_optimizado(target_rows_all, key_map, status.write)
+            representantes_indices = list(grupos_similares.keys())
+            noticias_representantes = [target_rows_all[i] for i in representantes_indices]
+            status.write(f"Se identificaron {len(noticias_representantes)} grupos únicos de noticias de un total de {len(target_rows_all)}.")
+            
+            status.update(label="Paso 3/4: Analizando Tono y Tema con IA (procesamiento por lotes)...")
+            status.write("Cargando modelos de IA...")
+            tokenizer_sent, model_sent = cargar_modelo_sentimiento()
+            modelo_emb = cargar_modelo_embeddings()
+            embeddings_temas = generar_embeddings_temas()
+            
+            textos_para_analisis = [f"{corregir_texto(rep.get(key_map.get('titulo'), ''))}. {corregir_texto(rep.get(key_map.get('resumen'), ''))}" for rep in noticias_representantes]
+            
+            status.write(f"Analizando tono para {len(textos_para_analisis)} grupos...")
+            resultados_tono = analizar_tono_batch(textos_para_analisis, tokenizer_sent, model_sent)
+            
+            status.write(f"Asignando temas para {len(textos_para_analisis)} grupos...")
+            resultados_tema = asignar_tema_batch(textos_para_analisis, modelo_emb, embeddings_temas)
+            
+            status.write("Asignando resultados a todos los miembros de cada grupo...")
+            for i, idx_rep in enumerate(representantes_indices):
+                tono, tema = resultados_tono[i], resultados_tema[i]
+                for idx_miembro_lista in grupos_similares[idx_rep]:
+                    original_global_index = target_rows_all[idx_miembro_lista]['original_index']
+                    index_to_row_map[original_global_index][key_map.get("tonoai")] = tono
+                    index_to_row_map[original_global_index][key_map.get("tema")] = tema
+
+            status.update(label="Paso 4/4: Generando el informe final...")
+            final_processed_rows = list(index_to_row_map.values())
+            final_processed_rows = process_sov_mapping_final(final_processed_rows, key_map, sov_file)
+            
+            st.session_state["output_data"] = generate_two_sheet_excel(final_processed_rows, key_map)
+            st.session_state["output_filename"] = f"Informe_Analisis_UNAL_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+            st.session_state["processing_complete"] = True
+            st.session_state["tiempo_procesamiento"] = time.time() - tiempo_inicio
+            
+            status.update(label="✅ ¡Análisis Completado!", state="complete", expanded=False)
+
+        except Exception as e:
+            status.update(label="❌ Error Crítico Durante el Procesamiento", state="error", expanded=True)
+            st.error(f"La aplicación ha encontrado un error. Por favor, revisa los archivos de entrada o contacta al soporte.\n\nDetalle técnico: {e}")
+            st.exception(e) # Esto imprimirá el traceback completo para depuración
+            st.session_state["processing_complete"] = False
+
 
 def main():
     load_custom_css()
@@ -457,7 +457,7 @@ def main():
             st.session_state.password_correct = pwd
             st.rerun()
 
-    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v11.1 (Optimizado y Corregido) | Universidad Nacional de Colombia</p></div>", unsafe_allow_html=True)
+    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v11.2 (Lectura Robusta) | Universidad Nacional de Colombia</p></div>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
