@@ -9,13 +9,11 @@ from difflib import SequenceMatcher
 from copy import deepcopy
 import datetime
 import io
-import openai
 import re
 import time
 from unidecode import unidecode
 import numpy as np
 import json
-import asyncio
 from typing import List, Dict, Tuple, Any
 
 # ### LIBRERÍAS PARA MODELOS LOCALES ###
@@ -23,6 +21,7 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from sentence_transformers import SentenceTransformer
 import torch
 from sklearn.cluster import KMeans
+from sklearn.metrics.pairwise import cosine_similarity
 
 # ======================================
 # Configuracion general
@@ -35,8 +34,6 @@ st.set_page_config(
 )
 
 # ### CONFIGURACIÓN DE MODELOS ###
-# Modelo ligero de OpenAI para el etiquetado final de temas
-OPENAI_MODEL_ETIQUETADO = "gpt-4.1-nano-2025-04-14" 
 # Modelo de sentimiento local (ligero y multilingüe)
 MODELO_SENTIMIENTO_LOCAL = "nlptown/bert-base-multilingual-uncased-sentiment"
 # Modelo de embeddings local
@@ -47,8 +44,48 @@ TARGET_BRANDS = ["U. Nacional de Colombia", "Universidad Nacional de Colombia"]
 
 # Parámetros
 SIMILARITY_THRESHOLD_TITULOS = 0.95
-MAX_TOKENS_PROMPT_TXT = 4000
-NUM_TEMAS_CLUSTERING = 20
+
+# 30 TEMAS PREDEFINIDOS (4-6 palabras cada uno)
+TEMAS_PREDEFINIDOS = [
+    # Gobernanza y Administración
+    "Elección y Gestión del Rector",
+    "Decisiones del Consejo Superior Universitario",
+    "Presupuesto y Financiación Universitaria",
+    "Políticas y Reformas Administrativas",
+    "Nombramientos y Cargos Directivos",
+    # Vida Académica e Investigación
+    "Proceso de Admisión y Aspirantes",
+    "Desarrollo de Programas Académicos",
+    "Investigaciones y Publicaciones Científicas",
+    "Rankings y Acreditación Institucional",
+    "Grados, Egresados y Ceremonias",
+    "Colaboraciones y Convenios Académicos",
+    # Vida Estudiantil y Bienestar
+    "Protestas y Movilización Estudiantil",
+    "Actividades y Grupos Estudiantiles",
+    "Bienestar y Apoyo Estudiantil",
+    "Asuntos de Representación Estudiantil",
+    "Eventos Culturales y Deportivos",
+    # Campus, Infraestructura y Seguridad
+    "Desarrollo de Infraestructura y Sedes",
+    "Seguridad y Orden Público Campus",
+    "Sostenibilidad y Medio Ambiente Campus",
+    "Conectividad y Recursos Tecnológicos",
+    # Relación con la Sociedad y el País
+    "Aportes a Políticas Públicas",
+    "Proyectos de Extensión y Comunidad",
+    "Relación con el Gobierno Nacional",
+    "Debates sobre Educación Superior",
+    "Alianzas con Sector Privado",
+    # Conflictos, Controversias y Logros
+    "Controversias y Denuncias Internas",
+    "Reconocimientos y Premios Institucionales",
+    "Egresados Destacados y Nombramientos",
+    "Conflictos Laborales y Profesorado",
+    "Relaciones con Egresados Alumni"
+]
+
+NUM_TEMAS = len(TEMAS_PREDEFINIDOS)
 
 # ======================================
 # Estilos CSS
@@ -60,6 +97,9 @@ def load_custom_css():
         :root { --primary-color: #005A3A; --secondary-color: #B38612; --card-bg: #ffffff; --shadow-light: 0 2px 4px rgba(0,0,0,0.1); --border-radius: 12px; }
         .main-header { background: linear-gradient(135deg, var(--primary-color) 0%, var(--secondary-color) 100%); color: white; padding: 2rem; border-radius: var(--border-radius); text-align: center; font-size: 2.2rem; font-weight: 800; margin-bottom: 1.5rem; box-shadow: var(--shadow-light); }
         .stButton > button { border-radius: 8px; font-weight: 600; }
+        .timer-box { background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%); padding: 1.5rem; border-radius: 12px; text-align: center; margin: 1rem 0; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .timer-box h2 { color: #01579b; margin: 0; font-size: 2rem; }
+        .timer-box p { color: #0277bd; margin: 0.5rem 0 0 0; font-size: 1rem; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -84,26 +124,9 @@ def check_password() -> bool:
                     st.error("❌ Contraseña incorrecta")
     return False
 
-async def acall_with_retries(api_func, *args, **kwargs):
-    for attempt in range(3):
-        try:
-            return await api_func(*args, **kwargs)
-        except Exception as e:
-            if attempt == 2: raise e
-            await asyncio.sleep(1 * (2 ** attempt))
-
 def norm_key(text: Any) -> str:
     if text is None: return ""
     return re.sub(r"[^a-z0-9]+", "", unidecode(str(text).strip().lower()))
-
-def limpiar_tema(tema: str) -> str:
-    if not tema: return "Sin tema"
-    tema = tema.strip().strip('"').strip("'").strip()
-    if tema: tema = tema[0].upper() + tema[1:]
-    palabras = [p for p in tema.split() if p.lower() not in ["en","de","del","la","el","y","o","con","sin","por","para","sobre"]]
-    tema = " ".join(palabras)
-    if len(tema.split()) > 6: tema = " ".join(tema.split()[:6])
-    return tema if tema else "Sin tema"
 
 def extract_link(cell):
     if hasattr(cell, "hyperlink") and cell.hyperlink: return {"value": "Link", "url": cell.hyperlink.target}
@@ -111,12 +134,6 @@ def extract_link(cell):
         match = re.search(r'=HYPERLINK\("([^"]+)"', cell.value)
         if match: return {"value": "Link", "url": match.group(1)}
     return {"value": cell.value, "url": None}
-
-def normalize_title_for_comparison(title: Any) -> str:
-    if not isinstance(title, str): return ""
-    tmp = re.split(r"\s*[:|-]\s*", title, 1)
-    cleaned = tmp[0] if tmp else title
-    return re.sub(r"\W+", " ", cleaned).lower().strip()
 
 def clean_title_for_output(title: Any) -> str:
     if not isinstance(title, str): return str(title if title is not None else "")
@@ -137,6 +154,17 @@ def normalizar_tipo_medio(tipo_raw: str) -> str:
     mapping = {"fm": "Radio", "am": "Radio", "radio": "Radio", "aire": "Televisión", "cable": "Televisión", "tv": "Televisión", "television": "Televisión", "televisión": "Televisión", "senal abierta": "Televisión", "señal abierta": "Televisión", "diario": "Prensa", "prensa": "Prensa", "revista": "Revista", "revistas": "Revista", "online": "Internet", "internet": "Internet", "digital": "Internet", "web": "Internet"}
     return mapping.get(t, str(tipo_raw).strip().title() if str(tipo_raw).strip() else "Otro")
 
+def format_tiempo(segundos: float) -> str:
+    """Formatea segundos en formato legible"""
+    if segundos < 60:
+        return f"{segundos:.1f} segundos"
+    elif segundos < 3600:
+        minutos = segundos / 60
+        return f"{minutos:.1f} minutos"
+    else:
+        horas = segundos / 3600
+        return f"{horas:.2f} horas"
+
 # ======================================
 # Carga de Modelos Locales Optimizada
 # ======================================
@@ -152,6 +180,13 @@ def cargar_modelo_embeddings():
     """Carga el modelo de embeddings."""
     model = SentenceTransformer(MODELO_EMBEDDINGS_LOCAL)
     return model
+
+@st.cache_resource
+def generar_embeddings_temas():
+    """Genera embeddings para los temas predefinidos (se hace una sola vez)"""
+    modelo = cargar_modelo_embeddings()
+    embeddings = modelo.encode(TEMAS_PREDEFINIDOS, show_progress_bar=False)
+    return embeddings
 
 # ======================================
 # Lógica de Análisis de Tono y Tema con Modelos Locales
@@ -177,42 +212,44 @@ def analizar_tono_local(texto: str, tokenizer, model) -> str:
     except Exception:
         return "Neutro" # Fallback
 
-async def _etiquetar_cluster_con_ia(texto_representante: str) -> str:
-    """Usa OpenAI solo para generar la etiqueta corta del tema."""
-    prompt = f"Basado en la siguiente noticia, crea un tema corto y descriptivo de 3 a 5 palabras que capture la esencia del evento principal.\n\nNoticia: \"{texto_representante[:MAX_TOKENS_PROMPT_TXT]}\"\n\nGenera únicamente el tema."
+def asignar_tema_por_similitud(texto_noticia: str, modelo_emb, embeddings_temas) -> str:
+    """
+    Asigna un tema a la noticia basándose en similitud de coseno
+    con los embeddings de los temas predefinidos.
+    """
     try:
-        resp = await acall_with_retries(openai.ChatCompletion.acreate, model=OPENAI_MODEL_ETIQUETADO, messages=[{"role": "user", "content": prompt}], max_tokens=20, temperature=0.1)
-        return limpiar_tema(resp.choices[0].message.content)
+        embedding_noticia = modelo_emb.encode([texto_noticia], show_progress_bar=False)
+        similitudes = cosine_similarity(embedding_noticia, embeddings_temas)[0]
+        idx_mas_similar = np.argmax(similitudes)
+        return TEMAS_PREDEFINIDOS[idx_mas_similar]
     except Exception:
-        return "Tema no disponible"
+        return "Tema no asignado"
 
-async def generar_y_etiquetar_temas_local(noticias: List[Dict], key_map: Dict[str, str], p_bar) -> Dict[int, str]:
-    """Genera embeddings, agrupa noticias y etiqueta los temas resultantes."""
-    p_bar.progress(0.1, text="🧠 Generando embeddings con modelo local (puede tardar)...")
+def generar_temas_sin_api(noticias: List[Dict], key_map: Dict[str, str], p_bar) -> Dict[int, str]:
+    """
+    Genera embeddings de las noticias y las asigna al tema predefinido más similar.
+    No requiere API de OpenAI.
+    """
+    p_bar.progress(0.1, text="🧠 Cargando modelo de embeddings...")
     modelo_emb = cargar_modelo_embeddings()
-    textos_para_embed = [f"{corregir_texto(n.get(key_map.get('titulo'), ''))}. {corregir_texto(n.get(key_map.get('resumen'), ''))}" for n in noticias]
-    embeddings = modelo_emb.encode(textos_para_embed, show_progress_bar=False, batch_size=32)
     
-    p_bar.progress(0.5, f"🔄 Agrupando noticias en {NUM_TEMAS_CLUSTERING} temas...")
-    kmeans = KMeans(n_clusters=NUM_TEMAS_CLUSTERING, random_state=42, n_init='auto')
-    kmeans.fit(embeddings)
-    for i, noticia in enumerate(noticias): noticia['cluster_id'] = kmeans.labels_[i]
-
-    p_bar.progress(0.7, f"✍️ Etiquetando los {NUM_TEMAS_CLUSTERING} temas con IA...")
-    tasks = []
-    for cluster_id in range(NUM_TEMAS_CLUSTERING):
-        indices_cluster = [i for i, n in enumerate(noticias) if n['cluster_id'] == cluster_id]
-        if not indices_cluster: continue
-        embeddings_cluster = embeddings[indices_cluster]
-        distancias = np.linalg.norm(embeddings_cluster - kmeans.cluster_centers_[cluster_id], axis=1)
-        texto_rep = textos_para_embed[indices_cluster[np.argmin(distancias)]]
-        tasks.append(_etiquetar_cluster_con_ia(texto_rep))
-
-    etiquetas_temas = await asyncio.gather(*tasks)
-    mapa_cluster_a_tema = {i: tema for i, tema in enumerate(etiquetas_temas)}
+    p_bar.progress(0.3, text="📚 Preparando temas predefinidos...")
+    embeddings_temas = generar_embeddings_temas()
     
-    p_bar.progress(0.95, "✅ Asignando temas finales...")
-    return {n['original_index']: mapa_cluster_a_tema.get(n['cluster_id'], "Tema no asignado") for n in noticias}
+    p_bar.progress(0.5, text=f"🔍 Analizando {len(noticias)} noticias...")
+    mapa_idx_a_tema = {}
+    
+    for i, noticia in enumerate(noticias):
+        texto = f"{corregir_texto(noticia.get(key_map.get('titulo'), ''))}. {corregir_texto(noticia.get(key_map.get('resumen'), ''))}"
+        tema = asignar_tema_por_similitud(texto, modelo_emb, embeddings_temas)
+        mapa_idx_a_tema[noticia['original_index']] = tema
+        
+        if (i + 1) % 10 == 0:  # Actualizar cada 10 noticias
+            progreso = 0.5 + (0.4 * (i + 1) / len(noticias))
+            p_bar.progress(progreso, text=f"🔍 Procesadas {i+1}/{len(noticias)} noticias...")
+    
+    p_bar.progress(0.95, "✅ Asignación de temas completada")
+    return mapa_idx_a_tema
 
 # ======================================
 # Lógica de Procesamiento de Datos (Base)
@@ -316,12 +353,10 @@ def _append_rows_to_sheet(sheet, rows_data, key_map, include_ai_columns):
 # ======================================
 # Proceso Principal y UI
 # ======================================
-async def run_full_process_async(dossier_file, region_file, internet_file, sov_file):
-    try:
-        openai.api_key = st.secrets["OPENAI_API_KEY"]; openai.aiosession.set(None)
-    except Exception:
-        st.error("❌ Error: OPENAI_API_KEY no encontrado. Es necesario para el etiquetado de temas."); st.stop()
-
+def run_full_process(dossier_file, region_file, internet_file, sov_file):
+    # Iniciar temporizador
+    tiempo_inicio = time.time()
+    
     with st.status("📋 **Paso 1/3:** Limpieza y preparación de datos...", expanded=True) as s:
         all_processed_rows, key_map = run_base_logic(load_workbook(dossier_file, data_only=True).active)
         all_processed_rows = process_mappings_and_links(all_processed_rows, key_map, region_file, internet_file)
@@ -344,7 +379,7 @@ async def run_full_process_async(dossier_file, region_file, internet_file, sov_f
                 tono = analizar_tono_local(texto, tokenizer_sent, model_sent)
                 index_to_row_map[row['original_index']][key_map.get("tonoai")] = tono
             
-            mapa_idx_a_tema = await generar_y_etiquetar_temas_local(target_rows_all, key_map, p_bar)
+            mapa_idx_a_tema = generar_temas_sin_api(target_rows_all, key_map, p_bar)
             for idx, tema in mapa_idx_a_tema.items():
                 if idx in index_to_row_map: index_to_row_map[idx][key_map.get("tema")] = tema
             s.update(label="✅ **Paso 2/3:** Análisis de IA completado", state="complete")
@@ -355,6 +390,11 @@ async def run_full_process_async(dossier_file, region_file, internet_file, sov_f
         st.session_state["output_data"] = generate_two_sheet_excel(final_processed_rows, key_map)
         st.session_state["output_filename"] = f"Informe_Analisis_UNAL_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
         st.session_state["processing_complete"] = True
+        
+        # Calcular tiempo total
+        tiempo_total = time.time() - tiempo_inicio
+        st.session_state["tiempo_procesamiento"] = tiempo_total
+        
         s.update(label="✅ **Paso 3/3:** Informe generado exitosamente", state="complete")
 
 def main():
@@ -362,7 +402,17 @@ def main():
     if not check_password(): return
 
     st.markdown('<div class="main-header">🎓 Sistema de Análisis de Noticias para la Universidad Nacional</div>', unsafe_allow_html=True)
-    st.markdown(f"Esta herramienta utiliza **modelos de IA locales** para analizar Tono y agrupar noticias en **{NUM_TEMAS_CLUSTERING} categorías principales** para las marcas objetivo.")
+    st.markdown(f"Esta herramienta utiliza **modelos de IA locales** para analizar Tono y clasificar noticias en **{NUM_TEMAS} categorías temáticas predefinidas** para las marcas objetivo.")
+    
+    with st.expander("📋 Ver los 30 temas predefinidos", expanded=False):
+        cols = st.columns(2)
+        mitad = len(TEMAS_PREDEFINIDOS) // 2
+        with cols[0]:
+            for i, tema in enumerate(TEMAS_PREDEFINIDOS[:mitad], 1):
+                st.markdown(f"**{i}.** {tema}")
+        with cols[1]:
+            for i, tema in enumerate(TEMAS_PREDEFINIDOS[mitad:], mitad + 1):
+                st.markdown(f"**{i}.** {tema}")
 
     if not st.session_state.get("processing_complete", False):
         with st.form("input_form"):
@@ -377,10 +427,21 @@ def main():
                 if not all([dossier_file, region_file, internet_file, sov_file]):
                     st.error("❌ Faltan archivos obligatorios.")
                 else:
-                    asyncio.run(run_full_process_async(dossier_file, region_file, internet_file, sov_file))
+                    run_full_process(dossier_file, region_file, internet_file, sov_file)
                     st.rerun()
     else:
         st.success("## 🎉 Análisis Completado Exitosamente")
+        
+        # Mostrar tiempo de procesamiento
+        if "tiempo_procesamiento" in st.session_state:
+            tiempo_formateado = format_tiempo(st.session_state["tiempo_procesamiento"])
+            st.markdown(f"""
+            <div class="timer-box">
+                <h2>⏱️ Tiempo Total de Procesamiento</h2>
+                <p><strong>{tiempo_formateado}</strong></p>
+            </div>
+            """, unsafe_allow_html=True)
+        
         st.download_button("📥 **DESCARGAR INFORME**", st.session_state.output_data, file_name=st.session_state.output_filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True, type="primary")
         if st.button("🔄 **Realizar un Nuevo Análisis**", use_container_width=True):
             pwd = st.session_state.get("password_correct")
@@ -388,7 +449,7 @@ def main():
             st.session_state.password_correct = pwd
             st.rerun()
 
-    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v9.0 (Resource Optimized) | Adaptado para la Universidad Nacional</p></div>", unsafe_allow_html=True)
+    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v10.0 (Sin API) | Universidad Nacional de Colombia</p></div>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
