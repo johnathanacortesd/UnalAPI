@@ -45,9 +45,25 @@ SIMILARITY_THRESHOLD_TITULOS = 0.95
 MAX_TOKENS_PROMPT_TXT = 4000
 NUM_TEMAS_CLUSTERING = 20 # <<< Número de temas a generar
 
-# (El resto de las constantes y funciones de utilidad como norm_key, limpiar_tema, etc., se mantienen igual)
-# ... (copia aquí tus funciones de utilidad desde norm_key hasta normalizar_tipo_medio)
+# ======================================
+# Estilos CSS (Personalizados para la UNAL)  <--- PEGA EL BLOQUE AQUÍ
+# ======================================
+def load_custom_css():
+    st.markdown(
+        """
+        <style>
+        :root { --primary-color: #005A3A; --secondary-color: #B38612; --card-bg: #ffffff; --shadow-light: 0 2px 4px rgba(0,0,0,0.1); --border-radius: 12px; }
+        .main-header { background: linear-gradient(135deg, var(--primary-color) 0%, var(--secondary-color) 100%); color: white; padding: 2rem; border-radius: var(--border-radius); text-align: center; font-size: 2.2rem; font-weight: 800; margin-bottom: 1.5rem; box-shadow: var(--shadow-light); }
+        .stButton > button { border-radius: 8px; font-weight: 600; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
+# ======================================
+# Autenticacion y Utilidades
+# ======================================
+def check_password() -> bool:
 # ======================================
 # ### NUEVO: Carga de Modelos Locales con Caché ###
 # ======================================
