@@ -18,10 +18,6 @@ import gc # Importante para la gestión de memoria
 
 # ### LIBRERÍAS PARA MODELOS LOCALES ###
 # Se importarán dinámicamente para ahorrar memoria al inicio
-# from transformers import AutoTokenizer, AutoModelForSequenceClassification
-# from sentence_transformers import SentenceTransformer
-# import torch
-# from sklearn.metrics.pairwise import cosine_similarity
 
 # ======================================
 # Configuracion general
@@ -33,9 +29,9 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# ### CONFIGURACIÓN DE MODELOS ###
-MODELO_SENTIMIENTO_LOCAL = "nlptown/bert-base-multilingual-uncased-sentiment"
-MODELO_EMBEDDINGS_LOCAL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+# ### CONFIGURACIÓN DE MODELOS LIGEROS ###
+MODELO_SENTIMIENTO_LOCAL = "cardiffnlp/twitter-roberta-base-sentiment-latest"
+MODELO_EMBEDDINGS_LOCAL = "sentence-transformers/all-MiniLM-L6-v2"
 
 # Marcas objetivo a analizar
 TARGET_BRANDS = ["U. Nacional de Colombia", "Universidad Nacional de Colombia"]
@@ -56,17 +52,33 @@ TEMAS_PREDEFINIDOS = [
 NUM_TEMAS = len(TEMAS_PREDEFINIDOS)
 
 # ======================================
-# Estilos CSS y Funciones de Utilidad (sin cambios significativos)
+# Estilos CSS y Funciones de Utilidad
 # ======================================
 def load_custom_css():
-    # ... (Tu CSS aquí)
-    st.markdown("""<style>...</style>""", unsafe_allow_html=True)
+    st.markdown("""
+        <style>
+        :root { --primary-color: #005A3A; --secondary-color: #B38612; --card-bg: #ffffff; --shadow-light: 0 2px 4px rgba(0,0,0,0.1); --border-radius: 12px; }
+        .main-header { background: linear-gradient(135deg, var(--primary-color) 0%, var(--secondary-color) 100%); color: white; padding: 2rem; border-radius: var(--border-radius); text-align: center; font-size: 2.2rem; font-weight: 800; margin-bottom: 1.5rem; box-shadow: var(--shadow-light); }
+        .stButton > button { border-radius: 8px; font-weight: 600; }
+        .timer-box { background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%); padding: 1.5rem; border-radius: 12px; text-align: center; margin: 1rem 0; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .timer-box h2 { color: #01579b; margin: 0; font-size: 2rem; }
+        .timer-box p { color: #0277bd; margin: 0.5rem 0 0 0; font-size: 1rem; }
+        </style>
+        """, unsafe_allow_html=True)
 
 def check_password() -> bool:
-    # ... (Tu función de contraseña aquí)
-    return True # Temporalmente para pruebas, reemplázalo con tu lógica
+    if st.session_state.get("password_correct", False): return True
+    st.markdown('<div class="main-header">🔐 Portal de Acceso Seguro</div>', unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        with st.form("password_form"):
+            password = st.text_input("🔑 Contraseña:", type="password")
+            if st.form_submit_button("🚀 Ingresar", use_container_width=True, type="primary"):
+                if password == st.secrets.get("APP_PASSWORD", "INVALID_DEFAULT"):
+                    st.session_state["password_correct"] = True; st.success("✅ Acceso autorizado."); st.balloons(); time.sleep(1.5); st.rerun()
+                else: st.error("❌ Contraseña incorrecta")
+    return False
 
-# (Aquí van el resto de tus funciones de utilidad: norm_key, extract_link, etc. No han cambiado)
 def norm_key(text: Any) -> str:
     if text is None: return ""
     return re.sub(r"[^a-z0-9]+", "", unidecode(str(text).strip().lower()))
@@ -112,11 +124,9 @@ def format_tiempo(segundos: float) -> str:
     elif segundos < 3600: return f"{segundos / 60:.1f} minutos"
     else: return f"{segundos / 3600:.2f} horas"
 
-
 # ======================================
 # Lógica de Análisis Optimizada
 # ======================================
-# (Las funciones de agrupar, analizar_tono, asignar_tema, etc. no han cambiado)
 def agrupa_noticias_similares_optimizado(noticias: List[Dict], key_map: Dict[str, str], status_update) -> Dict[int, List[int]]:
     status_update("Optimizando textos para comparación...")
     for i, noticia in enumerate(noticias):
@@ -131,51 +141,51 @@ def agrupa_noticias_similares_optimizado(noticias: List[Dict], key_map: Dict[str
         if key: buckets[key].append(i)
 
     status_update(f"Comparando noticias dentro de {len(buckets)} bloques...")
-    grupos = {}
-    procesados = set()
-    
+    grupos, procesados = {}, set()
     for i in range(len(noticias)):
         if i in procesados: continue
         grupo_actual = [i]; procesados.add(i)
         key_i = " ".join(noticias[i]['norm_titulo'].split()[:5])
-        candidatos_indices = buckets.get(key_i, [])
-        
-        for j_cand in candidatos_indices:
+        for j_cand in buckets.get(key_i, []):
             if j_cand <= i or j_cand in procesados: continue
-            sim_titulo = calcular_similitud_textos(noticias[i]['norm_titulo'], noticias[j_cand]['norm_titulo'])
-            if sim_titulo >= SIMILARITY_THRESHOLD_TITULOS:
-                grupo_actual.append(j_cand); procesados.add(j_cand); continue
-            sim_resumen = calcular_similitud_textos(noticias[i]['norm_resumen'], noticias[j_cand]['norm_resumen'])
-            if sim_resumen >= SIMILARITY_THRESHOLD_RESUMENES:
+            if calcular_similitud_textos(noticias[i]['norm_titulo'], noticias[j_cand]['norm_titulo']) >= SIMILARITY_THRESHOLD_TITULOS or \
+               calcular_similitud_textos(noticias[i]['norm_resumen'], noticias[j_cand]['norm_resumen']) >= SIMILARITY_THRESHOLD_RESUMENES:
                 grupo_actual.append(j_cand); procesados.add(j_cand)
         grupos[i] = grupo_actual
     return grupos
-
 
 def analizar_tono_batch(textos: List[str], tokenizer, model) -> List[str]:
     from transformers import torch
     if not textos: return []
     try:
-        inputs = tokenizer(textos, return_tensors="pt", padding=True, truncation=True, max_length=512)
-        with torch.no_grad(): logits = model(**inputs).logits
-        scores = torch.argmax(logits, dim=-1).tolist()
-        map_sentimiento = {0: "Negativo", 1: "Negativo", 2: "Neutro", 3: "Positivo", 4: "Positivo"}
-        return [map_sentimiento.get(score, "Neutro") for score in scores]
-    except Exception: return ["Neutro"] * len(textos)
-
+        # Este modelo espera etiquetas label_0, label_1, label_2
+        map_sentimiento = {0: "Negativo", 1: "Neutro", 2: "Positivo"}
+        resultados = []
+        for texto in textos:
+            # Truncar manualmente para evitar avisos
+            inputs = tokenizer(texto[:512], return_tensors="pt")
+            with torch.no_grad():
+                logits = model(**inputs).logits
+            score = torch.argmax(logits, dim=-1).item()
+            resultados.append(map_sentimiento.get(score, "Neutro"))
+        return resultados
+    except Exception:
+        return ["Neutro"] * len(textos)
 
 def asignar_tema_batch(textos: List[str], modelo_emb, embeddings_temas) -> List[str]:
     from sklearn.metrics.pairwise import cosine_similarity
-    import numpy as np
     if not textos: return []
     try:
         embeddings_noticias = modelo_emb.encode(textos, show_progress_bar=False, batch_size=32)
         similitudes = cosine_similarity(embeddings_noticias, embeddings_temas)
         indices = np.argmax(similitudes, axis=1)
         return [TEMAS_PREDEFINIDOS[idx] for idx in indices]
-    except Exception: return ["Tema no asignado"] * len(textos)
+    except Exception:
+        return ["Tema no asignado"] * len(textos)
 
-# (Aquí van el resto de tus funciones de procesamiento: run_base_logic, etc. No han cambiado)
+# ======================================
+# Lógica de Procesamiento de Datos (Base) - Robusta
+# ======================================
 def run_base_logic(sheet, status_update):
     status_update("Leyendo encabezados del archivo...")
     headers = [c.value for c in sheet[1] if c.value]
@@ -186,17 +196,10 @@ def run_base_logic(sheet, status_update):
     
     status_update("Procesando filas de datos de forma segura...")
     rows = []
-    for row_idx, row_cells in enumerate(sheet.iter_rows(min_row=2), start=2):
+    for row_cells in sheet.iter_rows(min_row=2):
         if all(c.value is None for c in row_cells): continue
-        
         row_data = dict(zip(norm_keys, row_cells))
-        
-        processed_row = {}
-        for key, cell in row_data.items():
-            if key in [key_map["link_nota"], key_map["link_streaming"]]:
-                processed_row[key] = extract_link(cell)
-            else:
-                processed_row[key] = cell.value
+        processed_row = {key: extract_link(cell) if key in [key_map["link_nota"], key_map["link_streaming"]] else cell.value for key, cell in row_data.items()}
         rows.append(processed_row)
 
     status_update(f"Se leyeron {len(rows)} filas. Dividiendo por menciones...")
@@ -213,7 +216,7 @@ def run_base_logic(sheet, status_update):
     status_update("Detectando duplicados...")
     processed_rows = detectar_duplicados_avanzado(split_rows, key_map)
     for row in processed_rows:
-        if row["is_duplicate"]: row.update({"tonoai": "Duplicada", "tema": "Duplicada", "justificaciontono": "Noticia duplicada."})
+        if row["is_duplicate"]: row.update({"tonoai": "Duplicada", "tema": "Duplicada"})
     return processed_rows, key_map
 
 def detectar_duplicados_avanzado(rows: List[Dict], key_map: Dict[str, str]) -> List[Dict]:
@@ -238,6 +241,9 @@ def detectar_duplicados_avanzado(rows: List[Dict], key_map: Dict[str, str]) -> L
                 else: seen_broadcast[key] = i
     return processed_rows
 
+# ======================================
+# Mapeos y Generación de Excel
+# ======================================
 def process_mappings_and_links(all_processed_rows, key_map, region_file, internet_file):
     df_region = pd.read_excel(region_file); region_map = {str(k).lower().strip(): v for k, v in pd.Series(df_region.iloc[:, 1].values, index=df_region.iloc[:, 0]).to_dict().items()}
     df_internet = pd.read_excel(internet_file); internet_map = {str(k).lower().strip(): v for k, v in pd.Series(df_internet.iloc[:, 1].values, index=df_internet.iloc[:, 0]).to_dict().items()}
@@ -293,82 +299,54 @@ def _append_rows_to_sheet(sheet, rows_data, key_map, include_ai_columns):
         for col_idx, url in links_to_add.items():
             cell = sheet.cell(row=sheet.max_row, column=col_idx); cell.hyperlink = url; cell.style = "Hyperlink"
 
-
 # ======================================
-# Proceso Principal y UI (VERSIÓN FINAL)
+# Proceso Principal y UI
 # ======================================
 def run_full_process(dossier_file, region_file, internet_file, sov_file):
     tiempo_inicio = time.time()
     
     with st.status("🚀 **Iniciando Análisis...**", expanded=True) as status:
         try:
-            # --- PASO 1: Carga y Limpieza de Datos ---
             status.write("Paso 1/5: Preparando y limpiando datos...")
             all_processed_rows, key_map = run_base_logic(load_workbook(dossier_file, data_only=True).active, status.write)
-            
-            status.write("Aplicando mapeos de región e internet...")
             all_processed_rows = process_mappings_and_links(all_processed_rows, key_map, region_file, internet_file)
-            
-            for row in all_processed_rows:
-                row["__is_target_brand"] = (row.get(key_map.get("menciones")) in TARGET_BRANDS)
-            
+            for row in all_processed_rows: row["__is_target_brand"] = (row.get(key_map.get("menciones")) in TARGET_BRANDS)
             index_to_row_map = {row['original_index']: row for row in all_processed_rows}
             target_rows_all = [row for row in all_processed_rows if row.get("__is_target_brand") and not row.get("is_duplicate")]
 
             if not target_rows_all:
-                st.warning("No se encontraron noticias únicas para las marcas objetivo."); status.update(label="⚠️ Sin noticias para procesar.", state="complete"); return
-            
-            # --- PASO 2: Agrupación ---
+                st.warning("No se encontraron noticias únicas para analizar."); status.update(label="⚠️ Sin noticias para procesar.", state="complete"); return
+
             status.update(label="Paso 2/5: Agrupando noticias similares...")
             grupos_similares = agrupa_noticias_similares_optimizado(target_rows_all, key_map, status.write)
-            representantes_indices = list(grupos_similares.keys())
-            noticias_representantes = [target_rows_all[i] for i in representantes_indices]
+            noticias_representantes = [target_rows_all[i] for i in grupos_similares.keys()]
             status.write(f"Se identificaron {len(noticias_representantes)} grupos únicos de noticias.")
-            
             textos_para_analisis = [f"{corregir_texto(rep.get(key_map.get('titulo'), ''))}. {corregir_texto(rep.get(key_map.get('resumen'), ''))}" for rep in noticias_representantes]
 
-            # --- PASO 3: Análisis de Tono (con gestión de memoria) ---
             status.update(label="Paso 3/5: Analizando Tono con IA...")
-            status.write("Cargando modelo de sentimiento...")
+            status.write(f"Cargando modelo de sentimiento: {MODELO_SENTIMIENTO_LOCAL}")
             from transformers import AutoTokenizer, AutoModelForSequenceClassification
             tokenizer_sent = AutoTokenizer.from_pretrained(MODELO_SENTIMIENTO_LOCAL)
             model_sent = AutoModelForSequenceClassification.from_pretrained(MODELO_SENTIMIENTO_LOCAL)
-            
-            status.write(f"Analizando tono para {len(textos_para_analisis)} grupos...")
             resultados_tono = analizar_tono_batch(textos_para_analisis, tokenizer_sent, model_sent)
-            
-            # Liberar memoria del modelo de sentimiento
-            del tokenizer_sent, model_sent
-            gc.collect()
-            status.write("Memoria del modelo de sentimiento liberada.")
+            del tokenizer_sent, model_sent; gc.collect(); status.write("Memoria de Tono liberada.")
 
-            # --- PASO 4: Análisis de Tema (con gestión de memoria) ---
             status.update(label="Paso 4/5: Asignando Temas con IA...")
-            status.write("Cargando modelo de embeddings...")
+            status.write(f"Cargando modelo de embeddings: {MODELO_EMBEDDINGS_LOCAL}")
             from sentence_transformers import SentenceTransformer
             modelo_emb = SentenceTransformer(MODELO_EMBEDDINGS_LOCAL)
-            
-            status.write("Generando embeddings para temas predefinidos...")
             embeddings_temas = modelo_emb.encode(TEMAS_PREDEFINIDOS, show_progress_bar=False)
-            
-            status.write(f"Asignando temas para {len(textos_para_analisis)} grupos...")
             resultados_tema = asignar_tema_batch(textos_para_analisis, modelo_emb, embeddings_temas)
+            del modelo_emb, embeddings_temas; gc.collect(); status.write("Memoria de Tema liberada.")
 
-            # Liberar memoria del modelo de embeddings
-            del modelo_emb, embeddings_temas
-            gc.collect()
-            status.write("Memoria del modelo de embeddings liberada.")
-
-            # --- PASO 5: Ensamblaje y Generación de Reporte ---
             status.update(label="Paso 5/5: Generando el informe final...")
-            status.write("Asignando resultados a todos los miembros de cada grupo...")
-            for i, idx_rep in enumerate(representantes_indices):
+            for i, idx_rep in enumerate(grupos_similares.keys()):
                 tono, tema = resultados_tono[i], resultados_tema[i]
                 for idx_miembro_lista in grupos_similares[idx_rep]:
                     original_global_index = target_rows_all[idx_miembro_lista]['original_index']
                     index_to_row_map[original_global_index][key_map.get("tonoai")] = tono
                     index_to_row_map[original_global_index][key_map.get("tema")] = tema
-
+            
             final_processed_rows = list(index_to_row_map.values())
             final_processed_rows = process_sov_mapping_final(final_processed_rows, key_map, sov_file)
             
@@ -381,30 +359,24 @@ def run_full_process(dossier_file, region_file, internet_file, sov_file):
 
         except Exception as e:
             status.update(label=f"❌ Error Crítico: {e}", state="error", expanded=True)
-            st.error(f"La aplicación ha encontrado un error. Por favor, revisa los archivos de entrada o contacta al soporte.")
+            st.error("La aplicación ha encontrado un error. Revisa los archivos de entrada o contacta al soporte.")
             st.exception(e)
             st.session_state["processing_complete"] = False
 
-# ======================================
-# Interfaz de Usuario (main)
-# ======================================
 def main():
     load_custom_css()
     if not check_password(): return
 
     st.markdown('<div class="main-header">🎓 Sistema de Análisis de Noticias UNAL</div>', unsafe_allow_html=True)
-    st.markdown(f"**Versión 12.0 (Modo Ligero)**: Esta herramienta utiliza modelos de IA locales para analizar Tono y clasificar noticias en **{NUM_TEMAS} categorías**.")
+    st.markdown(f"**Versión 13.0 (Modelos Ligeros)**: Esta herramienta utiliza modelos de IA optimizados para analizar Tono y clasificar noticias en **{NUM_TEMAS} categorías**.")
     
     with st.expander("📋 Ver los 30 temas predefinidos", expanded=False):
-        # (Código para mostrar temas sin cambios)
         cols = st.columns(2)
         mitad = len(TEMAS_PREDEFINIDOS) // 2
         with cols[0]:
-            for i, tema in enumerate(TEMAS_PREDEFINIDOS[:mitad], 1):
-                st.markdown(f"**{i}.** {tema}")
+            for i, tema in enumerate(TEMAS_PREDEFINIDOS[:mitad], 1): st.markdown(f"**{i}.** {tema}")
         with cols[1]:
-            for i, tema in enumerate(TEMAS_PREDEFINIDOS[mitad:], mitad + 1):
-                st.markdown(f"**{i}.** {tema}")
+            for i, tema in enumerate(TEMAS_PREDEFINIDOS[mitad:], mitad + 1): st.markdown(f"**{i}.** {tema}")
 
     if not st.session_state.get("processing_complete", False):
         with st.form("input_form"):
@@ -440,7 +412,7 @@ def main():
             st.session_state.password_correct = pwd
             st.rerun()
 
-    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v12.0 (Modo Ligero) | Universidad Nacional de Colombia</p></div>", unsafe_allow_html=True)
+    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v13.0 (Modelos Ligeros) | Universidad Nacional de Colombia</p></div>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
