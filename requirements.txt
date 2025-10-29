@@ -7,3 +7,6 @@ scikit-learn
 unidecode
 nltk
 joblib
+transformers
+torch
+sentence-transformers
