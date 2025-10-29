@@ -17,7 +17,7 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 import json
 import asyncio
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Any
 
 # ### NUEVO: Importaciones para modelos locales ###
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
