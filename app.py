@@ -167,6 +167,25 @@ def calcular_similitud_textos(texto1: str, texto2: str) -> float:
         return 0.0
     return SequenceMatcher(None, norm1, norm2).ratio()
 
+# === FUNCIÓN CORREGIDA Y AÑADIDA AQUÍ ===
+def normalizar_tipo_medio(tipo_raw: Any) -> str:
+    """Normaliza la columna 'Tipo de Medio' a categorías estándar."""
+    if not isinstance(tipo_raw, str):
+        return str(tipo_raw) if tipo_raw is not None else "Otro"
+    
+    t = unidecode(tipo_raw.strip().lower())
+    mapping = {
+        "fm": "Radio", "am": "Radio", "radio": "Radio",
+        "aire": "Televisión", "cable": "Televisión", "tv": "Televisión",
+        "television": "Televisión", "televisión": "Televisión",
+        "senal abierta": "Televisión", "señal abierta": "Televisión",
+        "diario": "Prensa", "prensa": "Prensa",
+        "revista": "Revista", "revistas": "Revista",
+        "online": "Internet", "internet": "Internet",
+        "digital": "Internet", "web": "Internet"
+    }
+    return mapping.get(t, str(tipo_raw).strip().title() if str(tipo_raw).strip() else "Otro")
+
 def agrupar_noticias_similares(noticias: List[Dict], key_map: Dict[str, str]) -> Dict[int, List[int]]:
     """
     Agrupa noticias que tienen títulos o resúmenes similares.
@@ -206,10 +225,6 @@ def agrupar_noticias_similares(noticias: List[Dict], key_map: Dict[str, str]) ->
         grupos[i] = grupo_actual
     
     return grupos
-    if not isinstance(tipo_raw, str): return str(tipo_raw)
-    t = unidecode(tipo_raw.strip().lower())
-    mapping = {"fm": "Radio", "am": "Radio", "radio": "Radio", "aire": "Televisión", "cable": "Televisión", "tv": "Televisión", "television": "Televisión", "televisión": "Televisión", "senal abierta": "Televisión", "señal abierta": "Televisión", "diario": "Prensa", "prensa": "Prensa", "revista": "Revista", "revistas": "Revista", "online": "Internet", "internet": "Internet", "digital": "Internet", "web": "Internet"}
-    return mapping.get(t, str(tipo_raw).strip().title() if str(tipo_raw).strip() else "Otro")
 
 def format_tiempo(segundos: float) -> str:
     """Formatea segundos en formato legible"""
