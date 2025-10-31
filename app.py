@@ -286,64 +286,57 @@ def generate_excel_output(all_processed_rows, key_map):
     output_buffer.seek(0)
     return output_buffer
 
-# <<< MEJORA CRÍTICA: Lógica de agrupación completamente reescrita para ser más robusta.
+# <<< MEJORA CRÍTICA: Lógica de agrupación completamente reescrita con Union-Find para máxima robustez.
 def agrupar_noticias_similares(rows: List[Dict], key_map: Dict[str, str]) -> List[List[int]]:
     """
-    Agrupa noticias de forma robusta. Crea grupos por similitud de título Y por similitud de resumen,
-    y luego fusiona los grupos que tengan miembros en común. Esto asegura que noticias relacionadas
-    por cualquiera de los dos campos terminen en el mismo grupo.
+    Agrupa noticias utilizando un algoritmo Union-Find. Este método garantiza que si la noticia A
+    es similar a B (por título o resumen) y B es similar a C, entonces A, B y C terminarán en
+    el mismo grupo, resolviendo problemas de agrupación transitiva de forma eficiente.
     """
     titulo_key, resumen_key = key_map.get("titulo", "titulo"), key_map.get("resumen", "resumen")
-    
-    # 1. Crear grupos iniciales basados en claves de título y resumen
-    grupos_por_titulo = defaultdict(list)
-    grupos_por_resumen = defaultdict(list)
-    
+    n = len(rows)
+    parent = list(range(n))
+
+    def find(i):
+        if parent[i] == i:
+            return i
+        parent[i] = find(parent[i])
+        return parent[i]
+
+    def union(i, j):
+        root_i = find(i)
+        root_j = find(j)
+        if root_i != root_j:
+            parent[root_j] = root_i
+
+    titulo_a_raiz = {}
+    resumen_a_raiz = {}
+
     for idx, row in enumerate(rows):
-        # Clave para el título (primeras 5 palabras)
+        # Generar clave para el título (primeras 4 palabras)
         titulo = corregir_texto(row.get(titulo_key, ''))
         if titulo:
-            clave_titulo = norm_key(" ".join(titulo.strip().split()[:5]))
+            clave_titulo = norm_key(" ".join(titulo.strip().split()[:4]))
             if clave_titulo:
-                grupos_por_titulo[clave_titulo].append(idx)
-        
-        # Clave para el resumen (primeras 8 palabras)
+                if clave_titulo in titulo_a_raiz:
+                    union(idx, titulo_a_raiz[clave_titulo])
+                titulo_a_raiz[clave_titulo] = find(idx)
+
+        # Generar clave para el resumen (primeras 6 palabras)
         resumen = corregir_texto(row.get(resumen_key, ''))
         if resumen:
-            clave_resumen = norm_key(" ".join(resumen.strip().split()[:8]))
+            clave_resumen = norm_key(" ".join(resumen.strip().split()[:6]))
             if clave_resumen:
-                grupos_por_resumen[clave_resumen].append(idx)
+                if clave_resumen in resumen_a_raiz:
+                    union(idx, resumen_a_raiz[clave_resumen])
+                resumen_a_raiz[clave_resumen] = find(idx)
 
-    # 2. Fusionar grupos conectados (algoritmo de componentes conectados)
-    adj = defaultdict(set)
-    todos_los_grupos = list(grupos_por_titulo.values()) + list(grupos_por_resumen.values())
-    for grupo in todos_los_grupos:
-        if len(grupo) > 1:
-            for i in range(len(grupo)):
-                for j in range(i + 1, len(grupo)):
-                    u, v = grupo[i], grupo[j]
-                    adj[u].add(v)
-                    adj[v].add(u)
+    # Consolidar los grupos finales
+    grupos_finales = defaultdict(list)
+    for i in range(n):
+        grupos_finales[find(i)].append(i)
 
-    grupos_finales = []
-    visitado = set()
-    for i in range(len(rows)):
-        if i not in visitado:
-            componente_actual = []
-            q = [i]
-            visitado.add(i)
-            head = 0
-            while head < len(q):
-                u = q[head]
-                head += 1
-                componente_actual.append(u)
-                for v in adj.get(u, []):
-                    if v not in visitado:
-                        visitado.add(v)
-                        q.append(v)
-            grupos_finales.append(componente_actual)
-            
-    return grupos_finales
+    return list(grupos_finales.values())
 
 
 class CostTracker:
@@ -371,7 +364,6 @@ def analizar_con_openai_parallel(textos_agrupados: List[Tuple[str, List[int]]], 
     resultados = {}
     tools = [{"type": "function", "function": {"name": "clasificar_noticia_unal", "description": "Clasifica el tono y el tema de una noticia sobre la Universidad Nacional.", "parameters": {"type": "object", "properties": {"tono": {"type": "string", "description": "El tono de la noticia: Positivo, Negativo o Neutro.", "enum": ["Positivo", "Negativo", "Neutro"]}, "tema": {"type": "string", "description": "Tema específico de 4 a 6 palabras que resume el hecho principal. No debe incluir el nombre de la universidad ni ser genérico."}}, "required": ["tono", "tema"]}}}]
     
-    # <<< MEJORA CRÍTICA: Prompt extremadamente reforzado para garantizar el contexto correcto del tono.
     system_prompt = """Eres un analista de medios hiper-especializado y tu única misión es evaluar el impacto de las noticias sobre la Universidad Nacional de Colombia (UNAL). Debes ser implacable en la aplicación de las siguientes reglas.
 
 **REGLA DE ORO INQUEBRANTABLE:**
@@ -405,7 +397,6 @@ Tu precisión es vital. Evalúa el impacto, no el sentimiento general."""
         if cost_tracker.is_limit_exceeded():
             return None
         try:
-            # <<< MEJORA CRÍTICA: Modelo restaurado al solicitado por el usuario.
             response = client.chat.completions.create(
                model="gpt-4.1-nano-2025-04-14", 
                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": f"Analiza este grupo de noticias: \"{texto_representativo}\""}],
@@ -443,7 +434,6 @@ def procesar_por_lotes(target_rows: List[Dict], key_map: Dict[str, str], batch_s
     num_batches = (total_rows + batch_size - 1) // batch_size
     titulo_key, resumen_key = key_map.get("titulo"), key_map.get("resumen")
     tono_key, tema_key = key_map.get("tonoai"), key_map.get("tema")
-    all_resultados = []
     
     for batch_num in range(num_batches):
         if cost_tracker.is_limit_exceeded(): break
@@ -451,15 +441,14 @@ def procesar_por_lotes(target_rows: List[Dict], key_map: Dict[str, str], batch_s
         batch_rows = target_rows[start_idx:end_idx]
         status_placeholder.markdown(f'<div class="info-box">📦 <strong>Procesando Lote {batch_num + 1}/{num_batches}</strong> (Noticias {start_idx + 1}-{end_idx})</div>', unsafe_allow_html=True)
         
-        # <<< MEJORA CRÍTICA: Se utiliza la nueva y robusta función de agrupación.
         grupos_fusionados = agrupar_noticias_similares(batch_rows, key_map)
         
         textos_agrupados = []
         for indices_locales in grupos_fusionados:
             if not indices_locales: continue
-            idx_repr = indices_locales[0] # Se toma el primer elemento como representativo
-            texto_completo = f"{corregir_texto(batch_rows[idx_repr].get(titulo_key, ''))}. {corregir_texto(batch_rows[idx_repr].get(resumen_key, ''))}".strip()[:3000]
-            if texto_completo and texto_completo != ".":
+            idx_repr = indices_locales[0]
+            texto_completo = f"TÍTULO: {corregir_texto(batch_rows[idx_repr].get(titulo_key, ''))}. RESUMEN: {corregir_texto(batch_rows[idx_repr].get(resumen_key, ''))}".strip()[:3500]
+            if texto_completo and texto_completo != "TÍTULO: . RESUMEN: ":
                 textos_agrupados.append((texto_completo, indices_locales))
         
         def progress_hook_ia(current, total, text):
@@ -559,7 +548,6 @@ if start_button:
 
         # FASE 2: Análisis con IA
         status_container.markdown('<div class="info-box">🤖 <strong>Fase 2/3:</strong> Analizando con Inteligencia Artificial...</div>', unsafe_allow_html=True)
-        # <<< MEJORA CRÍTICA: Costos restaurados al modelo original.
         cost_tracker = CostTracker(cost_limit_usd, 0.10, 0.40)
         target_rows = [row for row in all_processed_rows if row.get("__is_target_brand") and not row.get("is_duplicate")]
         
@@ -654,4 +642,4 @@ else:
 
 # Footer
 st.markdown("---")
-st.markdown("<p style='text-align: center; color: #64748b;'>© 2025 Sistema de Análisis UNAL | Versión Optimizada 2.2</p>", unsafe_allow_html=True)
+st.markdown("<p style='text-align: center; color: #64748b;'>© 2025 Sistema de Análisis UNAL | Versión Optimizada 2.3</p>", unsafe_allow_html=True)
