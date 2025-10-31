@@ -1,308 +1,420 @@
-# ======================================
-# Importaciones (Versión API - Ligera y Robusta)
-# ======================================
+# ==============================================================================
+# ANÁLISIS DE TONO Y TEMA PARA UNIVERSIDAD NACIONAL - APP STREAMLIT
+# ==============================================================================
+
 import streamlit as st
 import pandas as pd
 from openpyxl import load_workbook, Workbook
 from collections import defaultdict
-from difflib import SequenceMatcher
 from copy import deepcopy
 import datetime
 import io
 import re
+import json
 import time
 from unidecode import unidecode
-from typing import List, Dict, Any
-import requests  # Para llamar a la API de Hugging Face
+from typing import List, Dict, Any, Tuple
+from tqdm import tqdm
+import warnings
+from openai import OpenAI
 
-# ======================================
-# VERIFICACIÓN DE SECRETS (PUNTO MÁS CRÍTICO)
-# Este bloque se ejecuta antes que nada para asegurar que el token de API existe.
-# ======================================
-if 'HF_API_TOKEN' not in st.secrets:
-    st.error("Error Crítico de Configuración: No se ha encontrado el secret 'HF_API_TOKEN'.")
-    st.info("La aplicación no puede funcionar sin el token de API. Por favor, siga estos pasos:")
-    st.markdown("""
-        1. Vaya a su panel de Streamlit Cloud y haga clic en **Manage app**.
-        2. Vaya a **Settings** (el menú de tres puntos ⋮).
-        3. Vaya a la pestaña **Secrets**.
-        4. Añada un nuevo secret con el siguiente formato exacto (reemplace el valor con su token real):
-    """)
-    st.code('HF_API_TOKEN = "hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"')
-    st.stop()  # Detiene la ejecución de la aplicación aquí mismo.
+warnings.filterwarnings('ignore')
 
-# ======================================
-# Configuracion general
-# ======================================
+# ==============================================================================
+# CONFIGURACIÓN DE LA PÁGINA DE STREAMLIT
+# ==============================================================================
 st.set_page_config(
-    page_title="Análisis de Noticias UNAL",
+    page_title="Análisis de Tono y Tema UNAL",
     page_icon="🎓",
-    layout="wide",
-    initial_sidebar_state="collapsed"
+    layout="wide"
 )
 
-# ### CONFIGURACIÓN DE MODELOS (VÍA API) ###
-MODELO_SENTIMIENTO_API = "cardiffnlp/twitter-roberta-base-sentiment-latest"
-MODELO_EMBEDDINGS_API = "sentence-transformers/all-MiniLM-L6-v2"
-API_URL_SENTIMIENTO = f"https://api-inference.huggingface.co/models/{MODELO_SENTIMIENTO_API}"
-API_URL_EMBEDDINGS = f"https://api-inference.huggingface.co/models/{MODELO_EMBEDDINGS_API}"
+# ==============================================================================
+# TODAS LAS FUNCIONES DEL SCRIPT ORIGINAL (SIN CAMBIOS EN SU LÓGICA INTERNA)
+# ==============================================================================
 
-# Marcas y Temas
-TARGET_BRANDS = ["U. Nacional de Colombia", "Universidad Nacional de Colombia"]
-TEMAS_PREDEFINIDOS = [
-    "Elección y Gestión del Rector", "Decisiones del Consejo Superior Universitario", "Presupuesto y Financiación Universitaria", "Políticas y Reformas Administrativas", "Nombramientos y Cargos Directivos",
-    "Proceso de Admisión y Aspirantes", "Desarrollo de Programas Académicos", "Investigaciones y Publicaciones Científicas", "Rankings y Acreditación Institucional", "Grados, Egresados y Ceremonias", "Colaboraciones y Convenios Académicos",
-    "Protestas y Movilización Estudiantil", "Actividades y Grupos Estudiantiles", "Bienestar y Apoyo Estudiantil", "Asuntos de Representación Estudiantil", "Eventos Culturales y Deportivos",
-    "Desarrollo de Infraestructura y Sedes", "Seguridad y Orden Público Campus", "Sostenibilidad y Medio Ambiente Campus", "Conectividad y Recursos Tecnológicos",
-    "Aportes a Políticas Públicas", "Proyectos de Extensión y Comunidad", "Relación con el Gobierno Nacional", "Debates sobre Educación Superior", "Alianzas con Sector Privado",
-    "Controversias y Denuncias Internas", "Reconocimientos y Premios Institucionales", "Egresados Destacados y Nombramientos", "Conflictos Laborales y Profesorado", "Relaciones con Egresados Alumni"
-]
-NUM_TEMAS = len(TEMAS_PREDEFINIDOS)
-
-# ======================================
-# Estilos CSS y Funciones de Utilidad
-# ======================================
-def load_custom_css():
-    st.markdown("""
-        <style>
-        :root { --primary-color: #005A3A; --secondary-color: #B38612; --card-bg: #ffffff; --shadow-light: 0 2px 4px rgba(0,0,0,0.1); --border-radius: 12px; }
-        .main-header { background: linear-gradient(135deg, var(--primary-color) 0%, var(--secondary-color) 100%); color: white; padding: 2rem; border-radius: var(--border-radius); text-align: center; font-size: 2.2rem; font-weight: 800; margin-bottom: 1.5rem; box-shadow: var(--shadow-light); }
-        .stButton > button { border-radius: 8px; font-weight: 600; }
-        .timer-box { background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%); padding: 1.5rem; border-radius: 12px; text-align: center; margin: 1rem 0; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-        .timer-box h2 { color: #01579b; margin: 0; font-size: 2rem; }
-        .timer-box p { color: #0277bd; margin: 0.5rem 0 0 0; font-size: 1rem; }
-        </style>
-        """, unsafe_allow_html=True)
-
-def check_password() -> bool:
-    if st.session_state.get("password_correct", False): return True
-    st.markdown('<div class="main-header">🔐 Portal de Acceso Seguro</div>', unsafe_allow_html=True)
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        with st.form("password_form"):
-            password = st.text_input("🔑 Contraseña:", type="password")
-            if st.form_submit_button("🚀 Ingresar", use_container_width=True, type="primary"):
-                if password == st.secrets.get("APP_PASSWORD", "INVALID_DEFAULT"):
-                    st.session_state["password_correct"] = True; st.success("✅ Acceso autorizado."); st.balloons(); time.sleep(1.5); st.rerun()
-                else: st.error("❌ Contraseña incorrecta")
-    return False
-
+# --- FUNCIONES DE UTILIDAD Y PROCESAMIENTO ---
 def norm_key(text: Any) -> str:
     if text is None: return ""
     return re.sub(r"[^a-z0-9]+", "", unidecode(str(text).strip().lower()))
 
-def extract_link(cell):
-    if hasattr(cell, "hyperlink") and cell.hyperlink and cell.hyperlink.target:
-        return {"value": "Link", "url": cell.hyperlink.target}
-    if isinstance(cell.value, str) and "=HYPERLINK" in cell.value:
-        match = re.search(r'=HYPERLINK\("([^"]+)"', cell.value)
-        if match: return {"value": "Link", "url": match.group(1)}
-    return {"value": cell.value, "url": None}
+def corregir_texto(text: Any) -> str:
+    if not isinstance(text, str): return ""
+    text = re.sub(r'(<br\s*/?>|\[\.\.\.\])+', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    match = re.search(r"[A-ZÁÉÍÓÚÑ]", text)
+    if match: text = text[match.start():]
+    return text
 
 def clean_title_for_output(title: Any) -> str:
     if not isinstance(title, str): return str(title if title is not None else "")
     return re.sub(r"\s*\|\s*[\w\s]+$", "", title).strip()
 
-def corregir_texto(text: Any) -> Any:
-    if not isinstance(text, str): return text if text is not None else ""
-    text = re.sub(r'(<br\s*/?>|\[\.\.\.\])+', ' ', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    match = re.search(r"[A-ZÁÉÍÓÚÑ]", text)
-    if match: text = text[match.start():]
-    if text and not text.endswith(('.', '...', '?', '!')): text = text + "..."
-    return text
-
-def normalizar_texto_para_comparacion(texto: Any) -> str:
-    if not isinstance(texto, str): return ""
-    texto = re.sub(r'[^\w\s]', '', unidecode(texto.lower()))
-    return re.sub(r'\s+', ' ', texto).strip()
-
-def calcular_similitud_textos(texto1: str, texto2: str) -> float:
-    if not texto1 or not texto2: return 0.0
-    return SequenceMatcher(None, texto1, texto2).ratio()
-
-def normalizar_tipo_medio(tipo_raw: Any) -> str:
-    if not isinstance(tipo_raw, str): return str(tipo_raw) if tipo_raw is not None else "Otro"
-    t = unidecode(tipo_raw.strip().lower())
-    mapping = {"fm": "Radio", "am": "Radio", "radio": "Radio", "aire": "Televisión", "cable": "Televisión", "tv": "Televisión", "television": "Televisión", "televisión": "Televisión", "senal abierta": "Televisión", "señal abierta": "Televisión", "diario": "Prensa", "prensa": "Prensa", "revista": "Revista", "revistas": "Revista", "online": "Internet", "internet": "Internet", "digital": "Internet", "web": "Internet"}
+def normalizar_tipo_medio(tipo_raw: str) -> str:
+    if not isinstance(tipo_raw, str): return str(tipo_raw)
+    t = unidecode(str(tipo_raw).strip().lower())
+    mapping = {
+        "fm": "Radio", "am": "Radio", "radio": "Radio", "aire": "Televisión", "cable": "Televisión", "tv": "Televisión",
+        "television": "Televisión", "televisión": "Televisión", "senal abierta": "Televisión", "señal abierta": "Televisión",
+        "diario": "Prensa", "prensa": "Prensa", "revista": "Revista", "revistas": "Revista", "online": "Internet",
+        "internet": "Internet", "digital": "Internet", "web": "Internet"
+    }
     return mapping.get(t, str(tipo_raw).strip().title() if str(tipo_raw).strip() else "Otro")
 
-def format_tiempo(segundos: float) -> str:
-    if segundos < 60: return f"{segundos:.1f} segundos"
-    elif segundos < 3600: return f"{segundos / 60:.1f} minutos"
-    else: return f"{segundos / 3600:.2f} horas"
+def extract_link(cell):
+    if hasattr(cell, "hyperlink") and cell.hyperlink and cell.hyperlink.target:
+        return {"value": cell.value or "Link", "url": cell.hyperlink.target}
+    if isinstance(cell.value, str) and "=HYPERLINK" in cell.value:
+        match = re.search(r'=HYPERLINK\("([^"]+)"', cell.value)
+        if match: return {"value": "Link", "url": match.group(1)}
+    return {"value": cell.value, "url": None}
 
-# ======================================
-# Lógica de Análisis (CON API)
-# ======================================
-@st.cache_data(show_spinner=False)
-def query_api(payload, api_url):
-    headers = {"Authorization": f"Bearer {st.secrets['HF_API_TOKEN']}"}
-    response = requests.post(api_url, headers=headers, json=payload)
-    if response.status_code != 200:
-        if "is currently loading" in response.text and response.status_code == 503:
-            st.toast("El modelo de IA se está iniciando. Esperando 20 segundos para reintentar...")
-            time.sleep(20)
-            return query_api(payload, api_url)
-        raise Exception(f"Error en API: {response.status_code} - {response.text}")
-    return response.json()
+def run_base_logic(sheet, progress_hook):
+    headers = [c.value for c in sheet[1] if c.value]
+    norm_keys = [norm_key(h) for h in headers]
+    key_map = {nk: nk for nk in norm_keys}
+    key_map.update({
+        "titulo": norm_key("Titulo"), "resumen": norm_key("Resumen - Aclaracion"), "menciones": norm_key("Menciones - Empresa"),
+        "medio": norm_key("Medio"), "tonoai": norm_key("Tono AI"), "tema": norm_key("Tema"), "idnoticia": norm_key("ID Noticia"),
+        "idduplicada": norm_key("ID duplicada"), "tipodemedio": norm_key("Tipo de Medio"), "link_nota": norm_key("Link Nota"),
+        "link_streaming": norm_key("Link (Streaming - Imagen)"), "region": norm_key("Region"), "hora": norm_key("Hora")
+    })
+    rows = [{norm_keys[i]: cell for i, cell in enumerate(row) if i < len(norm_keys)}
+            for row in sheet.iter_rows(min_row=2) if not all(c.value is None for c in row)]
+    split_rows = []
+    for r_cells in rows:
+        base = {k: extract_link(v) if k in [key_map["link_nota"], key_map["link_streaming"]] else v.value for k, v in r_cells.items()}
+        base[key_map["tipodemedio"]] = normalizar_tipo_medio(base.get(key_map["tipodemedio"]))
+        menciones_raw = str(base.get(key_map["menciones"], ""))
+        menciones_list = [m.strip() for m in menciones_raw.split(";") if m.strip()] or [menciones_raw]
+        for m in menciones_list:
+            new = deepcopy(base)
+            new[key_map["menciones"]] = m
+            split_rows.append(new)
+    for idx, row in enumerate(split_rows):
+        row.update({"original_index": idx, "is_duplicate": False, "tonoai": "", "tema": ""})
+    
+    processed_rows = detectar_duplicados_avanzado(split_rows, key_map, progress_hook)
+    
+    for row in processed_rows:
+        if row["is_duplicate"]:
+            row.update({key_map["tonoai"]: "Duplicada", key_map["tema"]: "Duplicada"})
+    return processed_rows, key_map
 
-def analizar_tono_api(textos: List[str]) -> List[str]:
-    if not textos: return []
-    try:
-        payload = {"inputs": textos, "options": {"wait_for_model": True}}
-        api_resultados = query_api(payload, API_URL_SENTIMIENTO)
-        map_sentimiento = {"negative": "Negativo", "neutral": "Neutro", "positive": "Positivo"}
-        return [map_sentimiento.get(res[0]['label'].lower(), "Neutro") for res in api_resultados]
-    except Exception as e:
-        st.warning(f"No se pudo analizar el tono vía API: {e}. Se asignará 'Neutro'.")
-        return ["Neutro"] * len(textos)
+def detectar_duplicados_avanzado(rows: List[Dict], key_map: Dict[str, str], progress_hook):
+    processed_rows = deepcopy(rows)
+    seen_text_key, seen_online_url, seen_broadcast = {}, {}, {}
+    id_key, id_duplicada_key = key_map.get("idnoticia", "idnoticia"), key_map.get("idduplicada", "idduplicada")
+    titulo_key, resumen_key = key_map.get("titulo", "titulo"), key_map.get("resumen", "resumen")
+    mencion_key, medio_key = key_map.get("menciones", "menciones"), key_map.get("medio", "medio")
+    tipo_medio_key, link_nota_key, hora_key = key_map.get("tipodemedio"), key_map.get("link_nota"), key_map.get("hora")
+    
+    total_rows = len(processed_rows)
+    for i, row in enumerate(processed_rows):
+        progress_hook(i, total_rows, "Detectando duplicados...")
+        mencion_norm, medio_norm = norm_key(row.get(mencion_key)), norm_key(row.get(medio_key))
+        texto_titulo, texto_resumen = corregir_texto(row.get(titulo_key, '')), corregir_texto(row.get(resumen_key, ''))
+        texto_base = texto_titulo if texto_titulo else texto_resumen
+        if texto_base:
+            clave_texto_norm = norm_key(" ".join(texto_base.split()[:3]))
+            key = (clave_texto_norm, mencion_norm, medio_norm)
+            if clave_texto_norm and key in seen_text_key:
+                row["is_duplicate"] = True
+                row[id_duplicada_key] = processed_rows[seen_text_key[key]].get(id_key, "")
+                continue
+            else: seen_text_key[key] = i
+        tipo_medio = normalizar_tipo_medio(str(row.get(tipo_medio_key)))
+        if tipo_medio == "Internet":
+            url = (row.get(link_nota_key, {}) or {}).get("url")
+            if url and mencion_norm:
+                key_url = (url, mencion_norm)
+                if key_url in seen_online_url:
+                    row["is_duplicate"] = True
+                    row[id_duplicada_key] = processed_rows[seen_online_url[key_url]].get(id_key, "")
+                else: seen_online_url[key_url] = i
+        elif tipo_medio in ["Radio", "Televisión"]:
+            hora = str(row.get(hora_key, "")).strip()
+            if mencion_norm and medio_norm and hora:
+                key_broadcast = (mencion_norm, medio_norm, hora)
+                if key_broadcast in seen_broadcast:
+                    row["is_duplicate"] = True
+                    row[id_duplicada_key] = processed_rows[seen_broadcast[key_broadcast]].get(id_key, "")
+                else: seen_broadcast[key_broadcast] = i
+    return processed_rows
 
-def asignar_tema_api(textos: List[str], status_update) -> List[str]:
-    if not textos: return []
-    resultados = []
-    for i, texto in enumerate(textos):
-        status_update(f"Analizando tema para noticia {i+1}/{len(textos)}...")
-        payload = {
-            "inputs": { "source_sentence": texto, "sentences": TEMAS_PREDEFINIDOS },
-            "options": {"wait_for_model": True}
-        }
-        try:
-            scores = query_api(payload, API_URL_EMBEDDINGS)
-            if scores:
-                resultados.append(TEMAS_PREDEFINIDOS[scores.index(max(scores))])
-            else:
-                resultados.append("Tema no asignado")
-        except Exception as e:
-            st.warning(f"No se pudo asignar tema para una noticia: {e}.")
-            resultados.append("Tema no asignado")
-    return resultados
+def process_mappings_and_links(all_processed_rows, key_map, region_file, internet_file):
+    df_region = pd.read_excel(region_file)
+    region_map = {str(k).lower().strip(): v for k, v in pd.Series(df_region.iloc[:, 1].values, index=df_region.iloc[:, 0]).to_dict().items()}
+    df_internet = pd.read_excel(internet_file)
+    internet_map = {str(k).lower().strip(): v for k, v in pd.Series(df_internet.iloc[:, 1].values, index=df_internet.iloc[:, 0]).to_dict().items()}
+    for row in all_processed_rows:
+        original_medio_key = str(row.get(key_map.get("medio"), "")).lower().strip()
+        row[key_map.get("region")] = region_map.get(original_medio_key, "N/A")
+        if original_medio_key in internet_map:
+            row[key_map.get("medio")] = internet_map[original_medio_key]
+            row[key_map.get("tipodemedio")] = "Internet"
+    return all_processed_rows
 
-def agrupa_noticias_similares_optimizado(noticias, key_map, status_update):
-    status_update("Optimizando textos para comparación...")
-    for n in noticias:
-        n['norm_titulo'] = normalizar_texto_para_comparacion(n.get(key_map.get('titulo'), ''))
-        n['norm_resumen'] = normalizar_texto_para_comparacion(n.get(key_map.get('resumen'), ''))
-    buckets = defaultdict(list)
-    for i, n in enumerate(noticias):
-        key = " ".join(n['norm_titulo'].split()[:5])
-        if key: buckets[key].append(i)
-    status_update(f"Comparando noticias dentro de {len(buckets)} bloques...")
-    grupos, procesados = {}, set()
-    for i in range(len(noticias)):
-        if i in procesados: continue
-        grupo_actual = [i]; procesados.add(i)
-        key_i = " ".join(noticias[i]['norm_titulo'].split()[:5])
-        for j_cand in buckets.get(key_i, []):
-            if j_cand <= i or j_cand in procesados: continue
-            if calcular_similitud_textos(noticias[i]['norm_titulo'], noticias[j_cand]['norm_titulo']) >= 0.90 or \
-               calcular_similitud_textos(noticias[i]['norm_resumen'], noticias[j_cand]['norm_resumen']) >= 0.85:
-                grupo_actual.append(j_cand); procesados.add(j_cand)
-        grupos[i] = grupo_actual
+def process_link_logic(all_rows, key_map):
+    ln_key, ls_key = key_map.get("link_nota"), key_map.get("link_streaming")
+    for row in all_rows:
+        tipo = normalizar_tipo_medio(row.get(key_map.get("tipodemedio"), ""))
+        ln, ls = row.get(ln_key) or {}, row.get(ls_key) or {}
+        has_url = lambda x: isinstance(x, dict) and bool(x.get("url"))
+        if tipo in ["Radio", "Televisión"]: row[ls_key] = None
+        elif tipo == "Internet": row[ln_key], row[ls_key] = ls, ln
+        elif tipo in ["Prensa", "Revista"]:
+            if not has_url(ln) and has_url(ls): row[ln_key] = ls
+            row[ls_key] = None
+    return all_rows
+
+def process_sov_mapping_final(all_rows: List[Dict], key_map: Dict[str, str], sov_file):
+    df_sov = pd.read_excel(sov_file)
+    cols_by_norm = {norm_key(c): c for c in df_sov.columns}
+    menc_col, name_col = cols_by_norm.get(norm_key("Menciones - Empresa")), cols_by_norm.get(norm_key("Nombre"))
+    if not menc_col or not name_col: return all_rows
+    sov_map = {str(r.get(menc_col, "")).strip().lower(): str(r.get(name_col)).strip() for _, r in df_sov.iterrows() if str(r.get(menc_col, "")).strip() and str(r.get(name_col, "")).strip()}
+    for r in all_rows:
+        mk = str(r.get(key_map.get("menciones"), "")).strip().lower()
+        if mk in sov_map: r[key_map.get("menciones")] = sov_map[mk]
+    return all_rows
+
+def _append_rows_to_sheet(sheet, rows_data, key_map, include_ai_columns):
+    base_order = ["ID Noticia", "Fecha", "Hora", "Medio", "Tipo de Medio", "Seccion - Programa", "Region", "Titulo", "Autor - Conductor", "Nro. Pagina", "Dimension", "Duracion - Nro. Caracteres", "CPE", "Tier", "Audiencia", "Tono", "Resumen - Aclaracion", "Link Nota", "Link (Streaming - Imagen)", "Menciones - Empresa", "ID duplicada"]
+    ai_order = ["Tono AI", "Tema"]
+    final_order = base_order[:16] + ai_order + base_order[16:] if include_ai_columns else base_order
+    sheet.append(final_order)
+    for row_data in rows_data:
+        row_data[key_map.get("titulo")] = clean_title_for_output(row_data.get(key_map.get("titulo")))
+        row_data[key_map.get("resumen")] = corregir_texto(str(row_data.get(key_map.get("resumen"), ""))).replace("_x000D_", "")
+        row_to_append, links_to_add = [], {}
+        for col_idx, header in enumerate(final_order, 1):
+            val = row_data.get(norm_key(header))
+            cell_value = None
+            if isinstance(val, dict) and val.get("url"):
+                cell_value, url = "Link", val.get("url")
+                links_to_add[col_idx] = url
+            elif val is not None: cell_value = str(val)
+            row_to_append.append(cell_value)
+        sheet.append(row_to_append)
+        for col_idx, url in links_to_add.items():
+            cell = sheet.cell(row=sheet.max_row, column=col_idx)
+            cell.hyperlink = url
+            cell.style = "Hyperlink"
+
+def generate_excel_output(all_processed_rows, key_map):
+    out_wb = Workbook()
+    sheet1 = out_wb.active
+    sheet1.title = "UNAL con IA"
+    unal_rows = [row for row in all_processed_rows if row.get("__is_target_brand")]
+    _append_rows_to_sheet(sheet1, unal_rows, key_map, include_ai_columns=True)
+    sheet2 = out_wb.create_sheet("Todas las Marcas")
+    _append_rows_to_sheet(sheet2, all_processed_rows, key_map, include_ai_columns=False)
+    
+    # Guardar en un buffer de memoria en lugar de un archivo físico
+    output_buffer = io.BytesIO()
+    out_wb.save(output_buffer)
+    output_buffer.seek(0)
+    return output_buffer
+
+# --- FUNCIONES DE AGRUPAMIENTO E IA (CON CONTROL DE COSTO) ---
+def agrupar_noticias_similares(rows: List[Dict], key_map: Dict[str, str]) -> Dict[str, List[int]]:
+    grupos = {}
+    titulo_key, resumen_key = key_map.get("titulo", "titulo"), key_map.get("resumen", "resumen")
+    for idx, row in enumerate(rows):
+        titulo, resumen = corregir_texto(row.get(titulo_key, '')), corregir_texto(row.get(resumen_key, ''))
+        clave_grupo = " ".join(titulo.strip().split()[:4]) if titulo else " ".join(resumen.strip().split()[:4])
+        clave_grupo_norm = norm_key(clave_grupo)
+        if clave_grupo_norm:
+            if clave_grupo_norm not in grupos: grupos[clave_grupo_norm] = []
+            grupos[clave_grupo_norm].append(idx)
     return grupos
 
-def run_base_logic(sheet, status_update):
-    # (El código de esta sección ya es robusto y está correcto)
-    return [], {}
-def process_mappings_and_links(rows, key_map, f1, f2): return rows
-def process_sov_mapping_final(rows, key_map, f): return rows
-def generate_two_sheet_excel(rows, key_map): return b""
+class CostTracker:
+    def __init__(self, limit_usd: float, input_cost_per_1m: float, output_cost_per_1m: float):
+        self.limit_usd, self.total_cost = limit_usd, 0.0
+        self.input_cost_per_token, self.output_cost_per_token = input_cost_per_1m / 1e6, output_cost_per_1m / 1e6
+        self.total_input_tokens, self.total_output_tokens = 0, 0
+    def add_cost(self, input_tokens: int, output_tokens: int):
+        cost = (input_tokens * self.input_cost_per_token) + (output_tokens * self.output_cost_per_token)
+        self.total_cost += cost
+        self.total_input_tokens += input_tokens
+        self.total_output_tokens += output_tokens
+    def is_limit_exceeded(self) -> bool: return self.total_cost >= self.limit_usd
+    def get_summary(self) -> str:
+        return (f"**Resumen de Costos:**\n\n"
+                f"- Límite Establecido: **${self.limit_usd:.2f}**\n\n"
+                f"- Costo Total Incurrido: **${self.total_cost:.4f}**\n\n"
+                f"- Tokens (Entrada / Salida): **{self.total_input_tokens:,} / {self.total_output_tokens:,}**")
 
-# ======================================
-# Proceso Principal y UI
-# ======================================
-def run_full_process(dossier_file, region_file, internet_file, sov_file):
-    tiempo_inicio = time.time()
-    with st.status("🚀 **Iniciando Análisis (modo API)...**", expanded=True) as status:
+def analizar_con_openai(textos_agrupados: List[Tuple[str, List[int]]], cost_tracker: CostTracker, client: OpenAI, progress_hook):
+    resultados = {}
+    tools = [{"type": "function", "function": {"name": "clasificar_noticia_unal", "description": "Clasifica el tono y el tema de una noticia sobre la Universidad Nacional.", "parameters": {"type": "object", "properties": {"tono": {"type": "string", "description": "El tono de la noticia: Positivo, Negativo o Neutro.", "enum": ["Positivo", "Negativo", "Neutro"]}, "tema": {"type": "string", "description": "Tema específico de 4 a 6 palabras que resume el hecho principal. No debe incluir el nombre de la universidad ni ser genérico."}}, "required": ["tono", "tema"]}}}]
+    system_prompt = """Eres un analista de medios experto y tu única especialidad es la Universidad Nacional de Colombia. Eres extremadamente preciso y sigues las reglas al pie de la letra. Analiza la noticia y clasifica su tono y tema. **REGLAS DE TONO:** - **NEGATIVO:** Crisis, críticas, efectos adversos, controversias, violencia en campus. - **POSITIVO:** Rankings, innovación, programas exitosos, gestiones a favor, reconocimientos. - **NEUTRO:** Menciones generales, informativas, sin valoración. **REGLAS CRÍTICAS PARA EL TEMA:** 1. **CONTENIDO ESPECÍFICO:** Describe el **evento o hecho principal**, no seas genérico. INCORRECTO: "Mención en contexto de violencia." CORRECTO: "Disturbios en campus por protestas estudiantiles." 2. **EXCLUIR LA MARCA:** **NO** incluyas "Universidad Nacional" o "UNAL" en el tema. 3. **LONGITUD PRECISA:** El tema debe tener **ESTRICTAMENTE entre 4 y 6 palabras.**"""
+    total_grupos = len(textos_agrupados)
+    for i, (texto_representativo, indices_grupo) in enumerate(textos_agrupados):
+        progress_hook(i, total_grupos, "Analizando con IA...")
+        if cost_tracker.is_limit_exceeded():
+            st.warning(f"⚠️ LÍMITE DE COSTO ALCANZADO (${cost_tracker.limit_usd:.2f}). Deteniendo el análisis.")
+            break
         try:
-            status.write("Paso 1/4: Preparando y limpiando datos...")
-            all_processed_rows, key_map = run_base_logic(load_workbook(dossier_file, data_only=True).active, status.write)
-            all_processed_rows = process_mappings_and_links(all_processed_rows, key_map, region_file, internet_file)
-            for row in all_processed_rows: row["__is_target_brand"] = (row.get(key_map.get("menciones")) in TARGET_BRANDS)
-            index_to_row_map = {row['original_index']: row for row in all_processed_rows}
-            target_rows_all = [row for row in all_processed_rows if row.get("__is_target_brand") and not row.get("is_duplicate")]
-
-            if not target_rows_all:
-                st.warning("No se encontraron noticias para analizar."); status.update(label="Análisis finalizado.", state="complete"); return
-            
-            status.update(label="Paso 2/4: Agrupando noticias similares...")
-            for i, noticia in enumerate(target_rows_all): noticia['original_list_index'] = i
-            grupos_similares = agrupa_noticias_similares_optimizado(target_rows_all, key_map, status.write)
-            noticias_representantes = [target_rows_all[i] for i in grupos_similares.keys()]
-            textos_para_analisis = [f"{corregir_texto(rep.get(key_map.get('titulo'), ''))}. {corregir_texto(rep.get(key_map.get('resumen'), ''))}" for rep in noticias_representantes]
-
-            status.update(label="Paso 3/4: Analizando Tono y Tema vía API de Hugging Face...")
-            resultados_tono = analizar_tono_api(textos_para_analisis)
-            resultados_tema = asignar_tema_api(textos_para_analisis, status.write)
-
-            status.update(label="Paso 4/4: Generando el informe final...")
-            for i, idx_rep in enumerate(grupos_similares.keys()):
-                tono, tema = resultados_tono[i], resultados_tema[i]
-                for idx_miembro_lista in grupos_similares[idx_rep]:
-                    original_global_index = target_rows_all[idx_miembro_lista]['original_index']
-                    index_to_row_map[original_global_index][key_map.get("tonoai")] = tono
-                    index_to_row_map[original_global_index][key_map.get("tema")] = tema
-            
-            final_processed_rows = list(index_to_row_map.values())
-            final_processed_rows = process_sov_mapping_final(final_processed_rows, key_map, sov_file)
-            
-            st.session_state["output_data"] = generate_two_sheet_excel(final_processed_rows, key_map)
-            st.session_state["output_filename"] = f"Informe_Analisis_UNAL_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-            st.session_state["processing_complete"] = True
-            st.session_state["tiempo_procesamiento"] = time.time() - tiempo_inicio
-            
-            status.update(label="✅ ¡Análisis Completado!", state="complete", expanded=False)
+            response = client.chat.completions.create(
+               model="gpt-4.1-nano-2025-04-14", messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": f"Analiza: \"{texto_representativo}\""}],
+               tools=tools, tool_choice={"type": "function", "function": {"name": "clasificar_noticia_unal"}}, temperature=0.0, max_tokens=250
+            )
+            if response.usage: cost_tracker.add_cost(response.usage.prompt_tokens, response.usage.completion_tokens)
+            resultado_json = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
+            tono, tema = resultado_json["tono"], resultado_json["tema"]
+            for idx in indices_grupo: resultados[idx] = {"tono": tono, "tema": tema}
         except Exception as e:
-            status.update(label=f"❌ Error Crítico: {e}", state="error", expanded=True)
-            st.exception(e)
+            st.error(f"Error CRÍTICO en API grupo {i + 1}: {e}")
+            for idx in indices_grupo: resultados[idx] = {"tono": "Error", "tema": "Excepción API"}
+    return resultados
 
-def main():
-    load_custom_css()
-    if not check_password(): return
+def procesar_por_lotes(target_rows: List[Dict], key_map: Dict[str, str], batch_size: int, cost_tracker: CostTracker, client: OpenAI, status_placeholder, progress_bar):
+    total_rows = len(target_rows)
+    num_batches = (total_rows + batch_size - 1) // batch_size
+    titulo_key, resumen_key = key_map.get("titulo"), key_map.get("resumen")
+    tono_key, tema_key = key_map.get("tonoai"), key_map.get("tema")
+    all_resultados = []
+    for batch_num in range(num_batches):
+        if cost_tracker.is_limit_exceeded(): break
+        start_idx, end_idx = batch_num * batch_size, min((batch_num + 1) * batch_size, total_rows)
+        batch_rows = target_rows[start_idx:end_idx]
+        status_placeholder.text(f"📦 Procesando Lote {batch_num + 1}/{num_batches} (Filas {start_idx + 1}-{end_idx})...")
+        
+        grupos = agrupar_noticias_similares(batch_rows, key_map)
+        textos_agrupados = []
+        for _, indices_locales in grupos.items():
+            idx_repr = indices_locales[0]
+            texto_completo = f"{corregir_texto(batch_rows[idx_repr].get(titulo_key, ''))}. {corregir_texto(batch_rows[idx_repr].get(resumen_key, ''))}".strip()[:3000]
+            if texto_completo: textos_agrupados.append((texto_completo, indices_locales))
+        
+        # Hook para actualizar la barra de progreso interna de la IA
+        def progress_hook_ia(current, total, text):
+            # Actualiza el progreso general del lote
+            base_progress = (batch_num / num_batches)
+            lote_progress = (current / total) * (1 / num_batches) if total > 0 else 0
+            progress_bar.progress(base_progress + lote_progress, text=f"Lote {batch_num+1}/{num_batches}: {text}")
 
-    st.markdown('<div class="main-header">🎓 Sistema de Análisis de Noticias UNAL</div>', unsafe_allow_html=True)
-    st.markdown(f"**Versión 15.0 (API Estable)**: Esta herramienta utiliza la API de Hugging Face para garantizar estabilidad y velocidad.")
+        resultados_batch = analizar_con_openai(textos_agrupados, cost_tracker, client, progress_hook_ia)
+        
+        for idx_local, resultado in resultados_batch.items():
+            batch_rows[idx_local][tono_key] = resultado["tono"]
+            batch_rows[idx_local][tema_key] = resultado["tema"]
+        all_resultados.extend(batch_rows)
+    return all_resultados
+
+# ==============================================================================
+# INTERFAZ DE LA APLICACIÓN STREAMLIT
+# ==============================================================================
+st.title("🎓 Análisis de Tono y Tema para la Universidad Nacional")
+st.markdown("Esta herramienta automatiza el análisis de menciones en medios, aplicando clasificación por IA y control de costos.")
+
+# --- INICIALIZACIÓN DE ESTADO ---
+if 'analysis_done' not in st.session_state:
+    st.session_state.analysis_done = False
+if 'result_buffer' not in st.session_state:
+    st.session_state.result_buffer = None
+if 'final_summary' not in st.session_state:
+    st.session_state.final_summary = ""
+
+# --- CONFIGURACIÓN EN LA BARRA LATERAL ---
+with st.sidebar:
+    st.header("1. Configuración")
     
-    with st.expander("📋 Ver los 30 temas predefinidos", expanded=False):
-        cols = st.columns(2)
-        mitad = len(TEMAS_PREDEFINIDOS) // 2
-        with cols[0]:
-            for i, tema in enumerate(TEMAS_PREDEFINIDOS[:mitad], 1): st.markdown(f"**{i}.** {tema}")
-        with cols[1]:
-            for i, tema in enumerate(TEMAS_PREDEFINIDOS[mitad:], mitad + 1): st.markdown(f"**{i}.** {tema}")
+    # Intenta obtener la API key desde los secrets de Streamlit, si no, pide al usuario
+    api_key = st.text_input("🔑 OpenAI API Key", type="password", help="Pega tu API Key de OpenAI aquí.", value=st.secrets.get("OPENAI_API_KEY", ""))
 
-    if not st.session_state.get("processing_complete", False):
-        with st.form("input_form"):
-            st.markdown("### 📂 Archivos de Entrada")
-            col1, col2, col3, col4 = st.columns(4)
-            dossier_file = col1.file_uploader("**1. Dossier Principal** (.xlsx)", type=["xlsx"])
-            region_file = col2.file_uploader("**2. Mapeo de Región** (.xlsx)", type=["xlsx"])
-            internet_file = col3.file_uploader("**3. Mapeo Internet** (.xlsx)", type=["xlsx"])
-            sov_file = col4.file_uploader("**4. Mapeo SOV** (.xlsx)", type=["xlsx"])
+    st.header("2. Carga de Archivos")
+    dossier_file = st.file_uploader("📂 Dossier Principal (.xlsx)", type="xlsx")
+    region_file = st.file_uploader("🌍 Mapeo de Región (.xlsx)", type="xlsx")
+    internet_file = st.file_uploader("🌐 Mapeo de Internet (.xlsx)", type="xlsx")
+    sov_file = st.file_uploader("📊 Mapeo SOV (.xlsx)", type="xlsx")
+    
+    st.header("3. Parámetros de Análisis")
+    cost_limit_usd = st.number_input("💰 Límite de Costo (USD)", min_value=0.10, max_value=10.0, value=1.00, step=0.10)
+    batch_size = st.slider("📦 Tamaño de Lote (Noticias por Tanda)", min_value=100, max_value=1000, value=500, step=50)
+
+# --- LÓGICA PRINCIPAL ---
+if st.sidebar.button("🚀 Iniciar Análisis", type="primary", use_container_width=True, disabled=(not all([api_key, dossier_file, region_file, internet_file, sov_file]))):
+    st.session_state.analysis_done = False
+    st.session_state.result_buffer = None
+
+    client = OpenAI(api_key=api_key)
+    TARGET_BRANDS = ["U. Nacional de Colombia", "Universidad Nacional de Colombia", "Universidad Nacional de Colombia - General"]
+    
+    status_container = st.container()
+    progress_text = "Iniciando proceso..."
+    progress_bar = st.progress(0, text=progress_text)
+
+    def main_progress_hook(current, total, text):
+        if total > 0:
+            progress_bar.progress(current / total, text=text)
+
+    try:
+        with st.spinner("Cargando y procesando archivos..."):
+            # FASE 1: PREPARACIÓN DE DATOS
+            status_container.info("📋 **Fase 1/3: Preparando y limpiando datos...**")
+            workbook = load_workbook(dossier_file, data_only=True)
+            all_processed_rows, key_map = run_base_logic(workbook.active, main_progress_hook)
+            all_processed_rows = process_mappings_and_links(all_processed_rows, key_map, region_file, internet_file)
+            all_processed_rows = process_link_logic(all_processed_rows, key_map)
             
-            if st.form_submit_button("🚀 **INICIAR ANÁLISIS COMPLETO**", use_container_width=True, type="primary"):
-                if not all([dossier_file, region_file, internet_file, sov_file]):
-                    st.error("❌ Faltan archivos obligatorios.")
-                else:
-                    run_full_process(dossier_file, region_file, internet_file, sov_file)
-                    st.rerun()
-    else:
-        st.success("## 🎉 Análisis Completado Exitosamente")
-        if "tiempo_procesamiento" in st.session_state:
-            st.markdown(f"""
-            <div class="timer-box">
-                <h2>⏱️ Tiempo Total de Procesamiento</h2>
-                <p><strong>{format_tiempo(st.session_state["tiempo_procesamiento"])}</strong></p>
-            </div>
-            """, unsafe_allow_html=True)
-        st.download_button("📥 **DESCARGAR INFORME**", st.session_state.output_data, file_name=st.session_state.output_filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True, type="primary")
-        if st.button("🔄 **Realizar un Nuevo Análisis**", use_container_width=True):
-            pwd = st.session_state.get("password_correct")
-            st.session_state.clear()
-            st.session_state.password_correct = pwd
-            st.rerun()
+            for row in all_processed_rows:
+                row["__is_target_brand"] = (row.get(key_map.get("menciones")) in TARGET_BRANDS)
+            
+            noticias_unal = sum(1 for row in all_processed_rows if row.get("__is_target_brand"))
+            status_container.write(f"✅ Datos preparados: {len(all_processed_rows)} noticias totales, {noticias_unal} de UNAL.")
+            progress_bar.progress(0.33, text="Datos limpios.")
 
-    st.markdown("<hr><div style='text-align:center;color:#666;font-size:0.9rem;'><p>Sistema de Análisis de Noticias v15.0 (API Estable) | Universidad Nacional de Colombia</p></div>", unsafe_allow_html=True)
+        # FASE 2: ANÁLISIS CON IA
+        status_container.info("🤖 **Fase 2/3: Analizando con Inteligencia Artificial...**")
+        cost_tracker = CostTracker(cost_limit_usd, 0.10, 0.40)
+        target_rows = [row for row in all_processed_rows if row.get("__is_target_brand") and not row.get("is_duplicate")]
+        
+        status_placeholder = st.empty() # Placeholder para mensajes de lotes
+        if target_rows:
+            target_rows_procesados = procesar_por_lotes(target_rows, key_map, batch_size, cost_tracker, client, status_placeholder, progress_bar)
+            update_map = {row['original_index']: row for row in target_rows_procesados}
+            for row in all_processed_rows:
+                if row['original_index'] in update_map:
+                    row[key_map.get("tonoai")] = update_map[row['original_index']].get(key_map.get("tonoai"))
+                    row[key_map.get("tema")] = update_map[row['original_index']].get(key_map.get("tema"))
+            st.session_state.final_summary = cost_tracker.get_summary()
+        else:
+            status_container.write("✅ No hay noticias nuevas de la UNAL para analizar con IA.")
+        
+        progress_bar.progress(0.66, text="Análisis IA completado.")
 
-if __name__ == "__main__":
-    main()
+        # FASE 3: GENERACIÓN DE INFORME
+        status_container.info("📄 **Fase 3/3: Generando informe final...**")
+        final_rows = process_sov_mapping_final(all_processed_rows, key_map, sov_file)
+        st.session_state.result_buffer = generate_excel_output(final_rows, key_map)
+        
+        progress_bar.progress(1.0, text="¡Proceso completado!")
+        st.session_state.analysis_done = True
+        st.success("🎉 ¡Análisis completado exitosamente!")
+
+    except Exception as e:
+        st.error(f"❌ Ocurrió un error durante el proceso: {e}")
+        st.exception(e) # Imprime el stack trace completo para debugging
+
+# --- MOSTRAR RESULTADOS Y BOTÓN DE DESCARGA ---
+if st.session_state.analysis_done and st.session_state.result_buffer:
+    st.markdown("---")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("📊 Resumen del Análisis")
+        st.markdown(st.session_state.final_summary)
+    with col2:
+        st.subheader("📥 Descargar Informe")
+        st.download_button(
+            label="Descargar Archivo Excel",
+            data=st.session_state.result_buffer,
+            file_name=f"Informe_Analisis_UNAL_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+else:
+    st.info("Configure los parámetros en la barra lateral y haga clic en 'Iniciar Análisis' para comenzar.")
