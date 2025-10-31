@@ -947,7 +947,7 @@ def main():
                 st.session_state.analysis_done = False
     
     # ==============================================================================
-    # MOSTRAR RESULTADOS
+    # MOSTRAR RESULTADOS (SECCIÓN INTEGRADA Y MEJORADA)
     # ==============================================================================
     
     if st.session_state.analysis_done and st.session_state.result_buffer:
@@ -958,36 +958,43 @@ def main():
         tab1, tab2, tab3 = st.tabs(["💰 Costos y Tokens", "📈 Estadísticas", "⏱️ Tiempos"])
         
         with tab1:
-            summary = st.session_state.final_summary
+            # Uso de 'or {}' para manejar de forma segura si 'final_summary' no existe.
+            summary = st.session_state.final_summary or {}
             
             col1, col2 = st.columns(2)
             
             with col1:
+                total_cost = summary.get('total_cost', 0)
+                limit = summary.get('limit', 0)
+                
                 st.markdown(f"""
                 <div class="metric-card">
                     <div class="metric-label">Costo Total</div>
-                    <div class="metric-value">${summary.get('total_cost', 0):.4f}</div>
-                    <div class="metric-label">Límite: ${summary.get('limit', 0):.2f}</div>
+                    <div class="metric-value">${total_cost:.4f}</div>
+                    <div class="metric-label">Límite: ${limit:.2f}</div>
                 </div>
                 """, unsafe_allow_html=True)
                 
                 # Barra de progreso de costo
                 percentage = summary.get('percentage', 0)
-                color = "#10B981" if percentage < 80 else "#F59E0B" if percentage < 95 else "#EF4444"
                 st.progress(min(percentage / 100, 1.0), text=f"Uso del presupuesto: {percentage:.1f}%")
             
             with col2:
+                input_tokens = summary.get('input_tokens', 0)
+                output_tokens = summary.get('output_tokens', 0)
+                total_tokens = input_tokens + output_tokens
+                
                 st.markdown(f"""
                 <div class="metric-card">
                     <div class="metric-label">Tokens Procesados</div>
-                    <div class="metric-value">{summary.get('input_tokens', 0) + summary.get('output_tokens', 0):,}</div>
-                    <div class="metric-label">Entrada: {summary.get('input_tokens', 0):,} | Salida: {summary.get('output_tokens', 0):,}</div>
+                    <div class="metric-value">{total_tokens:,}</div>
+                    <div class="metric-label">Entrada: {input_tokens:,} | Salida: {output_tokens:,}</div>
                 </div>
                 """, unsafe_allow_html=True)
                 
                 # Desglose de tokens
-                if summary.get('input_tokens', 0) + summary.get('output_tokens', 0) > 0:
-                    input_pct = summary.get('input_tokens', 0) / (summary.get('input_tokens', 0) + summary.get('output_tokens', 0)) * 100
+                if total_tokens > 0:
+                    input_pct = (input_tokens / total_tokens) * 100
                     st.info(f"📥 Entrada: {input_pct:.1f}% | 📤 Salida: {100-input_pct:.1f}%")
         
         with tab2:
