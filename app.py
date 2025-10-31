@@ -310,12 +310,13 @@ class CostTracker:
         self.total_output_tokens += output_tokens
     def is_limit_exceeded(self) -> bool: return self.total_cost >= self.limit_usd
     def get_summary(self) -> Dict:
+        remaining = max(0, self.limit_usd - self.total_cost)
         return {
             "limit": self.limit_usd,
             "total_cost": self.total_cost,
             "input_tokens": self.total_input_tokens,
             "output_tokens": self.total_output_tokens,
-            "remaining": max(0, self.limit_usd - self.total_cost)
+            "remaining": remaining
         }
 
 def analizar_con_openai_parallel(textos_agrupados: List[Tuple[str, List[int]]], cost_tracker: CostTracker, client: OpenAI, progress_hook, max_workers: int = 3):
@@ -515,23 +516,33 @@ if st.session_state.analysis_done and st.session_state.result_buffer:
     
     with col1:
         st.markdown("### 📊 Resumen del Análisis")
-        summary = st.session_state.final_summary
-        stats = st.session_state.analysis_stats
+        summary = st.session_state.get('final_summary', {})
+        stats = st.session_state.get('analysis_stats', {})
+        
+        # Valores seguros con defaults
+        total_cost = summary.get('total_cost', 0)
+        limit = summary.get('limit', 0)
+        remaining = max(0, limit - total_cost)
+        input_tokens = summary.get('input_tokens', 0)
+        output_tokens = summary.get('output_tokens', 0)
+        total_tokens = input_tokens + output_tokens
+        processing_time = stats.get('time', 0)
+        processed_news = stats.get('processed', 0)
         
         metrics_col1, metrics_col2, metrics_col3, metrics_col4 = st.columns(4)
-        metrics_col1.metric("💵 Costo Total", f"${summary['total_cost']:.4f}")
-        metrics_col2.metric("💰 Restante", f"${summary['remaining']:.4f}")
-        metrics_col3.metric("🔤 Tokens", f"{summary['input_tokens'] + summary['output_tokens']:,}")
-        metrics_col4.metric("⏱️ Tiempo", f"{stats.get('time', 0):.1f}s")
+        metrics_col1.metric("💵 Costo Total", f"${total_cost:.4f}")
+        metrics_col2.metric("💰 Restante", f"${remaining:.4f}")
+        metrics_col3.metric("🔤 Tokens", f"{total_tokens:,}")
+        metrics_col4.metric("⏱️ Tiempo", f"{processing_time:.1f}s")
         
         st.markdown(f"""
         <div class="metric-card">
             <h4>📈 Detalles de Procesamiento</h4>
             <ul>
-                <li><strong>Noticias Analizadas:</strong> {stats.get('processed', 0):,}</li>
-                <li><strong>Tokens de Entrada:</strong> {summary['input_tokens']:,}</li>
-                <li><strong>Tokens de Salida:</strong> {summary['output_tokens']:,}</li>
-                <li><strong>Límite Establecido:</strong> ${summary['limit']:.2f}</li>
+                <li><strong>Noticias Analizadas:</strong> {processed_news:,}</li>
+                <li><strong>Tokens de Entrada:</strong> {input_tokens:,}</li>
+                <li><strong>Tokens de Salida:</strong> {output_tokens:,}</li>
+                <li><strong>Límite Establecido:</strong> ${limit:.2f}</li>
             </ul>
         </div>
         """, unsafe_allow_html=True)
