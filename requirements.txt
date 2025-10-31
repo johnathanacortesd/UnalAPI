@@ -4,3 +4,4 @@ unidecode
 pandas
 openpyxl
 tqdm
+thefuzz
