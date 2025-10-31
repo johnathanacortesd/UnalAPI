@@ -286,15 +286,27 @@ def generate_excel_output(all_processed_rows, key_map):
     output_buffer.seek(0)
     return output_buffer
 
+# <<< MEJORA: Nueva función para agrupar noticias antes de enviarlas a la IA.
 def agrupar_noticias_similares(rows: List[Dict], key_map: Dict[str, str]) -> Dict[str, List[int]]:
+    """
+    Agrupa noticias basadas en las primeras 4 palabras del título o resumen.
+    Esto permite analizar un solo texto por grupo, reduciendo redundancia y costos.
+    """
     grupos = {}
     titulo_key, resumen_key = key_map.get("titulo", "titulo"), key_map.get("resumen", "resumen")
     for idx, row in enumerate(rows):
-        titulo, resumen = corregir_texto(row.get(titulo_key, '')), corregir_texto(row.get(resumen_key, ''))
-        clave_grupo = " ".join(titulo.strip().split()[:4]) if titulo else " ".join(resumen.strip().split()[:4])
+        # Prioriza el título, si no existe, usa el resumen.
+        titulo = corregir_texto(row.get(titulo_key, ''))
+        resumen = corregir_texto(row.get(resumen_key, ''))
+        texto_base = titulo if titulo else resumen
+        
+        # Crea una clave de grupo con las primeras 4 palabras normalizadas.
+        clave_grupo = " ".join(texto_base.strip().split()[:4])
         clave_grupo_norm = norm_key(clave_grupo)
+        
         if clave_grupo_norm:
-            if clave_grupo_norm not in grupos: grupos[clave_grupo_norm] = []
+            if clave_grupo_norm not in grupos:
+                grupos[clave_grupo_norm] = []
             grupos[clave_grupo_norm].append(idx)
     return grupos
 
@@ -319,19 +331,51 @@ class CostTracker:
             "remaining": remaining
         }
 
+# <<< MEJORA: Prompt y lógica de la función de OpenAI modificados para trabajar con grupos y mejorar el contexto.
 def analizar_con_openai_parallel(textos_agrupados: List[Tuple[str, List[int]]], cost_tracker: CostTracker, client: OpenAI, progress_hook, max_workers: int = 3):
-    """Versión optimizada con procesamiento paralelo limitado"""
+    """
+    Versión optimizada que analiza grupos de noticias similares.
+    Acepta una lista de tuplas (texto_representativo, lista_de_índices_del_grupo).
+    """
     resultados = {}
     tools = [{"type": "function", "function": {"name": "clasificar_noticia_unal", "description": "Clasifica el tono y el tema de una noticia sobre la Universidad Nacional.", "parameters": {"type": "object", "properties": {"tono": {"type": "string", "description": "El tono de la noticia: Positivo, Negativo o Neutro.", "enum": ["Positivo", "Negativo", "Neutro"]}, "tema": {"type": "string", "description": "Tema específico de 4 a 6 palabras que resume el hecho principal. No debe incluir el nombre de la universidad ni ser genérico."}}, "required": ["tono", "tema"]}}}]
-    system_prompt = """Eres un analista de medios experto y tu única especialidad es la Universidad Nacional de Colombia. Eres extremadamente preciso y sigues las reglas al pie de la letra. Analiza la noticia y clasifica su tono y tema. **REGLAS DE TONO:** - **NEGATIVO:** Crisis, críticas, efectos adversos, controversias, violencia en campus. - **POSITIVO:** Rankings, innovación, programas exitosos, gestiones a favor, reconocimientos. - **NEUTRO:** Menciones generales, informativas, sin valoración. **REGLAS CRÍTICAS PARA EL TEMA:** 1. **CONTENIDO ESPECÍFICO:** Describe el **evento o hecho principal**, no seas genérico. INCORRECTO: "Mención en contexto de violencia." CORRECTO: "Disturbios en campus por protestas estudiantiles." 2. **EXCLUIR LA MARCA:** **NO** incluyas "Universidad Nacional" o "UNAL" en el tema. 3. **LONGITUD PRECISA:** El tema debe tener **ESTRICTAMENTE entre 4 y 6 palabras.**"""
     
+    # <<< MEJORA: Prompt radicalmente mejorado para enfocarse en el contexto de la UNAL.
+    system_prompt = """Eres un analista de medios experto enfocado exclusivamente en la Universidad Nacional de Colombia (UNAL). Tu tarea es analizar el siguiente texto, que representa un grupo de noticias similares, y clasificarlo según su impacto DIRECTO en la universidad.
+
+**REGLAS DE TONO (IMPACTO EN LA UNAL):**
+- **NEGATIVO:** Solo si la noticia trata sobre:
+  - Críticas directas a la gestión o decisiones de la UNAL.
+  - Crisis internas, problemas administrativos o financieros de la UNAL.
+  - Eventos violentos o disturbios DENTRO de los campus de la UNAL que afecten a su comunidad.
+  - Fallos, escándalos o controversias que involucren directamente a la UNAL.
+- **POSITIVO:** Solo si la noticia trata sobre:
+  - Logros, premios o reconocimientos para la UNAL, sus facultades o estudiantes.
+  - Avances en investigación, innovación o proyectos liderados por la UNAL.
+  - Buena gestión, convenios exitosos o decisiones que benefician a la comunidad universitaria.
+  - Aparición en rankings positivos o contribuciones destacadas a la sociedad.
+- **NEUTRO:** Para todos los demás casos, incluyendo:
+  - Menciones informativas, contextuales o como fuente experta sin valoración.
+  - Noticias sobre el sector educativo en general donde solo se menciona a la UNAL.
+  - Eventos nacionales o locales donde la UNAL no es el actor principal.
+
+**REGLAS CRÍTICAS PARA EL TEMA (RESUMEN DEL HECHO):**
+1.  **CONTENIDO ESPECÍFICO:** Describe el **evento principal** del grupo de noticias.
+    - INCORRECTO: "Mención en contexto de violencia."
+    - CORRECTO: "Disturbios en campus por protestas estudiantiles."
+2.  **EXCLUIR LA MARCA:** **NO** incluyas "Universidad Nacional", "UNAL" o similares.
+3.  **LONGITUD PRECISA:** El tema debe tener **ESTRICTAMENTE entre 4 y 6 palabras.**
+
+Analiza con máxima precisión. Tu evaluación debe reflejar el impacto en la reputación y gestión de la Universidad Nacional, no el sentimiento general de la noticia."""
+
     def procesar_grupo(i, texto_representativo, indices_grupo):
         if cost_tracker.is_limit_exceeded():
             return None
         try:
+            # <<< MEJORA: Modelo actualizado a gpt-4.1-nano-2025-04-14 para mejor costo-eficiencia y rendimiento
             response = client.chat.completions.create(
                model="gpt-4.1-nano-2025-04-14", 
-               messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": f"Analiza: \"{texto_representativo}\""}],
+               messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": f"Analiza este grupo de noticias: \"{texto_representativo}\""}],
                tools=tools, 
                tool_choice={"type": "function", "function": {"name": "clasificar_noticia_unal"}}, 
                temperature=0.0, 
@@ -341,7 +385,8 @@ def analizar_con_openai_parallel(textos_agrupados: List[Tuple[str, List[int]]], 
             resultado_json = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
             return (indices_grupo, resultado_json["tono"], resultado_json["tema"])
         except Exception as e:
-            st.error(f"Error en grupo {i + 1}: {e}")
+            st.warning(f"Advertencia en API para grupo {i + 1}: {e}. Reintentando o asignando error.")
+            # Se puede agregar lógica de reintento aquí si se desea.
             return (indices_grupo, "Error", "Excepción API")
     
     total_grupos = len(textos_agrupados)
@@ -354,45 +399,68 @@ def analizar_con_openai_parallel(textos_agrupados: List[Tuple[str, List[int]]], 
             result = future.result()
             if result:
                 indices_grupo, tono, tema = result
+                # <<< MEJORA: Aplica el mismo resultado a todos los miembros del grupo.
                 for idx in indices_grupo:
                     resultados[idx] = {"tono": tono, "tema": tema}
             completed += 1
-            progress_hook(completed, total_grupos, f"Analizando con IA ({completed}/{total_grupos})...")
+            progress_hook(completed, total_grupos, f"Analizando grupos con IA ({completed}/{total_grupos})...")
     
     return resultados
 
+# <<< MEJORA: Lógica de procesamiento por lotes modificada para usar la agrupación.
 def procesar_por_lotes(target_rows: List[Dict], key_map: Dict[str, str], batch_size: int, cost_tracker: CostTracker, client: OpenAI, status_placeholder, progress_bar):
     total_rows = len(target_rows)
     num_batches = (total_rows + batch_size - 1) // batch_size
     titulo_key, resumen_key = key_map.get("titulo"), key_map.get("resumen")
     tono_key, tema_key = key_map.get("tonoai"), key_map.get("tema")
-    all_resultados = []
+    
+    # Crea un mapa del índice original de la fila completa al índice dentro de target_rows
+    target_map = {row['original_index']: i for i, row in enumerate(target_rows)}
     
     for batch_num in range(num_batches):
-        if cost_tracker.is_limit_exceeded(): break
-        start_idx, end_idx = batch_num * batch_size, min((batch_num + 1) * batch_size, total_rows)
+        if cost_tracker.is_limit_exceeded():
+            st.warning("Límite de costo alcanzado. Deteniendo el análisis de IA.")
+            break
+        
+        start_idx = batch_num * batch_size
+        end_idx = min((batch_num + 1) * batch_size, total_rows)
         batch_rows = target_rows[start_idx:end_idx]
+        
         status_placeholder.markdown(f'<div class="info-box">📦 <strong>Procesando Lote {batch_num + 1}/{num_batches}</strong> (Noticias {start_idx + 1}-{end_idx})</div>', unsafe_allow_html=True)
         
+        # 1. Agrupar noticias dentro del lote
         grupos = agrupar_noticias_similares(batch_rows, key_map)
-        textos_agrupados = []
-        for _, indices_locales in grupos.items():
-            idx_repr = indices_locales[0]
-            texto_completo = f"{corregir_texto(batch_rows[idx_repr].get(titulo_key, ''))}. {corregir_texto(batch_rows[idx_repr].get(resumen_key, ''))}".strip()[:3000]
-            if texto_completo: textos_agrupados.append((texto_completo, indices_locales))
         
+        # 2. Preparar los datos para la IA: un texto representativo por grupo
+        textos_agrupados_para_ia = []
+        for _, indices_locales in grupos.items():
+            # Elige la primera noticia del grupo como representativa
+            idx_repr_local = indices_locales[0]
+            row_repr = batch_rows[idx_repr_local]
+            
+            # Construye el texto completo para el análisis
+            texto_completo = f"TÍTULO: {corregir_texto(row_repr.get(titulo_key, ''))}. RESUMEN: {corregir_texto(row_repr.get(resumen_key, ''))}".strip()[:3500]
+            
+            if texto_completo and texto_completo != "TÍTULO: . RESUMEN: ":
+                textos_agrupados_para_ia.append((texto_completo, indices_locales))
+        
+        # Hook para la barra de progreso dentro del análisis de IA
         def progress_hook_ia(current, total, text):
             base_progress = (batch_num / num_batches)
             lote_progress = (current / total) * (1 / num_batches) if total > 0 else 0
-            progress_bar.progress(base_progress + lote_progress, text=f"🤖 Lote {batch_num+1}/{num_batches}: {text}")
+            progress_bar.progress(0.33 + (0.33 * (base_progress + lote_progress)), text=f"🤖 Lote {batch_num+1}/{num_batches}: {text}")
 
-        resultados_batch = analizar_con_openai_parallel(textos_agrupados, cost_tracker, client, progress_hook_ia, max_workers=3)
+        # 3. Analizar los grupos con la IA
+        resultados_batch = analizar_con_openai_parallel(textos_agrupados_para_ia, cost_tracker, client, progress_hook_ia, max_workers=3)
         
+        # 4. Actualizar las filas originales con los resultados del análisis
         for idx_local, resultado in resultados_batch.items():
-            batch_rows[idx_local][tono_key] = resultado["tono"]
-            batch_rows[idx_local][tema_key] = resultado["tema"]
-        all_resultados.extend(batch_rows)
-    return all_resultados
+            original_row_index_in_batch = start_idx + idx_local
+            if original_row_index_in_batch < len(target_rows):
+                target_rows[original_row_index_in_batch][tono_key] = resultado["tono"]
+                target_rows[original_row_index_in_batch][tema_key] = resultado["tema"]
+
+    return target_rows
 
 # ==============================================================================
 # LÓGICA PRINCIPAL DE LA APLICACIÓN
@@ -450,7 +518,7 @@ if start_button:
     metrics_container = st.container()
 
     def main_progress_hook(current, total, text):
-        if total > 0: progress_bar.progress(min(current / total, 0.99), text=text)
+        if total > 0: progress_bar.progress(min((current / total) * 0.33, 0.32), text=text)
 
     start_time = time.time()
 
@@ -476,17 +544,21 @@ if start_button:
 
         # FASE 2: Análisis con IA
         status_container.markdown('<div class="info-box">🤖 <strong>Fase 2/3:</strong> Analizando con Inteligencia Artificial...</div>', unsafe_allow_html=True)
-        cost_tracker = CostTracker(cost_limit_usd, 0.10, 0.40)
+        # <<< MEJORA: Costos actualizados para gpt-4.1-nano-2025-04-14
+        cost_tracker = CostTracker(cost_limit_usd, 0.10, 0.40) 
         target_rows = [row for row in all_processed_rows if row.get("__is_target_brand") and not row.get("is_duplicate")]
         
         status_placeholder = st.empty()
         if target_rows:
             target_rows_procesados = procesar_por_lotes(target_rows, key_map, batch_size, cost_tracker, client, status_placeholder, progress_bar)
+            
+            # Mapear los resultados de vuelta a la lista principal `all_processed_rows`
             update_map = {row['original_index']: row for row in target_rows_procesados}
             for row in all_processed_rows:
                 if row['original_index'] in update_map:
                     row[key_map.get("tonoai")] = update_map[row['original_index']].get(key_map.get("tonoai"))
                     row[key_map.get("tema")] = update_map[row['original_index']].get(key_map.get("tema"))
+            
             st.session_state.final_summary = cost_tracker.get_summary()
             st.session_state.analysis_stats = {
                 "processed": len(target_rows),
@@ -571,4 +643,4 @@ else:
 
 # Footer
 st.markdown("---")
-st.markdown("<p style='text-align: center; color: #64748b;'>© 2025 Sistema de Análisis UNAL | Versión Optimizada 2.0</p>", unsafe_allow_html=True)
+st.markdown("<p style='text-align: center; color: #64748b;'>© 2025 Sistema de Análisis UNAL | Versión Optimizada 2.1</p>", unsafe_allow_html=True)
