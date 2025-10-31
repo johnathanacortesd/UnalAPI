@@ -19,7 +19,7 @@ import warnings
 from openai import OpenAI
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
-from thefuzz import fuzz # <<< MEJORA: Importado para la consolidación de temas
+from thefuzz import fuzz # Requerido para la consolidación de temas
 
 warnings.filterwarnings('ignore')
 
@@ -100,7 +100,7 @@ def check_password():
     return False
 
 # ==============================================================================
-# FUNCIONES OPTIMIZADAS CON CACHE
+# FUNCIONES OPTIMIZADAS CON CACHE Y LÓGICA BASE (SIN CAMBIOS)
 # ==============================================================================
 @lru_cache(maxsize=10000)
 def norm_key(text: Any) -> str:
@@ -320,45 +320,57 @@ def agrupar_noticias_similares(rows: List[Dict], key_map: Dict[str, str]) -> Lis
     for i in range(n): grupos_finales[find(i)].append(i)
     return list(grupos_finales.values())
 
-# <<< MEJORA: Nueva función para consolidar temas similares post-análisis IA
-def consolidar_temas_similares(rows: List[Dict], key_map: Dict[str, str], umbral_similitud=90) -> Dict[str, str]:
+# <<< MEJORA CRÍTICA: Lógica de consolidación de temas totalmente reescrita para ser más potente
+def consolidar_temas_similares(rows: List[Dict], key_map: Dict[str, str], umbral_similitud=85) -> Dict[str, str]:
     """
-    Toma todos los temas generados, los ordena alfabéticamente y consolida aquellos
-    que son muy similares, creando un mapa de 'tema_variante' -> 'tema_canonico'.
+    Agrupa temas semánticamente similares usando un enfoque de clustering robusto.
+    Compara todos los temas entre sí para encontrar similitudes, incluso si no son
+    lexicográficamente adyacentes.
     """
     tema_key = key_map.get("tema")
+    temas_unicos = list(set(
+        row.get(tema_key) for row in rows 
+        if row.get(tema_key) and row.get(tema_key) not in ["Duplicada", "Error", "Excepción API"]
+    ))
     
-    # 1. Extraer todos los temas únicos y válidos
-    temas_validos = set()
-    for row in rows:
-        tema = row.get(tema_key)
-        if tema and tema not in ["Duplicada", "Error", "Excepción API"]:
-            temas_validos.add(tema)
-
-    # 2. Ordenar alfabéticamente para agrupar temas similares
-    temas_ordenados = sorted(list(temas_validos))
-
-    if not temas_ordenados:
+    if not temas_unicos:
         return {}
 
-    # 3. Crear mapa de consolidación
-    mapa_consolidacion = {tema: tema for tema in temas_ordenados} # Inicialmente, cada tema se mapea a sí mismo
-    
-    # El primer tema es el ancla inicial para la comparación
-    tema_canonico_actual = temas_ordenados[0]
+    n = len(temas_unicos)
+    parent = list(range(n))
 
-    for i in range(1, len(temas_ordenados)):
-        tema_actual = temas_ordenados[i]
+    def find(i):
+        if parent[i] == i: return i
+        parent[i] = find(parent[i])
+        return parent[i]
+
+    def union(i, j):
+        root_i, root_j = find(i), find(j)
+        if root_i != root_j: parent[root_j] = root_i
+
+    # Comparación O(n^2) entre todos los temas únicos
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Usar token_set_ratio es clave: maneja orden de palabras y diferencias de subconjuntos
+            similitud = fuzz.token_set_ratio(temas_unicos[i], temas_unicos[j])
+            if similitud >= umbral_similitud:
+                union(i, j)
+
+    # Agrupar los índices de temas por su raíz
+    grupos_indices = defaultdict(list)
+    for i in range(n):
+        grupos_indices[find(i)].append(i)
+
+    # Crear el mapa de consolidación final
+    mapa_consolidacion = {}
+    for root_idx, indices in grupos_indices.items():
+        # Para cada grupo, elegir un tema "canónico" (ej. el más corto)
+        grupo_temas = [temas_unicos[i] for i in indices]
+        tema_canonico = min(grupo_temas, key=len)
         
-        # Compara el tema actual con el tema canónico del grupo actual
-        similitud = fuzz.ratio(tema_actual, tema_canonico_actual)
-        
-        if similitud >= umbral_similitud:
-            # Si es similar, se mapea al tema canónico
-            mapa_consolidacion[tema_actual] = tema_canonico_actual
-        else:
-            # Si no es similar, este se convierte en el nuevo tema canónico para el siguiente grupo
-            tema_canonico_actual = tema_actual
+        # Mapear todos los temas del grupo al canónico
+        for tema in grupo_temas:
+            mapa_consolidacion[tema] = tema_canonico
             
     return mapa_consolidacion
 
@@ -370,9 +382,7 @@ class CostTracker:
         self.total_input_tokens, self.total_output_tokens = 0, 0
     def add_cost(self, input_tokens: int, output_tokens: int):
         cost = (input_tokens * self.input_cost_per_token) + (output_tokens * self.output_cost_per_token)
-        self.total_cost += cost
-        self.total_input_tokens += input_tokens
-        self.total_output_tokens += output_tokens
+        self.total_cost += cost; self.total_input_tokens += input_tokens; self.total_output_tokens += output_tokens
     def is_limit_exceeded(self) -> bool: return self.total_cost >= self.limit_usd
     def get_summary(self) -> Dict:
         remaining = max(0, self.limit_usd - self.total_cost)
@@ -381,15 +391,19 @@ class CostTracker:
 def analizar_con_openai_parallel(textos_agrupados: List[Tuple[str, List[int]]], cost_tracker: CostTracker, client: OpenAI, progress_hook, max_workers: int = 3):
     resultados = {}
     tools = [{"type": "function", "function": {"name": "clasificar_noticia_unal", "description": "Clasifica el tono y el tema de una noticia sobre la Universidad Nacional.", "parameters": {"type": "object", "properties": {"tono": {"type": "string", "description": "El tono de la noticia: Positivo, Negativo o Neutro.", "enum": ["Positivo", "Negativo", "Neutro"]}, "tema": {"type": "string", "description": "Tema específico de 4 a 6 palabras que resume el hecho principal. No debe incluir el nombre de la universidad ni ser genérico."}}, "required": ["tono", "tema"]}}}]
+    
+    # <<< MEJORA CRÍTICA: Prompt actualizado con la nueva regla de negocio sobre eventos.
     system_prompt = """Eres un analista de medios hiper-especializado y tu única misión es evaluar el impacto de las noticias sobre la Universidad Nacional de Colombia (UNAL). Debes ser implacable en la aplicación de las siguientes reglas.
 
 **REGLA DE ORO INQUEBRANTABLE:**
 - Si la UNAL **NO es el actor principal** de la noticia, o si su mención es meramente contextual, referencial, o como fuente de opinión, el tono es **SIEMPRE NEUTRO**. No importa si la noticia trata sobre violencia, política o crisis; si no afecta directamente la gestión o reputación de la UNAL, es NEUTRO.
 
 **REGLAS DE TONO (SÓLO si la UNAL es el actor principal):**
-- **NEGATIVO:** Únicamente si la noticia reporta un **fallo directo de la UNAL** o un **evento perjudicial que ocurre bajo su responsabilidad directa**.
-- **POSITIVO:** Únicamente si la noticia reporta un **logro o acción destacada de la UNAL**.
-- **NEUTRO:** Para **todo lo demás**, incluyendo anuncios, menciones contextuales, etc.
+- **NEGATIVO:** Únicamente si la noticia reporta un **fallo directo de la UNAL** o un **evento perjudicial que ocurre bajo su responsabilidad directa** (ej. críticas a la gestión, disturbios en campus, escándalos).
+- **POSITIVO:** Únicamente si la noticia reporta un **logro o acción destacada de la UNAL**. Ejemplos:
+  - Premios, reconocimientos, avances científicos.
+  - **Anuncios de conciertos, actividades, hechos o eventos organizados o alojados por la UNAL.**
+- **NEUTRO:** Para **todo lo demás**, incluyendo menciones puramente informativas que no constituyan un logro o un fallo.
 
 **REGLAS CRÍTICAS PARA EL TEMA:**
 1.  **HECHO PRINCIPAL:** Describe el evento central del grupo de noticias.
@@ -496,7 +510,7 @@ if start_button:
     start_time = time.time()
     try:
         # FASE 1: Preparación de datos
-        status_container.markdown('<div class="info-box">📋 <strong>Fase 1/3:</strong> Preparando y limpiando datos...</div>', unsafe_allow_html=True)
+        status_container.markdown('<div class="info-box">📋 <strong>Fase 1/4:</strong> Preparando y limpiando datos...</div>', unsafe_allow_html=True)
         all_processed_rows, key_map = run_base_logic(load_workbook(dossier_file, data_only=True).active, main_progress_hook)
         all_processed_rows = process_mappings_and_links(all_processed_rows, key_map, region_file, internet_file)
         all_processed_rows = process_link_logic(all_processed_rows, key_map)
@@ -507,10 +521,10 @@ if start_button:
             col1.metric("📰 Total Noticias", f"{total_news:,}")
             col2.metric("🎓 Noticias UNAL", f"{unal_news:,}")
             col3.metric("🔄 Duplicadas", f"{duplicates:,}")
-        progress_bar.progress(0.33, text="✅ Fase 1 completada")
+        progress_bar.progress(0.25, text="✅ Fase 1 completada")
 
         # FASE 2: Análisis con IA
-        status_container.markdown('<div class="info-box">🤖 <strong>Fase 2/3:</strong> Analizando con Inteligencia Artificial...</div>', unsafe_allow_html=True)
+        status_container.markdown('<div class="info-box">🤖 <strong>Fase 2/4:</strong> Analizando con Inteligencia Artificial...</div>', unsafe_allow_html=True)
         cost_tracker = CostTracker(cost_limit_usd, 0.10, 0.40)
         target_rows = [row for row in all_processed_rows if row.get("__is_target_brand") and not row.get("is_duplicate")]
         status_placeholder = st.empty()
@@ -523,20 +537,20 @@ if start_button:
                     row[key_map.get("tema")] = update_map[row['original_index']].get(key_map.get("tema"))
             st.session_state.final_summary = cost_tracker.get_summary()
             st.session_state.analysis_stats = {"processed": len(target_rows), "time": time.time() - start_time}
-        progress_bar.progress(0.66, text="✅ Fase 2 completada")
+        progress_bar.progress(0.50, text="✅ Fase 2 completada")
 
-        # <<< MEJORA: Fase 2.5 - Consolidación de Temas
-        status_container.markdown('<div class="info-box">✨ <strong>Fase 2.5/3:</strong> Consolidando temas similares...</div>', unsafe_allow_html=True)
+        # FASE 3: Consolidación de Temas
+        status_container.markdown('<div class="info-box">✨ <strong>Fase 3/4:</strong> Consolidando temas similares...</div>', unsafe_allow_html=True)
         mapa_consolidacion_temas = consolidar_temas_similares(all_processed_rows, key_map)
         tema_key = key_map.get("tema")
         for row in all_processed_rows:
             tema_original = row.get(tema_key)
             if tema_original and tema_original in mapa_consolidacion_temas:
                 row[tema_key] = mapa_consolidacion_temas[tema_original]
-        progress_bar.progress(0.80, text="✅ Temas consolidados")
+        progress_bar.progress(0.75, text="✅ Temas consolidados")
         
-        # FASE 3: Generación de informe
-        status_container.markdown('<div class="info-box">📄 <strong>Fase 3/3:</strong> Generando informe final...</div>', unsafe_allow_html=True)
+        # FASE 4: Generación de informe
+        status_container.markdown('<div class="info-box">📄 <strong>Fase 4/4:</strong> Generando informe final...</div>', unsafe_allow_html=True)
         final_rows = process_sov_mapping_final(all_processed_rows, key_map, sov_file)
         st.session_state.result_buffer = generate_excel_output(final_rows, key_map)
         progress_bar.progress(1.0, text="✅ ¡Proceso completado!")
@@ -569,4 +583,4 @@ if st.session_state.analysis_done and st.session_state.result_buffer:
 else:
     st.markdown('<div class="info-box">👈 Configure los parámetros en la barra lateral y presione <strong>"Iniciar Análisis"</strong> para comenzar.</div>', unsafe_allow_html=True)
 st.markdown("---")
-st.markdown("<p style='text-align: center; color: #64748b;'>© 2025 Sistema de Análisis UNAL | Versión Optimizada 2.4</p>", unsafe_allow_html=True)
+st.markdown("<p style='text-align: center; color: #64748b;'>© 2025 Sistema de Análisis UNAL | Versión Optimizada 2.5</p>", unsafe_allow_html=True)
