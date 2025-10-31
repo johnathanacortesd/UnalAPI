@@ -1,5 +1,5 @@
 # ==============================================================================
-# ANÁLISIS DE TONO Y TEMA PARA UNIVERSIDAD NACIONAL - APP STREAMLIT
+# ANÁLISIS DE TONO Y TEMA PARA UNIVERSIDAD NACIONAL - APP STREAMLIT (SEGURA)
 # ==============================================================================
 
 import streamlit as st
@@ -30,10 +30,41 @@ st.set_page_config(
 )
 
 # ==============================================================================
+# FUNCIÓN DE AUTENTICACIÓN
+# ==============================================================================
+def check_password():
+    """Devuelve `True` si el usuario ha introducido la contraseña correcta."""
+    if "password_correct" in st.session_state and st.session_state["password_correct"]:
+        return True
+
+    # Muestra el formulario de contraseña
+    with st.form("password_form"):
+        st.title("🔐 Acceso Protegido")
+        st.markdown("Por favor, introduce la contraseña para usar la aplicación.")
+        password = st.text_input("Contraseña", type="password")
+        submitted = st.form_submit_button("Ingresar")
+
+        if submitted:
+            # La contraseña se obtiene de los secrets de Streamlit
+            correct_password = st.secrets.get("APP_PASSWORD")
+            if not correct_password:
+                st.error("Error de configuración: No se ha establecido una contraseña para la aplicación.")
+                return False
+            
+            if password == correct_password:
+                st.session_state["password_correct"] = True
+                st.rerun()  # Vuelve a ejecutar el script para mostrar la app
+            else:
+                st.error("La contraseña es incorrecta.")
+    return False
+
+# ==============================================================================
 # TODAS LAS FUNCIONES DEL SCRIPT ORIGINAL (SIN CAMBIOS EN SU LÓGICA INTERNA)
 # ==============================================================================
-
-# --- FUNCIONES DE UTILIDAD Y PROCESAMIENTO ---
+# ... (Aquí irían todas las funciones de `norm_key` hasta `procesar_por_lotes`)
+# Para mantener la legibilidad, las omito aquí, pero DEBES COPIARLAS del bloque de código anterior.
+# El siguiente bloque de código asume que todas esas funciones están aquí.
+# --- INICIO DE FUNCIONES OMITIDAS (DEBES COPIARLAS DEL CÓDIGO ANTERIOR) ---
 def norm_key(text: Any) -> str:
     if text is None: return ""
     return re.sub(r"[^a-z0-9]+", "", unidecode(str(text).strip().lower()))
@@ -210,14 +241,11 @@ def generate_excel_output(all_processed_rows, key_map):
     _append_rows_to_sheet(sheet1, unal_rows, key_map, include_ai_columns=True)
     sheet2 = out_wb.create_sheet("Todas las Marcas")
     _append_rows_to_sheet(sheet2, all_processed_rows, key_map, include_ai_columns=False)
-    
-    # Guardar en un buffer de memoria en lugar de un archivo físico
     output_buffer = io.BytesIO()
     out_wb.save(output_buffer)
     output_buffer.seek(0)
     return output_buffer
 
-# --- FUNCIONES DE AGRUPAMIENTO E IA (CON CONTROL DE COSTO) ---
 def agrupar_noticias_similares(rows: List[Dict], key_map: Dict[str, str]) -> Dict[str, List[int]]:
     grupos = {}
     titulo_key, resumen_key = key_map.get("titulo", "titulo"), key_map.get("resumen", "resumen")
@@ -290,9 +318,7 @@ def procesar_por_lotes(target_rows: List[Dict], key_map: Dict[str, str], batch_s
             texto_completo = f"{corregir_texto(batch_rows[idx_repr].get(titulo_key, ''))}. {corregir_texto(batch_rows[idx_repr].get(resumen_key, ''))}".strip()[:3000]
             if texto_completo: textos_agrupados.append((texto_completo, indices_locales))
         
-        # Hook para actualizar la barra de progreso interna de la IA
         def progress_hook_ia(current, total, text):
-            # Actualiza el progreso general del lote
             base_progress = (batch_num / num_batches)
             lote_progress = (current / total) * (1 / num_batches) if total > 0 else 0
             progress_bar.progress(base_progress + lote_progress, text=f"Lote {batch_num+1}/{num_batches}: {text}")
@@ -304,40 +330,42 @@ def procesar_por_lotes(target_rows: List[Dict], key_map: Dict[str, str], batch_s
             batch_rows[idx_local][tema_key] = resultado["tema"]
         all_resultados.extend(batch_rows)
     return all_resultados
+# --- FIN DE FUNCIONES OMITIDAS ---
 
 # ==============================================================================
-# INTERFAZ DE LA APLICACIÓN STREAMLIT
+# LÓGICA PRINCIPAL DE LA APLICACIÓN
 # ==============================================================================
+if not check_password():
+    st.stop() # No muestra nada más si la contraseña es incorrecta
+
+# --- La aplicación principal solo se muestra si la contraseña es correcta ---
+
+# Verificación de la API Key (debe estar en los secrets)
+api_key = st.secrets.get("OPENAI_API_KEY")
+if not api_key:
+    st.error("Error de Configuración del Administrador: La API Key de OpenAI no está configurada en los secrets de Streamlit. La aplicación no puede funcionar.")
+    st.stop()
+
+# --- Interfaz de la aplicación ---
 st.title("🎓 Análisis de Tono y Tema para la Universidad Nacional")
 st.markdown("Esta herramienta automatiza el análisis de menciones en medios, aplicando clasificación por IA y control de costos.")
 
-# --- INICIALIZACIÓN DE ESTADO ---
-if 'analysis_done' not in st.session_state:
-    st.session_state.analysis_done = False
-if 'result_buffer' not in st.session_state:
-    st.session_state.result_buffer = None
-if 'final_summary' not in st.session_state:
-    st.session_state.final_summary = ""
+if 'analysis_done' not in st.session_state: st.session_state.analysis_done = False
+if 'result_buffer' not in st.session_state: st.session_state.result_buffer = None
+if 'final_summary' not in st.session_state: st.session_state.final_summary = ""
 
-# --- CONFIGURACIÓN EN LA BARRA LATERAL ---
 with st.sidebar:
-    st.header("1. Configuración")
-    
-    # Intenta obtener la API key desde los secrets de Streamlit, si no, pide al usuario
-    api_key = st.text_input("🔑 OpenAI API Key", type="password", help="Pega tu API Key de OpenAI aquí.", value=st.secrets.get("OPENAI_API_KEY", ""))
-
-    st.header("2. Carga de Archivos")
+    st.header("1. Carga de Archivos")
     dossier_file = st.file_uploader("📂 Dossier Principal (.xlsx)", type="xlsx")
     region_file = st.file_uploader("🌍 Mapeo de Región (.xlsx)", type="xlsx")
     internet_file = st.file_uploader("🌐 Mapeo de Internet (.xlsx)", type="xlsx")
     sov_file = st.file_uploader("📊 Mapeo SOV (.xlsx)", type="xlsx")
     
-    st.header("3. Parámetros de Análisis")
+    st.header("2. Parámetros de Análisis")
     cost_limit_usd = st.number_input("💰 Límite de Costo (USD)", min_value=0.10, max_value=10.0, value=1.00, step=0.10)
     batch_size = st.slider("📦 Tamaño de Lote (Noticias por Tanda)", min_value=100, max_value=1000, value=500, step=50)
 
-# --- LÓGICA PRINCIPAL ---
-if st.sidebar.button("🚀 Iniciar Análisis", type="primary", use_container_width=True, disabled=(not all([api_key, dossier_file, region_file, internet_file, sov_file]))):
+if st.sidebar.button("🚀 Iniciar Análisis", type="primary", use_container_width=True, disabled=(not all([dossier_file, region_file, internet_file, sov_file]))):
     st.session_state.analysis_done = False
     st.session_state.result_buffer = None
 
@@ -345,35 +373,26 @@ if st.sidebar.button("🚀 Iniciar Análisis", type="primary", use_container_wid
     TARGET_BRANDS = ["U. Nacional de Colombia", "Universidad Nacional de Colombia", "Universidad Nacional de Colombia - General"]
     
     status_container = st.container()
-    progress_text = "Iniciando proceso..."
-    progress_bar = st.progress(0, text=progress_text)
+    progress_text, progress_bar = "Iniciando proceso...", st.progress(0, text="Iniciando proceso...")
 
     def main_progress_hook(current, total, text):
-        if total > 0:
-            progress_bar.progress(current / total, text=text)
+        if total > 0: progress_bar.progress(current / total, text=text)
 
     try:
         with st.spinner("Cargando y procesando archivos..."):
-            # FASE 1: PREPARACIÓN DE DATOS
             status_container.info("📋 **Fase 1/3: Preparando y limpiando datos...**")
-            workbook = load_workbook(dossier_file, data_only=True)
-            all_processed_rows, key_map = run_base_logic(workbook.active, main_progress_hook)
+            all_processed_rows, key_map = run_base_logic(load_workbook(dossier_file, data_only=True).active, main_progress_hook)
             all_processed_rows = process_mappings_and_links(all_processed_rows, key_map, region_file, internet_file)
             all_processed_rows = process_link_logic(all_processed_rows, key_map)
-            
-            for row in all_processed_rows:
-                row["__is_target_brand"] = (row.get(key_map.get("menciones")) in TARGET_BRANDS)
-            
-            noticias_unal = sum(1 for row in all_processed_rows if row.get("__is_target_brand"))
-            status_container.write(f"✅ Datos preparados: {len(all_processed_rows)} noticias totales, {noticias_unal} de UNAL.")
+            for row in all_processed_rows: row["__is_target_brand"] = (row.get(key_map.get("menciones")) in TARGET_BRANDS)
+            status_container.write(f"✅ Datos preparados: {len(all_processed_rows)} noticias totales, {sum(1 for r in all_processed_rows if r.get('__is_target_brand'))} de UNAL.")
             progress_bar.progress(0.33, text="Datos limpios.")
 
-        # FASE 2: ANÁLISIS CON IA
         status_container.info("🤖 **Fase 2/3: Analizando con Inteligencia Artificial...**")
         cost_tracker = CostTracker(cost_limit_usd, 0.10, 0.40)
         target_rows = [row for row in all_processed_rows if row.get("__is_target_brand") and not row.get("is_duplicate")]
         
-        status_placeholder = st.empty() # Placeholder para mensajes de lotes
+        status_placeholder = st.empty()
         if target_rows:
             target_rows_procesados = procesar_por_lotes(target_rows, key_map, batch_size, cost_tracker, client, status_placeholder, progress_bar)
             update_map = {row['original_index']: row for row in target_rows_procesados}
@@ -387,20 +406,17 @@ if st.sidebar.button("🚀 Iniciar Análisis", type="primary", use_container_wid
         
         progress_bar.progress(0.66, text="Análisis IA completado.")
 
-        # FASE 3: GENERACIÓN DE INFORME
         status_container.info("📄 **Fase 3/3: Generando informe final...**")
         final_rows = process_sov_mapping_final(all_processed_rows, key_map, sov_file)
         st.session_state.result_buffer = generate_excel_output(final_rows, key_map)
-        
         progress_bar.progress(1.0, text="¡Proceso completado!")
         st.session_state.analysis_done = True
         st.success("🎉 ¡Análisis completado exitosamente!")
 
     except Exception as e:
         st.error(f"❌ Ocurrió un error durante el proceso: {e}")
-        st.exception(e) # Imprime el stack trace completo para debugging
+        st.exception(e)
 
-# --- MOSTRAR RESULTADOS Y BOTÓN DE DESCARGA ---
 if st.session_state.analysis_done and st.session_state.result_buffer:
     st.markdown("---")
     col1, col2 = st.columns(2)
@@ -409,12 +425,6 @@ if st.session_state.analysis_done and st.session_state.result_buffer:
         st.markdown(st.session_state.final_summary)
     with col2:
         st.subheader("📥 Descargar Informe")
-        st.download_button(
-            label="Descargar Archivo Excel",
-            data=st.session_state.result_buffer,
-            file_name=f"Informe_Analisis_UNAL_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
+        st.download_button(label="Descargar Archivo Excel", data=st.session_state.result_buffer, file_name=f"Informe_Analisis_UNAL_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 else:
     st.info("Configure los parámetros en la barra lateral y haga clic en 'Iniciar Análisis' para comenzar.")
