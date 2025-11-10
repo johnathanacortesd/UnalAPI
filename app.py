@@ -1,5 +1,5 @@
 # ==============================================================================
-# ANÁLISIS DE TONO Y TEMA PARA UNIVERSIDAD NACIONAL - APP STREAMLIT (OPTIMIZADO V2.5)
+# ANÁLISIS DE TONO Y TEMA PARA UNIVERSIDAD NACIONAL - APP STREAMLIT (OPTIMIZADO)
 # ==============================================================================
 
 import streamlit as st
@@ -20,45 +20,8 @@ from openai import OpenAI
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from thefuzz import fuzz # Requerido para la consolidación de temas
-import logging
-from datetime import datetime
 
 warnings.filterwarnings('ignore')
-
-# ==============================================================================
-# CONFIGURACIÓN DE LOGGING Y CONSTANTES (MEJORA 7)
-# ==============================================================================
-# Configurar logging para trazabilidad y debugging
-log_filename = f"analisis_unal_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_filename),
-        logging.StreamHandler(st.empty()) # Para mostrar logs en Streamlit si se desea
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# MEJORA 1: Lógica de Clasificación de Voceros
-VOCEROS_UNAL = {
-    "leopoldo munera": "Rector Leopoldo Múnera Ruiz",
-    "leopoldo múnera": "Rector Leopoldo Múnera Ruiz",
-    "rector munera": "Rector Leopoldo Múnera Ruiz",
-    "rector múnera": "Rector Leopoldo Múnera Ruiz",
-    # Agregar más voceros según necesidad. Clave en minúsculas y sin tildes.
-}
-
-def detectar_voceros(texto: str) -> List[str]:
-    """Detecta presencia de voceros oficiales de la UNAL en el texto"""
-    if not isinstance(texto, str):
-        return []
-    texto_norm = unidecode(texto.lower())
-    voceros_encontrados = set()
-    for patron, nombre_oficial in VOCEROS_UNAL.items():
-        if patron in texto_norm:
-            voceros_encontrados.add(nombre_oficial)
-    return list(voceros_encontrados)
 
 # ==============================================================================
 # CONFIGURACIÓN DE LA PÁGINA DE STREAMLIT
@@ -357,23 +320,13 @@ def agrupar_noticias_similares(rows: List[Dict], key_map: Dict[str, str]) -> Lis
     for i in range(n): grupos_finales[find(i)].append(i)
     return list(grupos_finales.values())
 
-
-# MEJORA 4: Consolidación de Temas mejorada con contexto semántico
+# <<< MEJORA CRÍTICA: Lógica de consolidación de temas totalmente reescrita para ser más potente
 def consolidar_temas_similares(rows: List[Dict], key_map: Dict[str, str], umbral_similitud=85) -> Dict[str, str]:
     """
-    Agrupa temas semántica y léxicamente similares usando un enfoque de dos pasadas:
-    1. Clustering léxico con thefuzz para agrupar temas con variaciones menores.
-    2. Mapeo semántico basado en sinónimos de contexto para agrupar temas conceptualmente iguales.
+    Agrupa temas semánticamente similares usando un enfoque de clustering robusto.
+    Compara todos los temas entre sí para encontrar similitudes, incluso si no son
+    lexicográficamente adyacentes.
     """
-    SINONIMOS_CONTEXTO = {
-        ("protestas", "manifestaciones", "movilizaciones", "disturbios"): "Movilizaciones y protestas estudiantiles",
-        ("investigacion", "estudio", "investigaciones", "descubrimiento"): "Investigación científica y académica",
-        ("admisiones", "inscripciones", "registro", "aspirantes"): "Proceso de admisiones universitarias",
-        ("presupuesto", "recursos", "financiacion", "crisis financiera"): "Recursos y presupuesto institucional",
-        ("rector", "eleccion", "rectoria", "munera"): "Elección y gestión de rectoría",
-        ("concierto", "evento", "cultural", "actividad"): "Eventos y actividades culturales",
-    }
-    
     tema_key = key_map.get("tema")
     temas_unicos = list(set(
         row.get(tema_key) for row in rows 
@@ -383,7 +336,6 @@ def consolidar_temas_similares(rows: List[Dict], key_map: Dict[str, str], umbral
     if not temas_unicos:
         return {}
 
-    # --- PASO 1: Consolidación Léxica (Fuzzy Matching) ---
     n = len(temas_unicos)
     parent = list(range(n))
 
@@ -396,37 +348,32 @@ def consolidar_temas_similares(rows: List[Dict], key_map: Dict[str, str], umbral
         root_i, root_j = find(i), find(j)
         if root_i != root_j: parent[root_j] = root_i
 
+    # Comparación O(n^2) entre todos los temas únicos
     for i in range(n):
         for j in range(i + 1, n):
-            if fuzz.token_set_ratio(temas_unicos[i], temas_unicos[j]) >= umbral_similitud:
+            # Usar token_set_ratio es clave: maneja orden de palabras y diferencias de subconjuntos
+            similitud = fuzz.token_set_ratio(temas_unicos[i], temas_unicos[j])
+            if similitud >= umbral_similitud:
                 union(i, j)
 
+    # Agrupar los índices de temas por su raíz
     grupos_indices = defaultdict(list)
     for i in range(n):
         grupos_indices[find(i)].append(i)
 
-    mapa_consolidacion_lexica = {}
+    # Crear el mapa de consolidación final
+    mapa_consolidacion = {}
     for root_idx, indices in grupos_indices.items():
+        # Para cada grupo, elegir un tema "canónico" (ej. el más corto)
         grupo_temas = [temas_unicos[i] for i in indices]
         tema_canonico = min(grupo_temas, key=len)
+        
+        # Mapear todos los temas del grupo al canónico
         for tema in grupo_temas:
-            mapa_consolidacion_lexica[tema] = tema_canonico
+            mapa_consolidacion[tema] = tema_canonico
             
-    # --- PASO 2: Consolidación Semántica (Basada en sinónimos) ---
-    mapa_consolidacion_final = deepcopy(mapa_consolidacion_lexica)
-    temas_canonicos = set(mapa_consolidacion_lexica.values())
+    return mapa_consolidacion
 
-    for tema_canonico in temas_canonicos:
-        tema_norm = unidecode(tema_canonico.lower())
-        for grupo_sinonimos, tema_semantico in SINONIMOS_CONTEXTO.items():
-            if any(sinonimo in tema_norm for sinonimo in grupo_sinonimos):
-                # Si un tema canónico coincide, mapeamos todos los temas originales que apuntaban a él
-                for original, canonico in mapa_consolidacion_lexica.items():
-                    if canonico == tema_canonico:
-                        mapa_consolidacion_final[original] = tema_semantico
-                break # Pasamos al siguiente tema canónico
-    
-    return mapa_consolidacion_final
 
 class CostTracker:
     def __init__(self, limit_usd: float, input_cost_per_1m: float, output_cost_per_1m: float):
@@ -445,36 +392,25 @@ def analizar_con_openai_parallel(textos_agrupados: List[Tuple[str, List[int]]], 
     resultados = {}
     tools = [{"type": "function", "function": {"name": "clasificar_noticia_unal", "description": "Clasifica el tono y el tema de una noticia sobre la Universidad Nacional.", "parameters": {"type": "object", "properties": {"tono": {"type": "string", "description": "El tono de la noticia: Positivo, Negativo o Neutro.", "enum": ["Positivo", "Negativo", "Neutro"]}, "tema": {"type": "string", "description": "Tema específico de 4 a 6 palabras que resume el hecho principal. No debe incluir el nombre de la universidad ni ser genérico."}}, "required": ["tono", "tema"]}}}]
     
-    # MEJORA 2: Prompt de IA Mejorado con Reglas de Voceros
-    system_prompt = """Eres un analista de medios hiper-especializado en evaluar el impacto de noticias sobre la Universidad Nacional de Colombia (UNAL).
+    # <<< MEJORA CRÍTICA: Prompt actualizado con la nueva regla de negocio sobre eventos.
+    system_prompt = """Eres un analista de medios hiper-especializado y tu única misión es evaluar el impacto de las noticias sobre la Universidad Nacional de Colombia (UNAL). Debes ser implacable en la aplicación de las siguientes reglas.
 
-**REGLAS INQUEBRANTABLES DE TONO:**
+**REGLA DE ORO INQUEBRANTABLE:**
+- Si la UNAL **NO es el actor principal** de la noticia, o si su mención es meramente contextual, referencial, o como fuente de opinión, el tono es **SIEMPRE NEUTRO**. No importa si la noticia trata sobre violencia, política o crisis; si no afecta directamente la gestión o reputación de la UNAL, es NEUTRO.
 
-1.  **POSITIVO AUTOMÁTICO si:**
-    *   Aparecen voceros oficiales de la UNAL (Rector Leopoldo Múnera Ruiz, docentes identificados como de la UNAL, directivos) opinando, explicando o representando a la universidad.
-    *   La UNAL anuncia logros, premios, reconocimientos o avances científicos.
-    *   Se organizan eventos, conciertos o actividades por la UNAL.
-    *   Investigadores de la UNAL son citados como expertos.
+**REGLAS DE TONO (SÓLO si la UNAL es el actor principal):**
+- **NEGATIVO:** Únicamente si la noticia reporta un **fallo directo de la UNAL** o un **evento perjudicial que ocurre bajo su responsabilidad directa** (ej. críticas a la gestión, disturbios en campus, escándalos).
+- **POSITIVO:** Únicamente si la noticia reporta un **logro o acción destacada de la UNAL**. Ejemplos:
+  - Premios, reconocimientos, avances científicos.
+  - **Anuncios de conciertos, actividades, hechos o eventos organizados o alojados por la UNAL.**
+- **NEUTRO:** Para **todo lo demás**, incluyendo menciones puramente informativas que no constituyan un logro o un fallo.
 
-2.  **NEGATIVO solo si:**
-    *   Hay críticas directas a la gestión institucional de la UNAL.
-    *   Ocurren eventos perjudiciales bajo responsabilidad directa de la UNAL (disturbios en campus, escándalos administrativos).
-    *   Se reportan fallos operativos o académicos graves.
+**REGLAS CRÍTICAS PARA EL TEMA:**
+1.  **HECHO PRINCIPAL:** Describe el evento central del grupo de noticias.
+2.  **SIN MARCA:** **NO** incluyas "Universidad Nacional", "UNAL", etc.
+3.  **LONGITUD ESTRICTA:** Debe tener **entre 4 y 6 palabras.**
 
-3.  **NEUTRO para:**
-    *   Menciones puramente contextuales o referencias históricas.
-    *   Información estadística sin valoración.
-    *   Noticias donde la UNAL no es actor principal.
-
-**DETECCIÓN DE VOCEROS:**
-Si el texto menciona al Rector Leopoldo Múnera Ruiz, docentes de la UNAL, o cualquier vocero oficial dando declaraciones, el tono es **POSITIVO**, ya que representa visibilidad institucional favorable.
-
-**REGLAS PARA EL TEMA:**
-1.  Describe el hecho principal en 4-6 palabras.
-2.  **NO** incluyas "Universidad Nacional" o "UNAL".
-3.  Prioriza el evento específico sobre generalidades.
-
-Tu precisión es vital. Ante la duda entre NEUTRO y POSITIVO por presencia de voceros, elige **POSITIVO**."""
+Tu precisión es vital. Evalúa el impacto, no el sentimiento general."""
     
     def procesar_grupo(i, texto_representativo, indices_grupo):
         if cost_tracker.is_limit_exceeded(): return None
@@ -484,7 +420,6 @@ Tu precisión es vital. Ante la duda entre NEUTRO y POSITIVO por presencia de vo
             resultado_json = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
             return (indices_grupo, resultado_json["tono"], resultado_json["tema"])
         except Exception as e:
-            logger.error(f"Error en API para grupo {i + 1}: {e}. Texto: {texto_representativo[:200]}...")
             st.warning(f"Advertencia en API para grupo {i + 1}: {e}. Asignando error.")
             return (indices_grupo, "Error", "Excepción API")
     
@@ -501,7 +436,6 @@ Tu precisión es vital. Ante la duda entre NEUTRO y POSITIVO por presencia de vo
             progress_hook(completed, total_grupos, f"Analizando grupos con IA ({completed}/{total_grupos})...")
     return resultados
 
-# MEJORA 3: Enriquecer Análisis con Contexto de Voceros
 def procesar_por_lotes(target_rows: List[Dict], key_map: Dict[str, str], batch_size: int, cost_tracker: CostTracker, client: OpenAI, status_placeholder, progress_bar):
     total_rows = len(target_rows)
     num_batches = (total_rows + batch_size - 1) // batch_size
@@ -517,28 +451,12 @@ def procesar_por_lotes(target_rows: List[Dict], key_map: Dict[str, str], batch_s
         for indices_locales in grupos_fusionados:
             if not indices_locales: continue
             idx_repr = indices_locales[0]
-            titulo = corregir_texto(batch_rows[idx_repr].get(titulo_key, ''))
-            resumen = corregir_texto(batch_rows[idx_repr].get(resumen_key, ''))
-            
-            # NUEVO: Detectar voceros y agregar contexto al prompt
-            texto_completo_analisis = f"{titulo}. {resumen}"
-            voceros = detectar_voceros(texto_completo_analisis)
-            
-            contexto_voceros = ""
-            if voceros:
-                contexto_voceros = f"\n\n**ALERTA DE VOCEROS DETECTADOS:** {', '.join(voceros)}"
-                logger.info(f"Voceros detectados en noticia (original index: {batch_rows[idx_repr]['original_index']}): {voceros}")
-            
-            texto_completo = f"TÍTULO: {titulo}. RESUMEN: {resumen}{contexto_voceros}".strip()[:3500]
-            
-            if texto_completo and texto_completo.replace("TÍTULO: . RESUMEN: ", "").strip():
-                textos_agrupados.append((texto_completo, indices_locales))
-
+            texto_completo = f"TÍTULO: {corregir_texto(batch_rows[idx_repr].get(titulo_key, ''))}. RESUMEN: {corregir_texto(batch_rows[idx_repr].get(resumen_key, ''))}".strip()[:3500]
+            if texto_completo and texto_completo != "TÍTULO: . RESUMEN: ": textos_agrupados.append((texto_completo, indices_locales))
         def progress_hook_ia(current, total, text):
             base_progress = (batch_num / num_batches)
             lote_progress = (current / total) * (1 / num_batches) if total > 0 else 0
             progress_bar.progress(0.33 + (0.33 * (base_progress + lote_progress)), text=f"🤖 Lote {batch_num+1}/{num_batches}: {text}")
-        
         resultados_batch = analizar_con_openai_parallel(textos_agrupados, cost_tracker, client, progress_hook_ia, max_workers=3)
         for idx_local, resultado in resultados_batch.items():
             original_row_index_in_batch = start_idx + idx_local
@@ -547,35 +465,6 @@ def procesar_por_lotes(target_rows: List[Dict], key_map: Dict[str, str], batch_s
                 target_rows[original_row_index_in_batch][tema_key] = resultado["tema"]
     return target_rows
 
-# MEJORA 5: Función de Validación de Calidad Post-Análisis
-def validar_clasificaciones(rows: List[Dict], key_map: Dict[str, str]) -> Dict[str, int]:
-    """Valida consistencia de clasificaciones y genera alertas"""
-    tono_key, tema_key = key_map.get("tonoai"), key_map.get("tema")
-    titulo_key, resumen_key = key_map.get("titulo"), key_map.get("resumen")
-    
-    alertas = {
-        "voceros_sin_positivo": 0,
-        "temas_muy_genericos": 0
-    }
-    
-    for row in rows:
-        if not row.get("__is_target_brand") or row.get("is_duplicate"):
-            continue
-            
-        texto = f"{row.get(titulo_key, '')} {row.get(resumen_key, '')}"
-        tono = row.get(tono_key, "")
-        tema = row.get(tema_key, "")
-        
-        # Validar: Si hay voceros y no es Positivo
-        if detectar_voceros(texto) and tono != "Positivo":
-            alertas["voceros_sin_positivo"] += 1
-            logger.warning(f"Inconsistencia: Vocero detectado pero tono='{tono}' en noticia ID {row.get(key_map.get('idnoticia'))}")
-            
-        # Validar: Temas muy cortos (menos de 3 palabras)
-        if tema and tema not in ["Duplicada", "Error", "Excepción API"] and len(tema.split()) < 3:
-            alertas["temas_muy_genericos"] += 1
-    
-    return alertas
 # ==============================================================================
 # LÓGICA PRINCIPAL DE LA APLICACIÓN
 # ==============================================================================
@@ -592,10 +481,6 @@ if 'analysis_done' not in st.session_state: st.session_state.analysis_done = Fal
 if 'result_buffer' not in st.session_state: st.session_state.result_buffer = None
 if 'final_summary' not in st.session_state: st.session_state.final_summary = {}
 if 'analysis_stats' not in st.session_state: st.session_state.analysis_stats = {}
-if 'final_rows' not in st.session_state: st.session_state.final_rows = []
-if 'final_key_map' not in st.session_state: st.session_state.final_key_map = {}
-
-
 with st.sidebar:
     st.markdown("### 📂 Carga de Archivos")
     dossier_file = st.file_uploader("Dossier Principal", type="xlsx", help="Archivo principal con las noticias")
@@ -611,7 +496,6 @@ with st.sidebar:
     all_files_ready = all([dossier_file, region_file, internet_file, sov_file])
     if not all_files_ready: st.warning("⚠️ Cargue todos los archivos para continuar")
     start_button = st.button("🚀 Iniciar Análisis", type="primary", use_container_width=True, disabled=(not all_files_ready))
-
 if start_button:
     st.session_state.analysis_done = False
     st.session_state.result_buffer = None
@@ -621,18 +505,12 @@ if start_button:
     progress_bar = st.progress(0, text="🚀 Iniciando proceso...")
     status_container = st.empty()
     metrics_container = st.container()
-    
-    logger.info("================== NUEVO ANÁLISIS INICIADO ==================")
-    logger.info(f"Límite de costo: ${cost_limit_usd}, Tamaño de lote: {batch_size}")
-
     def main_progress_hook(current, total, text):
-        if total > 0: progress_bar.progress(min((current / total) * 0.20, 0.19), text=text)
-    
+        if total > 0: progress_bar.progress(min((current / total) * 0.33, 0.32), text=text)
     start_time = time.time()
     try:
         # FASE 1: Preparación de datos
-        status_container.markdown('<div class="info-box">📋 <strong>Fase 1/5:</strong> Preparando y limpiando datos...</div>', unsafe_allow_html=True)
-        logger.info("Fase 1: Preparando datos...")
+        status_container.markdown('<div class="info-box">📋 <strong>Fase 1/4:</strong> Preparando y limpiando datos...</div>', unsafe_allow_html=True)
         all_processed_rows, key_map = run_base_logic(load_workbook(dossier_file, data_only=True).active, main_progress_hook)
         all_processed_rows = process_mappings_and_links(all_processed_rows, key_map, region_file, internet_file)
         all_processed_rows = process_link_logic(all_processed_rows, key_map)
@@ -643,12 +521,11 @@ if start_button:
             col1.metric("📰 Total Noticias", f"{total_news:,}")
             col2.metric("🎓 Noticias UNAL", f"{unal_news:,}")
             col3.metric("🔄 Duplicadas", f"{duplicates:,}")
-        progress_bar.progress(0.20, text="✅ Fase 1 completada")
+        progress_bar.progress(0.25, text="✅ Fase 1 completada")
 
         # FASE 2: Análisis con IA
-        status_container.markdown('<div class="info-box">🤖 <strong>Fase 2/5:</strong> Analizando con Inteligencia Artificial...</div>', unsafe_allow_html=True)
-        logger.info("Fase 2: Analizando con IA...")
-        cost_tracker = CostTracker(cost_limit_usd, 0.10, 0.40) # gpt-4.1-nano
+        status_container.markdown('<div class="info-box">🤖 <strong>Fase 2/4:</strong> Analizando con Inteligencia Artificial...</div>', unsafe_allow_html=True)
+        cost_tracker = CostTracker(cost_limit_usd, 0.10, 0.40)
         target_rows = [row for row in all_processed_rows if row.get("__is_target_brand") and not row.get("is_duplicate")]
         status_placeholder = st.empty()
         if target_rows:
@@ -659,110 +536,51 @@ if start_button:
                     row[key_map.get("tonoai")] = update_map[row['original_index']].get(key_map.get("tonoai"))
                     row[key_map.get("tema")] = update_map[row['original_index']].get(key_map.get("tema"))
             st.session_state.final_summary = cost_tracker.get_summary()
-            st.session_state.analysis_stats = {"processed": len(target_rows), "time": 0}
-            logger.info(f"Análisis IA completado. Costo: ${cost_tracker.total_cost:.4f}, Noticias procesadas: {len(target_rows)}")
+            st.session_state.analysis_stats = {"processed": len(target_rows), "time": time.time() - start_time}
         progress_bar.progress(0.50, text="✅ Fase 2 completada")
 
         # FASE 3: Consolidación de Temas
-        status_container.markdown('<div class="info-box">✨ <strong>Fase 3/5:</strong> Consolidando temas similares...</div>', unsafe_allow_html=True)
-        logger.info("Fase 3: Consolidando temas...")
+        status_container.markdown('<div class="info-box">✨ <strong>Fase 3/4:</strong> Consolidando temas similares...</div>', unsafe_allow_html=True)
         mapa_consolidacion_temas = consolidar_temas_similares(all_processed_rows, key_map)
         tema_key = key_map.get("tema")
         for row in all_processed_rows:
             tema_original = row.get(tema_key)
             if tema_original and tema_original in mapa_consolidacion_temas:
                 row[tema_key] = mapa_consolidacion_temas[tema_original]
-        progress_bar.progress(0.70, text="✅ Temas consolidados")
+        progress_bar.progress(0.75, text="✅ Temas consolidados")
         
-        # MEJORA 5: FASE 3.5: Validación de Calidad
-        status_container.markdown('<div class="info-box">🔍 <strong>Fase 4/5:</strong> Validando calidad de clasificaciones...</div>', unsafe_allow_html=True)
-        logger.info("Fase 3.5: Validando calidad...")
-        alertas = validar_clasificaciones(all_processed_rows, key_map)
-        if alertas["voceros_sin_positivo"] > 0:
-            st.warning(f"⚠️ **Alerta de Calidad:** Se detectaron {alertas['voceros_sin_positivo']} noticias con voceros que no fueron clasificadas como 'Positivas'. Se recomienda revisar el informe.")
-        if alertas["temas_muy_genericos"] > 0:
-            st.warning(f"⚠️ **Alerta de Calidad:** Se detectaron {alertas['temas_muy_genericos']} temas muy genéricos (menos de 3 palabras).")
-        progress_bar.progress(0.85, text="✅ Validación completada")
-
         # FASE 4: Generación de informe
-        status_container.markdown('<div class="info-box">📄 <strong>Fase 5/5:</strong> Generando informe final...</div>', unsafe_allow_html=True)
-        logger.info("Fase 4: Generando informe...")
+        status_container.markdown('<div class="info-box">📄 <strong>Fase 4/4:</strong> Generando informe final...</div>', unsafe_allow_html=True)
         final_rows = process_sov_mapping_final(all_processed_rows, key_map, sov_file)
-        
-        # Guardar resultados en el estado de la sesión
-        st.session_state.final_rows = final_rows
-        st.session_state.final_key_map = key_map
-        st.session_state.analysis_stats["time"] = time.time() - start_time
         st.session_state.result_buffer = generate_excel_output(final_rows, key_map)
-        
         progress_bar.progress(1.0, text="✅ ¡Proceso completado!")
         st.session_state.analysis_done = True
         status_container.markdown('<div class="success-box">🎉 <strong>¡Análisis completado exitosamente!</strong></div>', unsafe_allow_html=True)
-        logger.info(f"Análisis finalizado en {st.session_state.analysis_stats['time']:.2f} segundos.")
-        
     except Exception as e:
-        logger.error(f"Error fatal durante el proceso: {e}", exc_info=True)
         st.error(f"❌ Error durante el proceso: {e}")
         st.exception(e)
 
 # Mostrar resultados
-if st.session_state.analysis_done:
+if st.session_state.analysis_done and st.session_state.result_buffer:
     st.markdown("---")
-    
-    # MEJORA 6: Dashboard de Análisis Mejorado
-    st.markdown("### 📊 Dashboard de Análisis")
-
-    final_rows = st.session_state.final_rows
-    key_map = st.session_state.final_key_map
-    stats = st.session_state.analysis_stats
-    summary = st.session_state.final_summary
-    
-    processed_news = stats.get('processed', 0)
-    processing_time = stats.get('time', 0)
-
-    tonos_dist = defaultdict(int)
-    temas_top = defaultdict(int)
-    for row in final_rows:
-        if row.get("__is_target_brand") and not row.get("is_duplicate"):
-            tonos_dist[row.get(key_map.get("tonoai"), "Sin clasificar")] += 1
-            if row.get(key_map.get("tema")) not in ["Duplicada", "Error", "Excepción API", "Sin clasificar"]:
-                temas_top[row.get(key_map.get("tema"), "Sin tema")] += 1
-
-    dash_col1, dash_col2, dash_col3 = st.columns(3)
-    with dash_col1:
-        st.markdown("#### ⚖️ Distribución de Tonos")
-        st.metric("💚 Positivas", f"{tonos_dist.get('Positivo', 0):,}")
-        st.metric("💛 Neutras", f"{tonos_dist.get('Neutro', 0):,}")
-        st.metric("💔 Negativas", f"{tonos_dist.get('Negativo', 0):,}")
-        st.metric("❓ Errores/Sin clasificar", f"{tonos_dist.get('Error', 0) + tonos_dist.get('Sin clasificar', 0):,}")
-    
-    with dash_col2:
-        st.markdown("#### 🎯 Top 5 Temas")
-        top_temas_df = pd.DataFrame(sorted(temas_top.items(), key=lambda x: x[1], reverse=True)[:5], columns=['Tema', 'Frecuencia'])
-        st.dataframe(top_temas_df, use_container_width=True, hide_index=True)
-
-    with dash_col3:
-        st.markdown("#### ⚙️ Métricas de Proceso")
-        total_analizadas = sum(v for k, v in tonos_dist.items() if k not in ['Sin clasificar'])
-        efectividad = (total_analizadas / processed_news * 100) if processed_news > 0 else 0
-        st.metric("📈 Tasa de Clasificación", f"{efectividad:.1f}%", help="Porcentaje de noticias de la UNAL que fueron clasificadas por la IA.")
-        st.metric("⚡ Velocidad", f"{processed_news/processing_time:.1f} noticias/s" if processing_time > 0 else "N/A")
-        st.metric("💵 Costo Total", f"${summary.get('total_cost', 0):.4f}")
-        st.metric("⏱️ Tiempo Total", f"{processing_time:.1f}s")
-
-    st.markdown("---")
-    st.markdown("### 📥 Descargar Informe Completo")
-    st.download_button(
-        label="⬇️ Descargar Excel", 
-        data=st.session_state.result_buffer, 
-        file_name=f"Informe_UNAL_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx", 
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 
-        use_container_width=True
-    )
-    st.markdown("""<div class="success-box" style="margin-top: 20px;"><strong>✅ Archivo Generado</strong><br>El informe incluye:<br>• Hoja 1: UNAL con IA<br>• Hoja 2: Todas las Marcas</div>""", unsafe_allow_html=True)
-    
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        st.markdown("### 📊 Resumen del Análisis")
+        summary, stats = st.session_state.get('final_summary', {}), st.session_state.get('analysis_stats', {})
+        total_cost, limit = summary.get('total_cost', 0), summary.get('limit', 0)
+        remaining, input_tokens, output_tokens = max(0, limit - total_cost), summary.get('input_tokens', 0), summary.get('output_tokens', 0)
+        total_tokens, processing_time, processed_news = input_tokens + output_tokens, stats.get('time', 0), stats.get('processed', 0)
+        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+        m_col1.metric("💵 Costo Total", f"${total_cost:.4f}")
+        m_col2.metric("💰 Restante", f"${remaining:.4f}")
+        m_col3.metric("🔤 Tokens", f"{total_tokens:,}")
+        m_col4.metric("⏱️ Tiempo", f"{processing_time:.1f}s")
+        st.markdown(f"""<div class="metric-card"><h4>📈 Detalles de Procesamiento</h4><ul><li><strong>Noticias Analizadas:</strong> {processed_news:,}</li><li><strong>Tokens de Entrada:</strong> {input_tokens:,}</li><li><strong>Tokens de Salida:</strong> {output_tokens:,}</li><li><strong>Límite Establecido:</strong> ${limit:.2f}</li></ul></div>""", unsafe_allow_html=True)
+    with col2:
+        st.markdown("### 📥 Descargar Informe")
+        st.download_button(label="⬇️ Descargar Excel", data=st.session_state.result_buffer, file_name=f"Informe_UNAL_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+        st.markdown("""<div class="success-box" style="margin-top: 20px;"><strong>✅ Archivo Generado</strong><br>El informe incluye:<br>• Hoja 1: UNAL con IA<br>• Hoja 2: Todas las Marcas</div>""", unsafe_allow_html=True)
 else:
     st.markdown('<div class="info-box">👈 Configure los parámetros en la barra lateral y presione <strong>"Iniciar Análisis"</strong> para comenzar.</div>', unsafe_allow_html=True)
-
 st.markdown("---")
 st.markdown("<p style='text-align: center; color: #64748b;'>© 2025 Sistema de Análisis UNAL | Versión Optimizada 2.5</p>", unsafe_allow_html=True)
