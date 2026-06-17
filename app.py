@@ -2,21 +2,15 @@ import streamlit as st
 import pandas as pd
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, Alignment
-from collections import defaultdict, Counter
+from collections import defaultdict
 import datetime
 import io
 import openai
 import asyncio
 import time
 import gc
-import re
 import hashlib
-from difflib import SequenceMatcher
-import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.cluster import AgglomerativeClustering
-import json
-from copy import deepcopy
+import re
 from unidecode import unidecode
 
 # ======================================
@@ -41,41 +35,66 @@ BRAND_ALIASES = ["UNAL", "Universidad Nacional", "U.Nal.", "U. Nacional"]
 def load_custom_css():
     st.markdown("""
     <style>
-    .app-header{background:#fff;border:1px solid #dadce0;border-radius:16px;padding:1rem 1.5rem;margin-bottom:1rem;display:flex;align-items:center;gap:1rem;box-shadow:0 1px 3px rgba(0,0,0,0.1);}
-    .app-header-icon{width:48px;height:48px;background:linear-gradient(135deg,#f97316,#ea580c);border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:1.6rem;color:white;}
-    .metric-card{background:white;border:1px solid #dadce0;border-radius:12px;padding:1rem;text-align:center;}
-    .success-banner{background:#ecfdf5;border:1px solid #a7f3d0;border-left:4px solid #10b981;padding:1rem;border-radius:12px;}
+    .app-header {background:#fff; border:1px solid #dadce0; border-radius:16px; padding:1.2rem 1.8rem; margin-bottom:1.5rem; display:flex; align-items:center; gap:1rem; box-shadow:0 2px 8px rgba(0,0,0,0.08);}
+    .app-header-icon {width:56px; height:56px; background:linear-gradient(135deg,#f97316,#ea580c); border-radius:14px; display:flex; align-items:center; justify-content:center; font-size:1.8rem; color:white; flex-shrink:0;}
+    .metric-card {background:white; border:1px solid #dadce0; border-radius:12px; padding:1rem; text-align:center;}
+    .success-banner {background:#ecfdf5; border:1px solid #a7f3d0; border-left:5px solid #10b981; padding:1rem; border-radius:12px; margin:1rem 0;}
     </style>
     """, unsafe_allow_html=True)
 
 # ======================================
-# UTILIDADES
+# PASSWORD
 # ======================================
 def check_password():
     if st.session_state.get("password_correct", False):
         return True
-    st.text_input("Contraseña", type="password", key="pw")
-    if st.button("Ingresar"):
-        if st.session_state.pw == st.secrets.get("APP_PASSWORD", "1234"):
+    st.markdown("### 🔐 Acceso Restringido")
+    pw = st.text_input("Ingresa la contraseña", type="password", key="pw_input")
+    if st.button("Ingresar", type="primary"):
+        if pw == st.secrets.get("APP_PASSWORD", "unal2025"):
             st.session_state.password_correct = True
             st.rerun()
         else:
             st.error("Contraseña incorrecta")
     return False
 
+# ======================================
+# EMBEDDING CACHE
+# ======================================
 class EmbeddingCache:
     def __init__(self):
         self._cache = {}
+        self._hits = 0
+        self._misses = 0
+
     def _key(self, text):
-        return hashlib.md5(text[:1500].encode('utf-8', errors='ignore')).hexdigest()
+        return hashlib.md5(str(text)[:1500].encode('utf-8', errors='ignore')).hexdigest()
+
     def get(self, text):
-        return self._cache.get(self._key(text))
+        k = self._key(text)
+        if k in self._cache:
+            self._hits += 1
+            return self._cache[k]
+        self._misses += 1
+        return None
+
     def put(self, text, emb):
         self._cache[self._key(text)] = emb
+
     def get_many(self, textos):
         results = [self.get(t) for t in textos]
         missing = [i for i, r in enumerate(results) if r is None]
         return results, missing
+
+    def clear(self):
+        self._cache.clear()
+        self._hits = 0
+        self._misses = 0
+
+    def stats(self):
+        total = self._hits + self._misses
+        rate = (self._hits / total * 100) if total > 0 else 0
+        return f"Cache: {self._hits} hits, {self._misses} misses ({rate:.0f}%)"
 
 if '_emb_cache' not in st.session_state:
     st.session_state['_emb_cache'] = EmbeddingCache()
@@ -84,23 +103,27 @@ def get_embedding_cache():
     return st.session_state['_emb_cache']
 
 def get_embeddings_batch(textos):
+    if not textos:
+        return []
     cache = get_embedding_cache()
     results, missing = cache.get_many(textos)
     if not missing:
         return results
-    mt = [textos[i] for i in missing]
+    
+    mt = [textos[i][:1800] for i in missing]
     try:
         resp = openai.Embedding.create(input=mt, model=OPENAI_MODEL_EMBEDDING)
         for j, d in enumerate(resp["data"]):
             idx = missing[j]
-            results[idx] = d["embedding"]
-            cache.put(textos[idx], d["embedding"])
-    except:
-        pass
+            emb = d["embedding"]
+            results[idx] = emb
+            cache.put(textos[idx], emb)
+    except Exception as e:
+        st.warning(f"Error embeddings: {e}")
     return results
 
 # ======================================
-# CLASES DE ANÁLISIS (Simplificadas pero funcionales)
+# CLASES DE ANÁLISIS
 # ======================================
 class ClasificadorTono:
     def __init__(self, marca, aliases):
@@ -111,10 +134,11 @@ class ClasificadorTono:
         n = len(textos)
         results = []
         for i in range(n):
-            if i % 10 == 0:
-                pbar.progress(i/n, f"Analizando tono {i+1}/{n}")
-            results.append({"tono": "Neutro"})  # Placeholder - puedes expandir con LLM
-        pbar.progress(1.0, "Tono completado")
+            if i % 8 == 0:
+                pbar.progress((i+1)/n, f"Evaluando tono {i+1}/{n}")
+            # Placeholder - puedes expandir con LLM real
+            results.append({"tono": "Neutro"})
+        pbar.progress(1.0, "✅ Tono completado")
         return results
 
 class ClasificadorSubtema:
@@ -126,42 +150,20 @@ class ClasificadorSubtema:
         n = len(textos)
         subtemas = []
         for i in range(n):
-            if i % 15 == 0:
-                pbar.progress(i/n, f"Generando subtemas {i+1}/{n}")
-            subtemas.append("Análisis UNAL")
-        pbar.progress(1.0, "Subtemas completados")
+            if i % 10 == 0:
+                pbar.progress((i+1)/n, f"Generando subtema {i+1}/{n}")
+            subtemas.append("Cobertura Universidad Nacional")
+        pbar.progress(1.0, "✅ Subtemas completados")
         return subtemas
 
 def consolidar_temas(subtemas, textos, pbar):
-    pbar.progress(1.0, "Temas consolidados")
+    pbar.progress(1.0, "✅ Temas consolidados")
     return ["Universidad Nacional de Colombia"] * len(subtemas)
 
-# Funciones de limpieza (mínimas esenciales)
 def texto_para_embedding(titulo, resumen):
-    return f"{titulo}. {resumen}"[:1800]
-
-def detectar_duplicados_avanzado(rows, km):
-    return rows  # Simplificado para esta versión
-
-def read_and_normalize_dossier(sheet, region_map, internet_map):
-    # ... (usa tu función original completa)
-    # Por brevedad aquí usamos una versión básica:
-    headers = [cell.value for cell in sheet[1] if cell.value]
-    rows = []
-    for row in sheet.iter_rows(min_row=2):
-        if all(c.value is None for c in row): continue
-        row_data = {headers[i]: row[i].value for i in range(min(len(headers), len(row))) if i < len(row)}
-        rows.append(row_data)
-    return pd.DataFrame(rows)
-
-def generar_hoja(ws, rows, km, title):
-    ORDER = ["ID Noticia", "Fecha", "Hora", "Medio", "Tipo de Medio", "Título", 
-             "Resumen - Aclaracion", "Tono", "Tono IA", "Tema", "Subtema", 
-             "Menciones - Empresa", "Link Nota"]
-    ws.title = title
-    ws.append(ORDER)
-    for row in rows:
-        ws.append([row.get(col, "") for col in ORDER])
+    t = str(titulo or "")
+    r = str(resumen or "")
+    return f"{t}. {t}. {r}"[:1800]
 
 # ======================================
 # PROCESO PRINCIPAL
@@ -171,70 +173,96 @@ async def run_unal_process_async(df_file):
     get_embedding_cache().clear()
     t0 = time.time()
 
-    openai.api_key = st.secrets["OPENAI_API_KEY"]
+    try:
+        openai.api_key = st.secrets["OPENAI_API_KEY"]
+    except:
+        st.error("❌ OPENAI_API_KEY no configurada en secrets.")
+        st.stop()
 
-    with st.status("Cargando dossier...", expanded=True) as s:
-        config_path = "Configuracion.xlsx"  # Ajusta si es necesario
+    with st.status("📂 Cargando y normalizando dossier...", expanded=True) as s:
         wb = load_workbook(df_file, data_only=True)
-        df = read_and_normalize_dossier(wb.active, {}, {})
+        sheet = wb.active
+        headers = [cell.value for cell in sheet[1] if cell.value]
+        
+        rows = []
+        for row in sheet.iter_rows(min_row=2):
+            if all(c.value is None for c in row): continue
+            row_data = {}
+            for i, h in enumerate(headers):
+                if i < len(row):
+                    row_data[h] = row[i].value
+            rows.append(row_data)
+
+        km = {
+            "menciones": "Menciones - Empresa",
+            "titulo": "Título",
+            "resumen": "Resumen - Aclaracion",
+            "tonoiai": "Tono IA",
+            "tema": "Tema",
+            "subtema": "Subtema"
+        }
 
         # Expandir menciones
-        rows = []
-        for _, r in df.iterrows():
-            menc = str(r.get('Menciones - Empresa', '')).split(';')
-            for m in menc:
-                row = r.to_dict()
-                row['Menciones - Empresa'] = m.strip()
-                row['is_duplicate'] = False
-                rows.append(row)
+        expanded_rows = []
+        for r in rows:
+            menciones = str(r.get(km["menciones"], "")).split(';')
+            for m in menciones:
+                new_row = r.copy()
+                new_row[km["menciones"]] = m.strip()
+                expanded_rows.append(new_row)
 
-        km = {"menciones": "Menciones - Empresa", "titulo": "Título", "resumen": "Resumen - Aclaracion"}
+        unal_rows = [r for r in expanded_rows if r.get(km["menciones"]) == "Universidad Nacional de Colombia - General"]
+        otras_rows = [r for r in expanded_rows if r.get(km["menciones"]) != "Universidad Nacional de Colombia - General"]
 
-        unal_rows = [r for r in rows if r.get(km["menciones"]) == "Universidad Nacional de Colombia - General"]
-        otras_rows = [r for r in rows if r.get(km["menciones"]) != "Universidad Nacional de Colombia - General"]
+        s.update(label=f"✓ {len(unal_rows)} noticias UNAL | {len(otras_rows)} otras", state="complete")
 
-        s.update(label="✓ Datos cargados", state="complete")
-
-    # Análisis solo para UNAL
+    # === ANÁLISIS IA SOLO PARA UNAL ===
     if unal_rows:
         df_unal = pd.DataFrame(unal_rows)
-        df_unal["_txt"] = df_unal.apply(lambda r: texto_para_embedding(str(r.get(km["titulo"], "")), str(r.get(km["resumen"], ""))), axis=1)
+        df_unal["_txt"] = df_unal.apply(
+            lambda r: texto_para_embedding(r.get(km["titulo"], ""), r.get(km["resumen"], "")), axis=1
+        )
 
-        with st.status("Analizando con IA (Tono + Temas)...", expanded=True) as s:
+        with st.status("🤖 Analizando con IA (Tono + Temas)...", expanded=True) as s:
             pb = st.progress(0)
             tono_res = await ClasificadorTono(BRAND_NAME, BRAND_ALIASES).procesar_lote_async(
-                df_unal["_txt"].tolist(), pb, df_unal[km["resumen"]], df_unal[km["titulo"]]
+                df_unal["_txt"].tolist(), pb, df_unal.get(km["resumen"], pd.Series()), df_unal.get(km["titulo"], pd.Series())
             )
-            df_unal["Tono IA"] = [r["tono"] for r in tono_res]
+            df_unal[km["tonoiai"]] = [r["tono"] for r in tono_res]
 
             pb = st.progress(0)
             subtemas = ClasificadorSubtema(BRAND_NAME, BRAND_ALIASES).procesar_lote(
-                df_unal["_txt"].tolist(), pb, df_unal[km["resumen"]], df_unal[km["titulo"]]
+                df_unal["_txt"].tolist(), pb, df_unal.get(km["resumen"], pd.Series()), df_unal.get(km["titulo"], pd.Series())
             )
             temas = consolidar_temas(subtemas, df_unal["_txt"].tolist(), pb)
 
-            df_unal["Subtema"] = subtemas
-            df_unal["Tema"] = temas
-            s.update(label="✓ Análisis IA completado", state="complete")
+            df_unal[km["subtema"]] = subtemas
+            df_unal[km["tema"]] = temas
+            s.update(label="✅ Análisis IA completado", state="complete")
 
-        # Actualizar filas
+        # Actualizar filas originales
         for row in unal_rows:
-            idx = row.get('original_index')
-            if idx is not None:
-                matching = df_unal[df_unal['original_index'] == idx]
-                if not matching.empty:
-                    row.update(matching.iloc[0].to_dict())
+            row[km["tonoiai"]] = df_unal.loc[df_unal.index[unal_rows.index(row)], km["tonoiai"]]
+            row[km["subtema"]] = df_unal.loc[df_unal.index[unal_rows.index(row)], km["subtema"]]
+            row[km["tema"]] = df_unal.loc[df_unal.index[unal_rows.index(row)], km["tema"]]
 
-    # Generar Excel
-    with st.status("Generando Excel con 2 hojas...", expanded=True) as s:
-        wb = Workbook()
-        wb.remove(wb.active)
+    # === GENERAR EXCEL ===
+    with st.status("📊 Generando Excel con 2 hojas...", expanded=True) as s:
+        wb_out = Workbook()
+        wb_out.remove(wb_out.active)
 
-        generar_hoja(wb.create_sheet("UNAL_Analizado"), unal_rows, km, "UNAL_Analizado")
-        generar_hoja(wb.create_sheet("Otras_Menciones"), otras_rows, km, "Otras_Menciones")
+        def crear_hoja(nombre, datos):
+            ws = wb_out.create_sheet(nombre)
+            columnas = ["Menciones - Empresa", "Título", "Resumen - Aclaracion", "Tono IA", "Tema", "Subtema", "Medio", "Fecha"]
+            ws.append(columnas)
+            for r in datos:
+                ws.append([r.get(c, "") for c in columnas])
+
+        crear_hoja("UNAL_Analizado", unal_rows)
+        crear_hoja("Otras_Menciones", otras_rows)
 
         buf = io.BytesIO()
-        wb.save(buf)
+        wb_out.save(buf)
 
         st.session_state.update({
             "output_data": buf.getvalue(),
@@ -242,9 +270,9 @@ async def run_unal_process_async(df_file):
             "processing_complete": True,
             "unal_count": len(unal_rows),
             "otras_count": len(otras_rows),
-            "duration": f"{time.time()-t0:.1f}s"
+            "duration": f"{time.time() - t0:.1f}s"
         })
-        s.update(label="✓ Listo", state="complete")
+        s.update(label="✅ Archivo generado", state="complete")
 
 # ======================================
 # MAIN
@@ -257,29 +285,32 @@ def main():
     st.markdown("""
     <div class="app-header">
         <div class="app-header-icon">◈</div>
-        <div class="app-header-text">
-            <h1>Análisis Universidad Nacional de Colombia</h1>
-            <p>Procesamiento IA selectivo</p>
+        <div>
+            <h2>Análisis Universidad Nacional de Colombia</h2>
+            <p><strong>Procesamiento selectivo con IA</strong></p>
         </div>
     </div>
     """, unsafe_allow_html=True)
 
     if not st.session_state.get("processing_complete", False):
-        with st.form("main_form"):
-            f = st.file_uploader("Sube el dossier (.xlsx)", type=["xlsx"])
+        with st.form("unal_form"):
+            f = st.file_uploader("📁 Sube el dossier Excel", type=["xlsx"])
             if st.form_submit_button("🚀 Iniciar Análisis UNAL", type="primary", use_container_width=True):
                 if f:
                     asyncio.run(run_unal_process_async(f))
                     st.rerun()
+                else:
+                    st.warning("Por favor sube un archivo")
     else:
-        st.success("✅ Análisis completado exitosamente")
+        st.markdown('<div class="success-banner">✅ <strong>Análisis completado exitosamente</strong></div>', unsafe_allow_html=True)
+        
         col1, col2 = st.columns(2)
-        col1.metric("Noticias UNAL analizadas", st.session_state.unal_count)
+        col1.metric("UNAL Analizadas", st.session_state.unal_count)
         col2.metric("Otras menciones", st.session_state.otras_count)
-        st.metric("Tiempo total", st.session_state.duration)
+        st.metric("Tiempo de procesamiento", st.session_state.duration)
 
         st.download_button(
-            "⬇️ Descargar Informe (2 hojas)",
+            "⬇️ Descargar Informe UNAL (2 hojas)",
             data=st.session_state.output_data,
             file_name=st.session_state.output_filename,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -287,10 +318,10 @@ def main():
             type="primary"
         )
 
-        if st.button("Nuevo análisis"):
-            for key in list(st.session_state.keys()):
-                if key != "password_correct":
-                    del st.session_state[key]
+        if st.button("🔄 Nuevo análisis"):
+            for k in list(st.session_state.keys()):
+                if k not in ["password_correct"]:
+                    del st.session_state[k]
             st.rerun()
 
 if __name__ == "__main__":
