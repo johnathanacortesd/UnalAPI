@@ -114,7 +114,7 @@ _PATRON_TITULAR = re.compile(
 )
 _PATRON_ESTADO = re.compile(
     r"\b(calma|caos|urgente|hoy|ya|ahora|ayer|mañana|nuevo|nueva|"
-    r"gran|grande|important|especial|exclusivo)\s*$",
+    r"gran|grande|importante|especial|exclusivo)\s*$",
     re.IGNORECASE
 )
 
@@ -221,6 +221,30 @@ _ENIE_MAP = {
     "resena":"reseña","resenas":"reseñas","panuelo":"pañuelo","panuelos":"pañuelos",
     "companerismo":"compañerismo","desengano":"desengaño","lenio":"leño","leno":"leño",
 }
+
+# ── 20 CATEGORÍAS UNIVERSITARIAS RECTORAS PARA LA UNAL ──────────────────────────
+CATEGORIAS_UNAL = [
+    "Políticas de Admisión y Matrículas",
+    "Presupuesto y Financiación Universitaria",
+    "Investigación, Ciencia y Tecnología",
+    "Infraestructura y Planta Física",
+    "Gobernanza, Elecciones y Elección de Rector",
+    "Movilización Estudiantil y Protestas",
+    "Calidad Académica y Acreditación",
+    "Bienestar Universitario y Becas",
+    "Relaciones Internacionales y Convenios",
+    "Seguridad y Convivencia en el Campus",
+    "Innovación, Patentes y Emprendimiento",
+    "Extensión, Cultura y Aporte Social",
+    "Docencia y Escalafón Profesoral",
+    "Sindicalismo y Demandas Laborales",
+    "Inclusión, Diversidad y Equidad de Género",
+    "Reformas Curriculares y Nuevos Programas",
+    "Salud Pública, Clínicas y Hospital Universitario",
+    "Escándalos, Denuncias e Investigaciones",
+    "Egresados y Empleabilidad",
+    "Crisis Administrativa y Paros"
+]
 
 def corregir_tildes(texto: str) -> str:
     if not texto: return texto
@@ -526,7 +550,7 @@ def check_password():
     st.markdown("""
     <div class="auth-wrap">
         <div class="auth-icon">◈</div>
-        <div class="auth-title">Sistema de Análisis</div>
+        <div class="auth-title">Sistema de Análisis universidad Nacional</div>
         <div class="auth-sub">Ingresa tus credenciales para continuar</div>
     </div>""", unsafe_allow_html=True)
     _, col, _ = st.columns([1, 2, 1])
@@ -1088,7 +1112,7 @@ def seleccionar_representante(indices, textos):
 
 
 # ======================================
-# TONO (Sistema Reputacional por IA)
+# TONO (Análisis Reputacional UNAL)
 # ======================================
 class ClasificadorTono:
     def __init__(self, marca, aliases):
@@ -1102,26 +1126,16 @@ class ClasificadorTono:
 
     async def _clasificar_llm(self, texto, sem):
         async with sem:
-            if not self._menciona_marca(texto):
-                return {"tono": "Neutro"}
-
-            aliases_str = f" (también conocida como: {', '.join(self.aliases)})" if self.aliases else ""
+            # ── EVALUACIÓN ENFOCADA EN LA UNIVERSIDAD NACIONAL ──────────────────────────
             prompt = (
-                f"Eres un experto analista en Relaciones Públicas y Gestión de Reputación. "
-                f"Tu tarea es evaluar el impacto reputacional DIRECTO de la siguiente noticia sobre la marca '{self.marca}'{aliases_str}.\n\n"
+                "Eres un experto analista de reputación de medios y comunicación institucional.\n"
+                "Tu tarea es evaluar el impacto directo de la noticia sobre la Universidad Nacional de Colombia (UNAL).\n\n"
                 f"TEXTO A EVALUAR:\n{texto[:1600]}\n\n"
-                f"REGLAS DE CLASIFICACIÓN ESTRICTAS:\n"
-                f"🔴 NEGATIVO: La marca '{self.marca}' es CULPABLE o VÍCTIMA DIRECTA de algo malo. Ejemplos: "
-                f"demandas, multas, fraudes corporativos, fallas operativas graves, quejas de usuarios, o investigaciones en su contra.\n"
-                f"🟢 POSITIVO: La marca '{self.marca}' LOGRA algo bueno. Ejemplos: lanza un servicio, gana un premio, "
-                f"reporta ganancias, lidera una iniciativa positiva, hace donaciones o expansiones.\n"
-                f"⚪ NEUTRO: La marca se menciona SIN impacto a su imagen. Ejemplos:\n"
-                f"  - La noticia habla de una crisis del sector/país, pero la marca solo es mencionada informando o adaptándose.\n"
-                f"  - Se menciona a la marca como patrocinador menor o en una lista de empresas.\n"
-                f"  - Emite un comunicado regular sin connotaciones de crisis ni éxito rotundo.\n\n"
-                f"⚠️ ATENCIÓN: Ignora si la noticia es trágica a nivel general (ej. una pandemia o accidente de terceros). "
-                f"Evalúa ÚNICAMENTE si la reputación corporativa de '{self.marca}' mejora (Positivo), empeora (Negativo) o se mantiene (Neutro).\n\n"
-                f'Responde ÚNICAMENTE con JSON en este formato: {{"tono": "Positivo|Negativo|Neutro"}}'
+                "REGLAS DE CLASIFICACIÓN:\n"
+                "🟢 Positivo: Si exalta, destaca logros, premios, investigaciones científicas destacadas, patentes o aportes sociales positivos de la universidad.\n"
+                "🔴 Negativo: Si afecta negativamente la imagen de la universidad, describiendo crisis, bloqueos, paros, violencia, escándalos, investigaciones disciplinarias, mala gestión, fallas de infraestructura o problemas graves.\n"
+                "⚪ Neutro: Si se menciona a la universidad de manera neutral (trámites normales, anuncios administrativos normales, boletines de rutina o menciones informativas sin un impacto positivo o negativo claro).\n\n"
+                'Responde EXCLUSIVAMENTE con un JSON en este formato: {"tono": "Positivo|Negativo|Neutro"}'
             )
 
             try:
@@ -1799,7 +1813,7 @@ class ClasificadorSubtema:
         return r
 
 # ======================================
-# TEMAS  
+# TEMAS (Clasificación en 20 Categorías de UNAL)
 # ======================================
 def _construir_representacion_grupo(subtema, textos_grupo, max_textos=30):
     palabras = []
@@ -1840,18 +1854,18 @@ def _generar_nombre_tema_llm(subtemas_grupo, textos_muestra, titulos_muestra):
             if len(w) > 3: palabras.append(w)
     kw = ", ".join(w for w, _ in Counter(palabras).most_common(6))
     tit_muestra = "\n".join(f"  · {t[:100]}" for t in list(dict.fromkeys(titulos_muestra))[:5])
+    
+    # ── MAPEO ESTRICTO HACIA LAS 20 CATEGORÍAS UNAL ──────────────────────────
+    cats_str = "\n".join(f" - {c}" for c in CATEGORIAS_UNAL)
     prompt = (
-        "Eres editor jefe de un periódico. Crea UNA sección editorial (2-4 palabras) que agrupe estos subtemas.\n\n"
-        "SUBTEMAS:\n" + subs_list + "\n\nTÍTULOS DE REFERENCIA:\n" + tit_muestra +
-        f"\n\nKEYWORDS: {kw}\n\n"
-        "REGLAS ESTRICTAS:\n"
-        "  1. Piensa en secciones de periódico: 'Política', 'Economía', 'Tecnología', 'Seguridad', 'Justicia', 'Medio Ambiente'.\n"
-        "  2. Más GENERAL y ABSTRACTO que los subtemas — nunca repitas un subtema ni copies fragmentos de titular.\n"
-        "  3. NUNCA incluyas números, cantidades ni nombres propios.\n"
-        "  4. 2-4 palabras. Sustantivo + adjetivo o sustantivo solo.\n"
-        "  5. Tildes y ñ correctas.\n\n"
-        "CORRECTO: 'Política', 'Gestión legislativa', 'Justicia penal', 'Regulación financiera'\n"
-        "INCORRECTO: 'Cinco congresistas con líos', 'Congresistas electos', 'Investigación disciplinaria congreso', 'Nuevo acuerdo'\n\n"
+        "Eres un analista de datos experto en educación superior y periodismo institucional.\n"
+        "Clasifica el siguiente grupo de noticias de la Universidad Nacional de Colombia en una de las siguientes 20 categorías prioritarias:\n\n"
+        f"{cats_str}\n\n"
+        "NOTICIAS DE MUESTRA:\n" + tit_muestra +
+        f"\n\nSUBTEMAS ASOCIADOS:\n" + subs_list +
+        "\n\nREGLAS DE CLASIFICACIÓN:\n"
+        "1. Si el grupo de noticias encaja de manera razonable en una de las 20 categorías rectoras anteriores, responde EXACTAMENTE con ese nombre.\n"
+        "2. Si y SOLO SI la noticia es ajena por completo a estas 20 categorías, crea una nueva temática específica corta (2 a 4 palabras) que represente fielmente la noticia.\n"
         'JSON: {"tema":"..."}'
     )
     try:
@@ -1872,11 +1886,12 @@ def _generar_nombre_tema_llm(subtemas_grupo, textos_muestra, titulos_muestra):
 
 def _regenerar_tema_diferente(subtemas_grupo, titulos_muestra, intento=0):
     subs_list = ", ".join(subtemas_grupo[:8])
+    cats_str = "\n".join(f" - {c}" for c in CATEGORIAS_UNAL)
     prompt = (
-        f"Subtemas: {subs_list}\n\n"
-        "Genera UNA categoría GENERAL (2-3 palabras), diferente a los subtemas. "
-        "Piensa en sección de periódico (Economía, Política, Tecnología, Infraestructura, Cultura, Deportes…). "
-        "Tildes y ñ correctas, terminar en sustantivo/adjetivo.\n"
+        "Clasifica estas noticias de la Universidad Nacional. Intenta ubicar de forma preferente una de estas categorías:\n"
+        f"{cats_str}\n\n"
+        f"Subtemas de referencia: {subs_list}\n"
+        "Si no encaja, genera un tema corto y claro (2-3 palabras).\n"
         'JSON: {"tema":"..."}'
     )
     try:
@@ -2098,342 +2113,6 @@ def _unificar_tema_por_subtema(temas, subtemas):
         sub_to_best[sub] = Counter(tema_list).most_common(1)[0][0]
     return [sub_to_best[s] for s in subtemas]
 
-# ======================================
-# Duplicados y Excel (Particionado en Hojas UNAL y Otros)
-# ======================================
-def _normalizar_url(url: str) -> str:
-    if not url: return ""
-    url = url.strip().lower()
-    url = re.sub(r'^https?://', '', url)
-    url = re.sub(r'^www\.', '', url)
-    url = url.rstrip('/')
-    return url
-
-def detectar_duplicados_avanzado(rows, km):
-    processed = deepcopy(rows)
-    seen_url, seen_bcast = {}, {}
-    seen_streaming: Dict[tuple, int] = {}
-    tb = defaultdict(list)
-
-    for i, row in enumerate(processed):
-        if row.get("is_duplicate"): continue
-
-        tipo    = normalizar_tipo_medio(str(row.get(km["tipodemedio"], "")))
-        mencion = norm_key(row.get(km["menciones"], ""))
-        medio   = norm_key(row.get(km["medio"], ""))
-
-        streaming_url_raw = row.get(km["link_streaming"])
-        if isinstance(streaming_url_raw, dict):
-            streaming_url_raw = streaming_url_raw.get("url")
-            
-        if streaming_url_raw and mencion:
-            streaming_url_norm = _normalizar_url(str(streaming_url_raw))
-            if streaming_url_norm:
-                sk = (streaming_url_norm, mencion)
-                if sk in seen_streaming:
-                    row["is_duplicate"] = True
-                    row[km["idduplicada"]] = processed[seen_streaming[sk]].get(km["idnoticia"], "")
-                    continue
-                seen_streaming[sk] = i
-
-        if tipo == "Internet":
-            li = row.get(km["link_nota"])
-            url = li.get("url") if isinstance(li, dict) else li
-            if url and mencion:
-                url_norm = _normalizar_url(str(url))
-                k = (url_norm, mencion)
-                if k in seen_url:
-                    row["is_duplicate"] = True
-                    row[km["idduplicada"]] = processed[seen_url[k]].get(km["idnoticia"], "")
-                    continue
-                seen_url[k] = i
-            if medio and mencion:
-                tb[(medio, mencion)].append(i)
-
-        elif tipo in ("Radio", "Televisión"):
-            hora = str(row.get(km["hora"], "")).strip()
-            if mencion and medio and hora:
-                k = (mencion, medio, hora)
-                if k in seen_bcast:
-                    row["is_duplicate"] = True
-                    row[km["idduplicada"]] = processed[seen_bcast[k]].get(km["idnoticia"], "")
-                else:
-                    seen_bcast[k] = i
-
-    for idxs in tb.values():
-        if len(idxs) < 2: continue
-        for i in range(len(idxs)):
-            for j in range(i + 1, len(idxs)):
-                a, b = idxs[i], idxs[j]
-                if processed[a].get("is_duplicate") or processed[b].get("is_duplicate"): continue
-                ta  = normalize_title_for_comparison(processed[a].get(km["titulo"]))
-                tb_ = normalize_title_for_comparison(processed[b].get(km["titulo"]))
-                if ta and tb_ and SequenceMatcher(None, ta, tb_).ratio() >= SIMILARITY_THRESHOLD_TITULOS:
-                    if len(ta) < len(tb_):
-                        processed[a]["is_duplicate"] = True
-                        processed[a][km["idduplicada"]]  = processed[b].get(km["idnoticia"], "")
-                    else:
-                        processed[b]["is_duplicate"] = True
-                        processed[b][km["idduplicada"]]  = processed[a].get(km["idnoticia"], "")
-
-    return processed
-
-def read_and_normalize_dossier(sheet, region_map, internet_map):
-    headers = [cell.value for cell in sheet[1] if cell.value is not None]
-    rows = []
-    for row in sheet.iter_rows(min_row=2):
-        if all(c.value is None for c in row):
-            continue
-        row_data = {}
-        for i, h in enumerate(headers):
-            if i < len(row):
-                cell = row[i]
-                val = cell.value
-                url = cell.hyperlink.target if (cell.hyperlink and cell.hyperlink.target) else None
-                if url:
-                    row_data[h] = {"value": val or "Link", "url": url}
-                else:
-                    row_data[h] = val
-        rows.append(row_data)
-
-    df = pd.DataFrame(rows)
-
-    tipo_medio_map = {
-        'online': 'Internet', 'internet': 'Internet',
-        'diario': 'Prensa',
-        'am': 'Radio', 'fm': 'Radio',
-        'aire': 'Televisión', 'cable': 'Televisión',
-        'revista': 'Revistas', 'revistas': 'Revistas',
-    }
-    
-    if 'Tipo de Medio' in df.columns:
-        df['Tipo de Medio'] = (
-            df['Tipo de Medio'].astype(str).str.lower().str.strip()
-            .map(tipo_medio_map)
-            .fillna(df['Tipo de Medio'].astype(str).str.strip())
-        )
-    else:
-        df['Tipo de Medio'] = 'Otro'
-
-    is_av = df['Tipo de Medio'].isin(['Radio', 'Televisión'])
-    is_grafica = df['Tipo de Medio'].isin(['Prensa', 'Internet', 'Revistas'])
-    is_internet = df['Tipo de Medio'] == 'Internet'
-
-    # --- Buscarv Región (Antes de cambiar el nombre en Medio) ---
-    if 'Medio' in df.columns:
-        raw_medios_clean = df['Medio'].astype(str).str.lower().str.strip()
-        df['Región'] = raw_medios_clean.map(region_map).fillna("N/A")
-    else:
-        df['Medio'] = 'N/A'
-        df['Región'] = 'N/A'
-
-    # --- Buscarv Internet sobre Medio (Una vez mapeada la región) ---
-    if 'Medio' in df.columns:
-        df.loc[is_internet, 'Medio'] = (
-            df.loc[is_internet, 'Medio']
-            .astype(str).str.lower().str.strip()
-            .map(internet_map)
-            .fillna(df.loc[is_internet, 'Medio'])
-        )
-
-    df['ID Noticia'] = df.get('NoticiaId', df.get('ID Noticia', pd.Series(dtype=str)))
-    df['Fecha'] = pd.to_datetime(df.get('Fecha', pd.Series(dtype=str)), dayfirst=True, errors='coerce').dt.normalize()
-    df['Hora'] = df.get('Hora', pd.Series(dtype=str))
-    df['Sección - Programa'] = df.get('Sección - Programa', pd.Series(dtype=str)).astype(str).apply(clean_text)
-    
-    titulo_col = 'Título' if 'Título' in df.columns else 'Titulo'
-    df['Título'] = df.get(titulo_col, pd.Series(dtype=str)).astype(str).apply(clean_text)
-    df['Autor - Conductor'] = df.get('Autor - Conductor', pd.Series(dtype=str)).astype(str).apply(clean_text)
-    df['Nro. Pagina'] = df.get('Nro. Pagina', pd.Series(dtype=str))
-    
-    dim_col = 'Dimensioncm2' if 'Dimensioncm2' in df.columns else 'Dimensión'
-    df['Dimensión'] = df.get(dim_col, pd.Series(dtype=str))
-    df['Duración - Nro. Caracteres'] = df.get('Duración - Nro. Caracteres', pd.Series(dtype=str))
-
-    df.loc[is_av, 'Dimensión'] = df.loc[is_av, 'Duración - Nro. Caracteres']
-    df.loc[is_av, 'Duración - Nro. Caracteres'] = 0
-
-    cpe_av = df.get('CPE', pd.Series([np.nan] * len(df)))
-    cpe_grafica = df.get('Valor de Nota', pd.Series([np.nan] * len(df)))
-    df['CPE'] = np.where(is_av, cpe_av, np.where(is_grafica, cpe_grafica, np.nan))
-
-    df['Tier'] = df.get('Tier', pd.Series(dtype=str))
-    df['Audiencia'] = df.get('Audiencia', pd.Series(dtype=str))
-    df['Tono'] = df.get('Tono', pd.Series(dtype=str)).astype(str).apply(clean_text)
-    df['Tema'] = df.get('Tematica', df.get('Tema', pd.Series(dtype=str))).astype(str).apply(clean_text)
-    df['Temas Generales - Tema'] = df.get('Temas Generales - Tema', pd.Series(dtype=str)).astype(str).apply(clean_text)
-
-    cuerpo_col = 'CuerpoEs' if 'CuerpoEs' in df.columns else 'Resumen - Aclaracion'
-    cuerpo_cleaned = df.get(cuerpo_col, pd.Series([''] * len(df))).astype(str).apply(clean_cuerpo)
-
-    def fmt_grafica(text):
-        if not isinstance(text, str) or not text.strip():
-            return text
-        parrafos = [p.strip() for p in text.split('\n') if p.strip()]
-        return '\n\n'.join(parrafos) if len(parrafos) > 1 else text
-
-    df['Resumen - Aclaracion'] = np.where(is_av, cuerpo_cleaned, cuerpo_cleaned.apply(fmt_grafica))
-
-    url_nota_av = df.get('URL Nota AV', df.get('Link Nota AV', pd.Series([''] * len(df))))
-    url_streaming = df.get('URL (Streaming - Imagen)', pd.Series([''] * len(df)))
-    
-    link_nota_final = []
-    for val_av, val_str, is_av_row in zip(url_nota_av, url_streaming, is_av):
-        if is_av_row:
-            if isinstance(val_av, dict):
-                url_t = val_av.get("url", "")
-                link_nota_final.append({"value": "Link", "url": url_t.replace(".com.ar", ".com.co") if url_t else None})
-            else:
-                url_t = str(val_av or "")
-                link_nota_final.append({"value": "Link", "url": url_t.replace(".com.ar", ".com.co") if url_t else None})
-        else:
-            if isinstance(val_str, dict):
-                link_nota_final.append(val_str)
-            else:
-                link_nota_final.append({"value": "Link", "url": val_str if val_str else None})
-                
-    df['Link Nota'] = link_nota_final
-
-    # URL Nota se mapea a Link (Streaming - Imagen). Solamente para medios Internet debe persistir valor, para el resto queda None.
-    url_nota_raw = df.get('URL Nota', pd.Series([''] * len(df)))
-    link_stream_final = []
-    for val_url, is_int in zip(url_nota_raw, is_internet):
-        if is_int:
-            if isinstance(val_url, dict):
-                link_stream_final.append(val_url)
-            else:
-                link_stream_final.append({"value": "Link", "url": val_url if val_url else None})
-        else:
-            link_stream_final.append(None)
-            
-    df['Link (Streaming - Imagen)'] = link_stream_final
-
-    menciones_av = df.get('Menciones - Empresa', pd.Series([''] * len(df))).fillna('').astype(str).apply(clean_text)
-    menciones_grafica = df.get('Empresa rel.', pd.Series([''] * len(df))).fillna('').astype(str).apply(clean_text)
-    df['Menciones - Empresa'] = np.where(is_av, menciones_av, np.where(is_grafica, menciones_grafica, menciones_av))
-
-    return df
-
-def generate_output_excel(rows, km):
-    wb = Workbook()
-    
-    # Separación de registros para las dos pestañas especificadas
-    rows_unal = []
-    rows_otros = []
-    for row in rows:
-        mencion = str(row.get("Menciones - Empresa", "")).strip()
-        if mencion == "Universidad Nacional de Colombia - General":
-            rows_unal.append(row)
-        else:
-            rows_otros.append(row)
-            
-    # Configuración de Hojas
-    ws_unal = wb.active
-    ws_unal.title = "UNAL"
-    ws_otros = wb.create_sheet(title="Otros")
-    
-    ORDER_UNAL = [
-        "ID Noticia", "Fecha", "Hora", "Medio", "Tipo de Medio",
-        "Sección - Programa", "Región", "Título", "Autor - Conductor",
-        "Nro. Pagina", "Dimensión", "Duración - Nro. Caracteres",
-        "CPE", "Tier", "Audiencia", "Tono", "Tono IA", "Tema", "Subtema",
-        "Link Nota", "Resumen - Aclaracion", "Link (Streaming - Imagen)", "Menciones - Empresa",
-        "ID duplicada"
-    ]
-    
-    ORDER_OTROS = [
-        "ID Noticia", "Fecha", "Hora", "Medio", "Tipo de Medio",
-        "Sección - Programa", "Región", "Título", "Autor - Conductor",
-        "Nro. Pagina", "Dimensión", "Duración - Nro. Caracteres",
-        "CPE", "Tier", "Audiencia", "Tono", "Tema", "Link Nota", 
-        "Resumen - Aclaracion", "Link (Streaming - Imagen)", "Menciones - Empresa",
-        "ID duplicada"
-    ]
-    
-    def populate_sheet(ws, sheet_rows, cols_order):
-        ws.append(cols_order)
-        font_hyperlink = Font(color="0563C1", underline="single")
-        align_left = Alignment(horizontal='left')
-        font_header = Font(bold=True)
-        NUM = {"ID Noticia", "Nro. Pagina", "Dimensión", "Duración - Nro. Caracteres", "CPE", "Tier", "Audiencia"}
-        
-        for i, col_name in enumerate(cols_order, start=1):
-            cell = ws.cell(row=1, column=i)
-            cell.font = font_header
-            
-        for row in sheet_rows:
-            row_copy = dict(row)
-            tk = km.get("titulo")
-            if tk and tk in row_copy: row_copy[tk] = clean_title_for_output(row_copy.get(tk))
-            rk = km.get("resumen")
-            if rk and rk in row_copy: row_copy[rk] = corregir_texto(row_copy.get(rk))
-            
-            out, links = [], {}
-            for ci, h in enumerate(cols_order, start=1):
-                # ── LIMPIEZA DE TONO Y TEMA EN HOJA OTROS ──────────────────────────────
-                if ws.title == "Otros" and h in ("Tono", "Tema"):
-                    val = None
-                else:
-                    val = row_copy.get(h)
-                    
-                cv = None
-                if h == 'Fecha' and pd.notna(val):
-                    if isinstance(val, pd.Timestamp):
-                        cv = val.to_pydatetime()
-                    elif isinstance(val, (datetime.datetime, datetime.date)):
-                        cv = val
-                    else:
-                        cv = str(val) if val is not None else None
-                elif h in NUM:
-                    cv = parse_numeric(val)
-                elif isinstance(val, dict) and "url" in val:
-                    cv = val.get("value", "Link")
-                    if val.get("url"): links[ci] = val["url"]
-                elif val is not None:
-                    if isinstance(val, str) and val.startswith("http"):
-                        cv = "Link"
-                        links[ci] = val
-                    else:
-                        cv = str(val)
-                out.append(cv)
-            ws.append(out)
-            
-            current_row = ws.max_row
-            for ci, url in links.items():
-                cell = ws.cell(row=current_row, column=ci)
-                cell.hyperlink = url
-                cell.font = font_hyperlink
-                cell.alignment = align_left
-                
-            date_col_idx = cols_order.index("Fecha") + 1
-            date_cell = ws.cell(row=current_row, column=date_col_idx)
-            if isinstance(date_cell.value, (datetime.datetime, datetime.date)):
-                date_cell.number_format = 'DD/MM/YYYY'
-                
-            cpe_idx = cols_order.index("CPE") + 1
-            tipo_medio_idx = cols_order.index("Tipo de Medio") + 1
-            tipo_medio_val = ws.cell(row=current_row, column=tipo_medio_idx).value
-            cpe_cell = ws.cell(row=current_row, column=cpe_idx)
-            
-            if tipo_medio_val in ("Radio", "Televisión") and isinstance(cpe_cell.value, (int, float)):
-                cpe_cell.number_format = '#,##0'
-                
-        for i, col_name in enumerate(cols_order, start=1):
-            letter = ws.cell(row=1, column=i).column_letter
-            if col_name in ['Título', 'Resumen - Aclaracion']:
-                ws.column_dimensions[letter].width = 50
-            elif col_name in ['Link Nota', 'Link (Streaming - Imagen)']:
-                ws.column_dimensions[letter].width = 15
-            else:
-                ws.column_dimensions[letter].width = 20
-
-    populate_sheet(ws_unal, rows_unal, ORDER_UNAL)
-    populate_sheet(ws_otros, rows_otros, ORDER_OTROS)
-    
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
-
 
 # ======================================
 # Proceso principal
@@ -2497,9 +2176,7 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
             "tier": "Tier",
             "audiencia": "Audiencia",
             "tono": "Tono",
-            "tonoiai": "Tono IA",
             "tema": "Tema",
-            "subtema": "Subtema",
             "link_nota": "Link Nota",
             "resumen": "Resumen - Aclaracion",
             "link_streaming": "Link (Streaming - Imagen)",
@@ -2510,9 +2187,8 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
         rows = detectar_duplicados_avanzado(rows_expanded, km)
         for row in rows:
             if row["is_duplicate"]:
-                row["Tono IA"] = "Duplicada"
+                row["Tono"] = "Duplicada"
                 row["Tema"] = "-"
-                row["Subtema"] = "-"
                 
         s.update(label="✓ Paso 1 completado", state="complete")
         
@@ -2526,8 +2202,7 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
         df = pd.DataFrame(ta)
         
         # Asignar valores por defecto para evitar NAs en filas que no se procesen con la API
-        df[km["tonoiai"]] = "Neutro"
-        df[km["subtema"]] = "Cobertura informativa general"
+        df[km["tono"]] = "Neutro"
         df[km["tema"]] = "Cobertura informativa general"
         
         # Filtrado para procesar únicamente "Universidad Nacional de Colombia - General" con OpenAI
@@ -2554,7 +2229,7 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
                     )
                 else:
                     res = [{"tono": "N/A"}] * len(df_target)
-                df_target[km["tonoiai"]] = [r["tono"] for r in res]
+                df_target[km["tono"]] = [r["tono"] for r in res]
                 s.update(label="✓ Paso 3 · Tono completado", state="complete")
                 
             with st.status("Paso 4 · Clasificación (Universidad Nacional)", expanded=True) as s:
@@ -2567,17 +2242,11 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
                         df_target["_txt"], pb, df_target[km["resumen"]], df_target[km["titulo"]]
                     )
                     temas = consolidar_temas(subtemas, df_target["_txt"].tolist(), pb)
-                df_target[km["subtema"]] = subtemas
-                if "PKL" in mode and epkl:
-                    tp = analizar_temas_con_pkl(df_target["_txt"].tolist(), epkl)
-                    if tp: df_target[km["tema"]] = _unificar_tema_por_subtema(tp, subtemas)
-                else:
-                    df_target[km["tema"]] = temas
+                df_target[km["tema"]] = temas
                 s.update(label="✓ Paso 4 · Clasificación completada", state="complete")
                 
             # Mapear los registros procesados al DataFrame general
-            df.loc[is_target, km["tonoiai"]] = df_target[km["tonoiai"]]
-            df.loc[is_target, km["subtema"]] = df_target[km["subtema"]]
+            df.loc[is_target, km["tono"]] = df_target[km["tono"]]
             df.loc[is_target, km["tema"]] = df_target[km["tema"]]
             
         rm2 = df.set_index("original_index").to_dict("index")
@@ -2613,8 +2282,7 @@ async def run_quick_async(df, tc, sc, bn, al):
             menciones_col = c
             break
             
-    df['Tono IA'] = 'Neutro'
-    df['Subtema'] = 'Cobertura informativa general'
+    df['Tono'] = 'Neutro'
     df['Tema'] = 'Cobertura informativa general'
     
     if menciones_col is not None:
@@ -2632,18 +2300,16 @@ async def run_quick_async(df, tc, sc, bn, al):
         with st.status("Tono", expanded=True) as s:
             pb = st.progress(0)
             res = await ClasificadorTono(bn, al).procesar_lote_async(df_target["_txt"], pb, df_target[sc].fillna(''), df_target[tc].fillna(''))
-            df_target['Tono IA'] = [r["tono"] for r in res]
+            df_target['Tono'] = [r["tono"] for r in res]
             s.update(label="✓ Tono", state="complete")
         with st.status("Clasificación", expanded=True) as s:
             pb = st.progress(0)
             subtemas = ClasificadorSubtema(bn, al).procesar_lote(df_target["_txt"], pb, df_target[sc].fillna(''), df_target[tc].fillna(''))
-            df_target['Subtema'] = subtemas
             temas = consolidar_temas(subtemas, df_target["_txt"].tolist(), pb)
             df_target['Tema'] = temas
             s.update(label="✓ Clasificación", state="complete")
             
-        df.loc[is_target, 'Tono IA'] = df_target['Tono IA']
-        df.loc[is_target, 'Subtema'] = df_target['Subtema']
+        df.loc[is_target, 'Tono'] = df_target['Tono']
         df.loc[is_target, 'Tema'] = df_target['Tema']
         
     ci = (st.session_state['tokens_input']     / 1e6) * PRICE_INPUT_1M
