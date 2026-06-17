@@ -4,7 +4,7 @@
 import streamlit as st
 import pandas as pd
 from openpyxl import load_workbook, Workbook
-from openpyxl.styles import Font, NamedStyle, Alignment
+from openpyxl.styles import Font, Alignment
 from collections import defaultdict, Counter
 from difflib import SequenceMatcher
 from copy import deepcopy
@@ -15,8 +15,6 @@ import re
 import time
 from unidecode import unidecode
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.cluster import AgglomerativeClustering
 import json
 import asyncio
 import hashlib
@@ -243,6 +241,78 @@ def corregir_tildes(texto: str) -> str:
 
 
 # ======================================
+# IMPLEMENTACIONES PROPIAS (REEMPLAZO DE SKLEARN)
+# ======================================
+def cosine_similarity(X, Y=None):
+    """Cálculo nativo de la similitud de coseno mediante NumPy."""
+    X = np.atleast_2d(X)
+    if Y is None:
+        Y = X
+    else:
+        Y = np.atleast_2d(Y)
+    
+    norm_X = np.linalg.norm(X, axis=1, keepdims=True)
+    norm_Y = np.linalg.norm(Y, axis=1, keepdims=True)
+    
+    norm_X[norm_X == 0] = 1e-10
+    norm_Y[norm_Y == 0] = 1e-10
+    
+    sim = np.dot(X, Y.T) / (norm_X * norm_Y.T)
+    return np.clip(sim, -1.0, 1.0)
+
+def agglomerative_clustering_precomputed(dist_matrix, distance_threshold=None, n_clusters=None, linkage='average'):
+    """Algoritmo de clustering jerárquico nativo sobre matrices de distancias precalculadas."""
+    n = dist_matrix.shape[0]
+    clusters = {i: [i] for i in range(n)}
+    curr_dist = dist_matrix.copy().astype(float)
+    np.fill_diagonal(curr_dist, np.inf)
+    
+    while len(clusters) > 1:
+        if n_clusters is not None and len(clusters) <= n_clusters:
+            break
+        
+        active_keys = list(clusters.keys())
+        sub_matrix = curr_dist[np.ix_(active_keys, active_keys)]
+        
+        min_idx = np.argmin(sub_matrix)
+        r, c = np.unravel_index(min_idx, sub_matrix.shape)
+        
+        min_dist = sub_matrix[r, c]
+        if distance_threshold is not None and min_dist > distance_threshold:
+            break
+            
+        key_r, key_c = active_keys[r], active_keys[c]
+        clusters[key_r].extend(clusters[key_c])
+        del clusters[key_c]
+        
+        for k in list(clusters.keys()):
+            if k == key_r:
+                continue
+            members_r = clusters[key_r]
+            members_k = clusters[k]
+            dists = dist_matrix[np.ix_(members_r, members_k)]
+            
+            if linkage == 'complete':
+                new_d = np.max(dists)
+            elif linkage == 'single':
+                new_d = np.min(dists)
+            else: # 'average'
+                new_d = np.mean(dists)
+                
+            curr_dist[key_r, k] = new_d
+            curr_dist[k, key_r] = new_d
+            
+        curr_dist[key_c, :] = np.inf
+        curr_dist[:, key_c] = np.inf
+        
+    labels = np.zeros(n, dtype=int)
+    for label_idx, (k, members) in enumerate(clusters.items()):
+        for m in members:
+            labels[m] = label_idx
+    return labels
+
+
+# ======================================
 # CSS
 # ======================================
 def load_custom_css():
@@ -328,7 +398,7 @@ label[data-testid="stWidgetLabel"] p{font-family:'Google Sans',sans-serif!import
 [data-testid="stStatus"]{background:var(--s1)!important;border:1px solid var(--border)!important;border-radius:var(--r2)!important;font-family:'Roboto Mono',monospace!important;font-size:0.8rem!important;}
 [data-testid="stAlert"]{background:var(--s1)!important;border:1px solid var(--border)!important;border-radius:var(--r2)!important;color:var(--text2)!important;font-size:0.85rem!important;padding:0.6rem 0.8rem!important;}
 .success-banner{background:linear-gradient(135deg,#ecfdf5,#d1fae5);border:1px solid var(--green-bdr);border-left:4px solid var(--green);border-radius:var(--r2);padding:0.8rem 1.2rem;margin:0.5rem 0 0.8rem;display:flex;align-items:center;gap:0.8rem;}
-.success-icon{width:34px;height:34px;background:linear-gradient(135deg,#059669,#047857);border-radius:50%;display:flex;align-items:center;justify-content:center;color:white;font-size:1rem;flex-shrink:0;}
+.success-icon{width:34px;height:34px;background:linear-gradient(135deg,#1e3a8a,#3b82f6);border-radius:50%;display:flex;align-items:center;justify-content:center;color:white;font-size:1rem;flex-shrink:0;}
 .success-title{font-family:'Google Sans',sans-serif;font-size:1rem;font-weight:700;color:#047857;margin-bottom:0.1rem}
 .success-sub{font-size:0.8rem;color:var(--text2)}
 .auth-wrap{max-width:380px;margin:8vh auto 0;text-align:center}
@@ -1073,9 +1143,9 @@ def agrupar_textos_similares(textos, umbral):
     valid = [(i, e) for i, e in enumerate(embs) if e is not None]
     if len(valid) < 2: return {}
     idxs, M = zip(*valid)
-    labels = AgglomerativeClustering(
-        n_clusters=None, distance_threshold=1 - umbral, metric="cosine", linkage="average"
-    ).fit(np.array(M)).labels_
+    sim_matrix = cosine_similarity(np.array(M))
+    dist_matrix = 1 - sim_matrix
+    labels = agglomerative_clustering_precomputed(dist_matrix, distance_threshold=1 - umbral, linkage="average")
     g = defaultdict(list)
     for k, lbl in enumerate(labels): g[lbl].append(idxs[k])
     return dict(enumerate(g.values()))
@@ -1298,10 +1368,7 @@ class ClasificadorSubtema:
             io_, M = zip(*ok)
             sim_matrix = cosine_similarity(np.array(M))
             linkage = 'complete' if n <= 10 else 'average'
-            labels = AgglomerativeClustering(
-                n_clusters=None, distance_threshold=1 - umbral_cluster,
-                metric='precomputed', linkage=linkage
-            ).fit(1 - sim_matrix).labels_
+            labels = agglomerative_clustering_precomputed(1 - sim_matrix, distance_threshold=1 - umbral_cluster, linkage=linkage)
             g = defaultdict(list)
             for k, lbl in enumerate(labels): g[lbl].append(io_[k])
             for cl in g.values():
@@ -1332,10 +1399,7 @@ class ClasificadorSubtema:
             if len(ok) < 2: continue
             io_, M = zip(*ok)
             sim_matrix = cosine_similarity(np.array(M))
-            labels = AgglomerativeClustering(
-                n_clusters=None, distance_threshold=1 - umbral_cluster,
-                metric='precomputed', linkage='average'
-            ).fit(1 - sim_matrix).labels_
+            labels = agglomerative_clustering_precomputed(1 - sim_matrix, distance_threshold=1 - umbral_cluster, linkage='average')
             g = defaultdict(list)
             for k, lbl in enumerate(labels): g[lbl].append(io_[k])
             for cl in g.values():
@@ -1454,7 +1518,7 @@ class ClasificadorSubtema:
             "  2. USA preposiciones (de, del, para, sobre, en, por) para conectar conceptos.\n"
             "  3. SÉ ESPECÍFICO: describe el asunto real, no el actor.\n"
             "  4. Ciudades y regiones SÍ pueden aparecer si son relevantes al tema.\n"
-            "  5. Sin nombre de marcas privadas. Tildes y ñ correctas. "
+            "  5. Sin nombre de marcas privadas. Tildes y ñ correctas.\n"
             "  6. SIN MARCA: NO incluyas bajo ninguna circunstancia 'Universidad Nacional' ni 'UNAL' en el subtema.\n\n"
             "EJEMPLOS CORRECTOS: 'Proyecto de terminal de transportes', "
             "'Operación del Canal del Dique', 'Plan de infraestructura vial', "
@@ -1635,154 +1699,6 @@ class ClasificadorSubtema:
         except:
             return {s: s for s in subtemas_unicos}
 
-    def procesar_lote(self, col, pbar, res_puros, tit_puros):
-        textos   = col.tolist()
-        titulos  = tit_puros.tolist()
-        resumenes = res_puros.tolist()
-        n = len(textos)
-
-        self._umbrales = _umbrales_adaptativos(n)
-        u = self._umbrales
-        st.caption(
-            f"📐 Corpus: **{n}** noticias · Umbral subtema: **{u['subtema']}** · "
-            f"Sim mínima: **{u['sim_minima_agrupacion']}**"
-        )
-
-        et = [texto_para_embedding(titulos[i], resumenes[i]) for i in range(n)]
-
-        pbar.progress(0.05, "Fase 1 · Idénticas...")
-        dsu = DSU(n)
-        self._paso1(titulos, resumenes, dsu)
-        
-        pbar.progress(0.12, "Fase 2 · Títulos...")
-        self._paso2(titulos, dsu)
-
-        pbar.progress(0.18, "Embeddings...")
-        ae = get_embeddings_batch(et)
-
-        if u['usar_paso2b']:
-            pbar.progress(0.15, "Fase 2b · Keywords raras (con validación semántica)...")
-            self._paso2b_keywords(titulos, dsu, ae)
-
-        pbar.progress(0.20, "Fase 3 · Clustering...")
-        self._paso3(et, ae, dsu, pbar, 0.20)
-
-        gf = dsu.grupos(n)
-        ng = len(gf)
-        pbar.progress(0.55, f"Fase 4 · Etiquetando {ng} grupos...")
-        mapa = {}
-        sg = sorted(gf.items(), key=lambda x: -len(x[1]))
-        subtemas_aprobados = [] 
-
-        for k, (lid, idxs) in enumerate(sg):
-            if k % 10 == 0: pbar.progress(0.55 + 0.25 * (k / max(ng, 1)), f"Etiquetando {k + 1}/{ng}...")
-            
-            if len(idxs) > MAX_GRUPO_ETIQUETA:
-                subgrupos = [idxs[i:i + MAX_GRUPO_ETIQUETA] for i in range(0, len(idxs), MAX_GRUPO_ETIQUETA)]
-                for sg_ in subgrupos:
-                    e = self._generar_etiqueta(
-                        [textos[i] for i in sg_],
-                        [titulos[i] for i in sg_],
-                        [resumenes[i] for i in sg_],
-                        subtemas_existentes=subtemas_aprobados
-                    )
-                    if e not in subtemas_aprobados: subtemas_aprobados.append(e)
-                    for i in sg_: mapa[i] = e
-            else:
-                e = self._generar_etiqueta(
-                    [textos[i] for i in idxs],
-                    [titulos[i] for i in idxs],
-                    [resumenes[i] for i in idxs],
-                    subtemas_existentes=subtemas_aprobados
-                )
-                if e not in subtemas_aprobados: subtemas_aprobados.append(e)
-                for i in idxs: mapa[i] = e
-
-        subtemas = [mapa.get(i, "Varios") for i in range(n)]
-
-        pbar.progress(0.80, "Fase 4b · Coherencia etiqueta↔texto...")
-        umbral_coherencia = u['coherencia_etiqueta']
-        subtemas_unicos = list(set(subtemas))
-        embs_sub_lista = get_embeddings_batch(subtemas_unicos)
-        emb_subtemas = {sub: emb for sub, emb in zip(subtemas_unicos, embs_sub_lista) if emb is not None}
-
-        incoherentes = 0
-        for i in range(n):
-            sub = subtemas[i]
-            emb_txt = ae[i]
-            emb_sub = emb_subtemas.get(sub)
-            if emb_txt is None or emb_sub is None: continue
-            sim = cosine_similarity(np.array(emb_txt).reshape(1, -1), np.array(emb_sub).reshape(1, -1))[0][0]
-            if sim < umbral_coherencia:
-                mejor_sub, mejor_sim = sub, sim
-                for otro_sub, emb_otro in emb_subtemas.items():
-                    if otro_sub == sub: continue
-                    sim_otro = cosine_similarity(np.array(emb_txt).reshape(1, -1), np.array(emb_otro).reshape(1, -1))[0][0]
-                    if sim_otro > mejor_sim: mejor_sim = sim_otro; mejor_sub = otro_sub
-                if mejor_sub != sub and mejor_sim > umbral_coherencia:
-                    subtemas[i] = mejor_sub
-                else:
-                    nueva = self._generar_etiqueta([textos[i]], [titulos[i]], [resumenes[i]], subtemas_existentes=subtemas_aprobados)
-                    subtemas[i] = capitalizar_etiqueta(nueva)
-                    if nueva not in subtemas_aprobados: subtemas_aprobados.append(nueva)
-                incoherentes += 1
-
-        pbar.progress(0.82, "Fase 5 · Dedup...")
-        subtemas = dedup_labels(subtemas, u['dedup_label'])
-
-        pbar.progress(0.86, "Fase 5b · Fusión semántica...")
-        textos_por_sub = defaultdict(list)
-        for i, s in enumerate(subtemas): textos_por_sub[s].append(textos[i])
-        subtemas = _fusionar_subtemas_semanticos(subtemas, textos_por_sub, self.marca, self.aliases, u['fusion_subtemas'])
-
-        pbar.progress(0.90, "Fase 6 · Consistencia...")
-        subtemas = self._consistencia(subtemas, ae, pbar, u)
-
-        indices_reclass = [i for i, s in enumerate(subtemas) if s == "_RECLASSIFICAR"]
-        if indices_reclass:
-            pbar.progress(0.93, f"Fase 6b · Reclasificando...")
-            for i in indices_reclass:
-                et_ind = self._generar_etiqueta([textos[i]], [titulos[i]], [resumenes[i]], subtemas_existentes=subtemas_aprobados)
-                subtemas[i] = capitalizar_etiqueta(et_ind)
-                if et_ind not in subtemas_aprobados: subtemas_aprobados.append(et_ind)
-
-        pbar.progress(0.93, "Fase 7 · Completitud...")
-        subtemas = self._validar_completitud_final(subtemas, textos, titulos, resumenes)
-
-        pbar.progress(0.97, "Fase 8 · Dedup final...")
-        subtemas = dedup_labels(subtemas, u['dedup_label'])
-        
-        pbar.progress(0.99, "Consolidación final IA de sinónimos...")
-        unicos_finales = list(dict.fromkeys(subtemas))
-        if 1 < len(unicos_finales) <= 50:
-            mapa_sinonimos = self._consolidar_sinonimos_llm(unicos_finales)
-            subtemas = [mapa_sinonimos.get(s, s) for s in subtemas]
-
-        subtemas = [capitalizar_etiqueta(s) for s in subtemas]
-        nf = len(set(subtemas))
-        pbar.progress(1.0, f"{nf} subtemas")
-        st.info(f"Subtemas: **{nf}** · Grupos originales: **{ng}**")
-        return subtemas
-
-    def _validar_completitud_final(self, subtemas, textos, titulos, resumenes):
-        por_subtema = defaultdict(list)
-        for i, s in enumerate(subtemas): por_subtema[s].append(i)
-        resultado = list(subtemas)
-        for sub, idxs in por_subtema.items():
-            if _frase_esta_completa(sub): continue
-            recortada = _recortar_frase_completa(sub)
-            if _frase_esta_completa(recortada) and len(recortada.split()) >= 2:
-                for i in idxs: resultado[i] = capitalizar_etiqueta(recortada)
-                continue
-            tit_grp = [titulos[i] for i in idxs[:6]]
-            res_grp = [resumenes[i] for i in idxs[:3]]
-            nueva = _validar_etiqueta_completa(
-                sub, titulos_grp=tit_grp, resumenes_grp=res_grp,
-                marca=self.marca, aliases=self.aliases, fallback_fn=self._fallback
-            )
-            for i in idxs: resultado[i] = capitalizar_etiqueta(nueva)
-        return resultado
-
     def _consistencia(self, subtemas, ae, pbar, umbrales=None):
         min_sub = umbrales.get('min_pertenencia_subtema', UMBRAL_MIN_PERTENENCIA_SUBTEMA)
         ps = defaultdict(list)
@@ -1812,6 +1728,7 @@ class ClasificadorSubtema:
                 if bs != sub: r[oi] = bs
                 elif sv < min_sub: r[oi] = "_RECLASSIFICAR"
         return r
+
 
 # ======================================
 # TEMAS  
@@ -1865,7 +1782,7 @@ def _generar_nombre_tema_llm(subtemas_grupo, textos_muestra, titulos_muestra):
         "  3. NUNCA incluyas números, cantidades ni nombres propios.\n"
         "  4. 2-4 palabras. Sustantivo + adjetivo o sustantivo solo.\n"
         "  5. Tildes y ñ correctas. "
-        "  6. SIN MARCA: NO incluyas bajo ninguna circunstancia 'Universidad Nacional' ni 'UNAL'.\n\n"
+        "  6. SIN MARCA: NO incluyas bajo ninguna circunstancia 'Universidad Nacional' ni 'UNAL' en la sección editorial.\n\n"
         "CORRECTO: 'Política', 'Gestión legislativa', 'Justicia penal', 'Regulación financiera'\n"
         "INCORRECTO: 'Cinco congresistas con líos', 'Congresistas electos', 'Investigación disciplinaria congreso', 'Nuevo acuerdo'\n\n"
         'JSON: {"tema":"..."}'
@@ -1958,16 +1875,12 @@ def consolidar_temas(subtemas, textos, pbar):
     np.fill_diagonal(dist_matrix, 0)
     umbral_tema = u['tema']
     num_temas_max = u['num_temas_max']
-    linkage_temas = 'complete' if len(vs) <= 6 else 'average'
-    cl = AgglomerativeClustering(
-        n_clusters=None, distance_threshold=1 - umbral_tema,
-        metric='precomputed', linkage=linkage_temas
-    ).fit(dist_matrix)
-    if len(set(cl.labels_)) > num_temas_max:
-        cl = AgglomerativeClustering(n_clusters=num_temas_max, metric='precomputed', linkage=linkage_temas).fit(dist_matrix)
+    cl_labels = agglomerative_clustering_precomputed(dist_matrix, distance_threshold=1 - umbral_tema, linkage='average')
+    if len(set(cl_labels)) > num_temas_max:
+        cl_labels = agglomerative_clustering_precomputed(dist_matrix, n_clusters=num_temas_max, linkage='average')
 
     clusters = defaultdict(list)
-    for i, lbl in enumerate(cl.labels_): clusters[lbl].append(vs[i])
+    for i, lbl in enumerate(cl_labels): clusters[lbl].append(vs[i])
     uc = [s for s in us if s not in vs]
     mt = {}
     tc = len(clusters)
@@ -2050,69 +1963,6 @@ def consolidar_temas(subtemas, textos, pbar):
     st.info(f"Temas: **{len(set(tf_validado))}** (de {len(set(subtemas))} subtemas) · Máx: {num_temas_max}")
     pbar.progress(1.0, "Temas listos")
     return tf_validado
-
-def _fusionar_temas_contenidos(temas: List[str]) -> Dict[str, str]:
-    unique = list(dict.fromkeys(temas))
-    if len(unique) < 2: return {}
-    normed = {t: string_norm_label(t) for t in unique}
-    mapa: Dict[str, str] = {}
-    for i, ta in enumerate(unique):
-        for tb in unique[i + 1:]:
-            na, nb = normed[ta], normed[tb]
-            if not na or not nb: continue
-            if (f" {na} " in f" {nb} ") or nb == na or nb.startswith(na + " ") or nb.endswith(" " + na):
-                canon = tb if len(tb) >= len(ta) else ta
-                reemplazar = ta if canon == tb else tb
-                mapa[reemplazar] = canon
-            elif (f" {nb} " in f" {na} ") or na.startswith(nb + " ") or na.endswith(" " + nb):
-                canon = ta if len(ta) >= len(tb) else tb
-                reemplazar = tb if canon == ta else ta
-                mapa[reemplazar] = canon
-    umbral_relajado = 0.70
-    candidatos = [(t, normed[t]) for t in unique if len(t.split()) <= 3 and t not in mapa]
-    if len(candidatos) >= 2:
-        textos_c = [t for t, _ in candidatos]
-        embs = get_embeddings_batch(textos_c)
-        validos = [(textos_c[i], embs[i]) for i in range(len(textos_c)) if embs[i] is not None]
-        if len(validos) >= 2:
-            etqs, vecs = zip(*validos)
-            sim = cosine_similarity(np.array(vecs))
-            for i in range(len(etqs)):
-                for j in range(i + 1, len(etqs)):
-                    if sim[i][j] >= umbral_relajado:
-                        ta, tb = etqs[i], etqs[j]
-                        if ta in mapa or tb in mapa: continue
-                        words_a = set(normed[ta].split())
-                        words_b = set(normed[tb].split())
-                        if words_a & words_b:
-                            freq = Counter(temas)
-                            canon = ta if freq.get(ta, 0) >= freq.get(tb, 0) else tb
-                            reemplazar = tb if canon == ta else ta
-                            mapa[reemplazar] = canon
-    return mapa
-
-def _post_validar_tema_vs_subtema(temas, subtemas):
-    tema_a_subtemas = defaultdict(set)
-    for t, s in zip(temas, subtemas): tema_a_subtemas[t].add(s)
-    reemplazos = {}
-    for tema, subs in tema_a_subtemas.items():
-        if len(subs) == 1:
-            sub_unico = list(subs)[0]
-            tn = string_norm_label(tema)
-            sn = string_norm_label(sub_unico)
-            if tn and sn and SequenceMatcher(None, tn, sn).ratio() >= 0.80:
-                nuevo = _regenerar_tema_diferente([sub_unico], [])
-                if nuevo and not _tema_es_igual_a_subtema(nuevo, [sub_unico]) and _frase_esta_completa(nuevo):
-                    reemplazos[tema] = capitalizar_etiqueta(nuevo)
-    return [reemplazos.get(t, t) for t in temas] if reemplazos else temas
-
-def _unificar_tema_por_subtema(temas, subtemas):
-    sub_to_temas = defaultdict(list)
-    for t, s in zip(temas, subtemas): sub_to_temas[s].append(t)
-    sub_to_best = {}
-    for sub, tema_list in sub_to_temas.items():
-        sub_to_best[sub] = Counter(tema_list).most_common(1)[0][0]
-    return [sub_to_best[s] for s in subtemas]
 
 def consolidar_temas_fuzz(rows: List[Dict], km: Dict[str, str], umbral_similitud=85) -> Dict[str, str]:
     tema_key = km.get("tema")
