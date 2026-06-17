@@ -1,109 +1,491 @@
-# ==============================================================================
-# ANÁLISIS DE TONO Y TEMA PARA UNIVERSIDAD NACIONAL - APP STREAMLIT (OPTIMIZADO)
-# ==============================================================================
-
+# ======================================
+# Importaciones
+# ======================================
 import streamlit as st
 import pandas as pd
 from openpyxl import load_workbook, Workbook
-from openpyxl.styles import Font, Alignment
-from collections import defaultdict
+from openpyxl.styles import Font, NamedStyle, Alignment
+from collections import defaultdict, Counter
+from difflib import SequenceMatcher
 from copy import deepcopy
 import datetime
 import io
+import openai
 import re
-import json
 import time
 from unidecode import unidecode
-from typing import List, Dict, Any, Tuple
-import warnings
-from openai import OpenAI
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache
-from thefuzz import fuzz
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.cluster import AgglomerativeClustering
+import json
+import asyncio
+import hashlib
+from typing import List, Dict, Tuple, Optional, Any
+import joblib
+import gc
+import requests
+import os
+import zipfile
+import xml.etree.ElementTree as ET
+import html
 from pathlib import Path
+from thefuzz import fuzz
 
-warnings.filterwarnings('ignore')
-
-# ==============================================================================
-# CONFIGURACIÓN DE LA PÁGINA DE STREAMLIT
-# ==============================================================================
+# ======================================
+# Configuración general
+# ======================================
 st.set_page_config(
-    page_title="Análisis de Tono y Tema UNAL",
+    page_title="Análisis de Noticias UNAL · IA",
     page_icon="🎓",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
-# CSS personalizado para la interfaz
-st.markdown("""
+OPENAI_MODEL_EMBEDDING     = "text-embedding-3-small"
+OPENAI_MODEL_CLASIFICACION = "gpt-4.1-nano-2025-04-14"
+
+CONCURRENT_REQUESTS          = 50
+SIMILARITY_THRESHOLD_TONO    = 0.82
+SIMILARITY_THRESHOLD_TITULOS = 0.93
+
+# ── Umbrales base (corpus grande ≥ 20 noticias) ──────────────────────────────
+UMBRAL_SUBTEMA = 0.78
+UMBRAL_TEMA    = 0.72
+NUM_TEMAS_MAX  = 15
+
+UMBRAL_DEDUP_LABEL           = 0.78
+UMBRAL_FUSION_SUBTEMAS       = 0.78
+UMBRAL_FUSION_INTERGRUPO     = 0.84
+MAX_ITER_FUSION              = 5
+
+UMBRAL_MIN_PERTENENCIA_SUBTEMA = 0.60
+UMBRAL_MIN_PERTENENCIA_TEMA    = 0.52
+
+UMBRAL_COHERENCIA_ETIQUETA   = 0.35
+
+MAX_GRUPO_ETIQUETA           = 40
+
+# ── Umbrales mínimos de similitud REAL para agrupar ──────────────────────────
+SIM_MINIMA_AGRUPACION_SUBTEMA = 0.82   
+SIM_MINIMA_KEYWORDS_RARAS     = 0.78   
+SIM_MINIMA_FUSION_INTER       = 0.88   
+
+PRICE_INPUT_1M     = 0.10
+PRICE_OUTPUT_1M    = 0.40
+PRICE_EMBEDDING_1M = 0.02
+
+if 'tokens_input'     not in st.session_state: st.session_state['tokens_input']     = 0
+if 'tokens_output'    not in st.session_state: st.session_state['tokens_output']    = 0
+if 'tokens_embedding' not in st.session_state: st.session_state['tokens_embedding'] = 0
+
+STOPWORDS_ES = set("""
+a ante bajo cabe con contra de desde durante en entre hacia hasta mediante
+para por segun sin so sobre tras y o u e la el los las un una unos unas lo
+al del se su sus le les mi mis tu tus nuestro nuestros vuestra vuestras este
+esta estos estas ese esa esos esas aquel aquella aquellos aquellas que cual
+cuales quien quienes cuyo cuya cuyos cuyas como cuando donde cual es son fue
+fueron era eran sera seran seria serian he ha han habia han hay hubo habra
+habria estoy esta estan estaba estaban estamos estan estar estare estaria
+estuvieron estarian estuvo asi ya mas menos tan tanto cada muy todo toda todos
+todas ser haber hacer tener poder deber ir dar ver saber querer llegar pasar
+encontrar creer decir poner salir volver seguir llevar sentir cambiar
+""".split())
+
+_TRAILING_INCOMPLETE = {
+    "de","del","la","el","los","las","un","una","unos","unas","al","su","sus",
+    "en","con","sin","por","para","sobre","ante","bajo","contra","desde",
+    "entre","hacia","hasta","mediante","tras","y","o","u","e","lo","que","se",
+    "como","donde","cuando","cual","cuyo","cuya","cuyos","cuyas",
+    "este","esta","estos","estas","ese","esa","esos","esas",
+    "aquel","aquella","aquellos","aquellas","cada","todo","toda","todos","todas",
+    "otro","otra","otros","otras","nuevo","nueva","nuevos","nuevas",
+    "gran","grandes","mayor","mayores","menor","menores","mejor","mejores",
+    "peor","peores","primer","primera","segundo","segunda","tercer","tercera",
+    "más","mas","muy","tan","tanto","tanta","tantos","tantas",
+    "mi","mis","tu","tus","nuestro","nuestra","nuestros","nuestras",
+    "a","ha","he","ser","estar","haber","hacer","tener","poder","deber",
+    "ir","dar","ver","saber","querer","llegar","pasar","decir","poner",
+}
+
+_PATRON_TITULAR = re.compile(
+    r"^(nuevo|nueva|anuncia|lanza|presenta|inaugura|llega|abre|inicia|"
+    r"logra|alcanza|supera|confirma|destaca|revela|señala|advierte|"
+    r"lanzamiento|anuncio|apertura|inicio|presentacion|presentación)\b",
+    re.IGNORECASE
+)
+_PATRON_ESTADO = re.compile(
+    r"\b(calma|caos|urgente|hoy|ya|ahora|ayer|mañana|nuevo|nueva|"
+    r"gran|grande|importante|especial|exclusivo)\s*$",
+    re.IGNORECASE
+)
+
+_TILDE_MAP = {
+    "regulacion":"regulación","regulaciones":"regulaciones","innovacion":"innovación",
+    "innovaciones":"innovaciones","tecnologia":"tecnología","tecnologias":"tecnologías",
+    "tecnologica":"tecnológica","tecnologico":"tecnológico","educacion":"educación",
+    "gestion":"gestión","administracion":"administración","informacion":"información",
+    "comunicacion":"comunicación","comunicaciones":"comunicaciones","operacion":"operación",
+    "operaciones":"operaciones","inversion":"inversión","inversiones":"inversiones",
+    "expansion":"expansión","adquisicion":"adquisición","adquisiciones":"adquisiciones",
+    "fusion":"fusión","fusiones":"fusiones","transicion":"transición",
+    "transformacion":"transformación","digitalizacion":"digitalización",
+    "automatizacion":"automatización","modernizacion":"modernización",
+    "optimizacion":"optimización","implementacion":"implementación","evaluacion":"evaluación",
+    "planificacion":"planificación","organizacion":"organización","atencion":"atención",
+    "produccion":"producción","construccion":"construcción","distribucion":"distribución",
+    "exportacion":"exportación","importacion":"importación","comercializacion":"comercialización",
+    "negociacion":"negociación","negociaciones":"negociaciones","participacion":"participación",
+    "colaboracion":"colaboración","asociacion":"asociación","integracion":"integración",
+    "relacion":"relación","relaciones":"relaciones","situacion":"situación",
+    "condicion":"condición","condiciones":"condiciones","solucion":"solución",
+    "soluciones":"soluciones","prevencion":"prevención","proteccion":"protección",
+    "fiscalizacion":"fiscalización","sancion":"sanción","sanciones":"sanciones",
+    "investigacion":"investigación","investigaciones":"investigaciones","accion":"acción",
+    "acciones":"acciones","direccion":"dirección","decision":"decisión",
+    "decisiones":"decisiones","eleccion":"elección","elecciones":"elecciones",
+    "votacion":"votación","aprobacion":"aprobación","legislacion":"legislación",
+    "reclamacion":"reclamación","reclamaciones":"reclamaciones","obligacion":"obligación",
+    "obligaciones":"obligaciones","inflacion":"inflación","tributacion":"tributación",
+    "financiera":"financiera","financiero":"financiero","economica":"económica",
+    "economico":"económico","economia":"economía","credito":"crédito",
+    "creditos":"créditos","prestamo":"préstamo","prestamos":"préstamos",
+    "interes":"interés","comision":"comisión","comisiones":"comisiones",
+    "politica":"política","politicas":"políticas","politico":"político",
+    "publica":"pública","publico":"público","estrategia":"estrategia",
+    "estrategica":"estratégica","estrategico":"estratégico","logistica":"logística",
+    "analisis":"análisis","diagnostico":"diagnóstico","indice":"índice",
+    "vehiculo":"vehículo","vehiculos":"vehículos","electrico":"eléctrico",
+    "electrica":"eléctrica","energia":"energía","energetica":"energética",
+    "petroleo":"petróleo","mineria":"minería","agricola":"agrícola",
+    "biologica":"biológica","ecologica":"ecológica","inclusion":"inclusión",
+    "exclusion":"exclusión","pension":"pensión","pensiones":"pensiones",
+    "jubilacion":"jubilación","compensacion":"compensación","remuneracion":"remuneración",
+    "contratacion":"contratación","capacitacion":"capacitación","formacion":"formación",
+    "certificacion":"certificación","habilitacion":"habilitación","autorizacion":"autorización",
+    "concesion":"concesión","licitacion":"licitación","migracion":"migración",
+    "poblacion":"población","recaudacion":"recaudación","asignacion":"asignación",
+    "corporacion":"corporación","fundacion":"fundación","institucion":"institución",
+    "instituciones":"instituciones","region":"región","unico":"único","unica":"única",
+    "ultimo":"último","ultima":"última","proximo":"próximo","basico":"básico",
+    "basica":"básica","historico":"histórico","historica":"histórica",
+    "medico":"médico","medica":"médica","farmaceutica":"farmacéutica",
+    "clinica":"clínica","numero":"número","telefono":"teléfono","telefonia":"telefonía",
+    "movil":"móvil","moviles":"móviles","codigo":"código","informatica":"informática",
+    "electronica":"electrónica","robotica":"robótica","ciberseguridad":"ciberseguridad",
+    "trafico":"tráfico","transito":"tránsito","aereo":"aéreo","maritimo":"marítimo",
+    "turistica":"turística","turistico":"turístico","gastronomia":"gastronomía",
+    "academica":"académica","academico":"académico","pedagogica":"pedagógica",
+    "cientifica":"científica","cientifico":"científico","juridica":"jurídica",
+    "juridico":"jurídico","constitucion":"constitución","resolucion":"resolución",
+    "notificacion":"notificación","programacion":"programación","actualizacion":"actualización",
+    "verificacion":"verificación","validacion":"validación","liquidacion":"liquidación",
+    "facturacion":"facturación","evasion":"evasión","corrupcion":"corrupción",
+    "deforestacion":"deforestación","contaminacion":"contaminación","conservacion":"conservación",
+    "restauracion":"restauración","rehabilitacion":"rehabilitación","renovacion":"renovación",
+    "ampliacion":"ampliación","inauguracion":"inauguración","celebracion":"celebración",
+    "clasificacion":"clasificación","eliminacion":"eliminación","motivacion":"motivación",
+    "satisfaccion":"satisfacción","reputacion":"reputación","disposicion":"disposición",
+}
+
+_ENIE_MAP = {
+    "desempeno":"desempeño","desempenos":"desempeños","empeno":"empeño","empenos":"empeños",
+    "ensenanza":"enseñanza","ensenanzas":"enseñanzas","diseno":"diseño","disenos":"diseños",
+    "disenador":"diseñador","disenadora":"diseñadora","disenadores":"diseñadores",
+    "nino":"niño","nina":"niña","ninos":"niños","ninas":"niñas","ninez":"niñez",
+    "ano":"año","anos":"años","danio":"daño","danios":"daños","dano":"daño","danos":"daños",
+    "danino":"dañino","danina":"dañina","montana":"montaña","montanas":"montañas",
+    "espana":"España","espanol":"español","espanola":"española","espanoles":"españoles",
+    "companero":"compañero","companera":"compañera","companeros":"compañeros","companeras":"compañeras",
+    "compania":"compañía","companias":"compañías","acompanamiento":"acompanamiento",
+    "cana":"caña","canas":"cañas","banio":"baño","banios":"baños","bano":"baño","banos":"baños",
+    "pena":"peña","penas":"peñas","penon":"peñón","senor":"señor","senora":"señora",
+    "senores":"señores","senoras":"señoras","senal":"señal","senales":"señales",
+    "senalizacion":"señalización","pequeno":"pequeño","pequena":"pequeña",
+    "pequenos":"pequeños","pequenas":"peñas","sueno":"sueño","suenos":"sueños",
+    "dueno":"dueño","duena":"dueña","duenos":"dueños","duenas":"dueñas",
+    "otono":"otoño","punio":"puño","punios":"puños","puno":"puño",
+    "canon":"cañón","canones":"cañones","manana":"mañana","mananas":"mañanas",
+    "cabana":"cabaña","cabanas":"cabañas","banera":"bañera","vinedo":"viñedo",
+    "vinedos":"viñedos","rebano":"rebaño","rebanos":"rebaños","extrano":"extraño",
+    "extrana":"extraña","extranos":"extraños","extranas":"extrañas",
+    "enganio":"engaño","engano":"engaño","enganos":"engaños","tamanio":"tamaño",
+    "tamano":"tamaño","tamanos":"tamaños","muneca":"muñeca","munecas":"muñecas",
+    "cunado":"cuñado","cunada":"cuñada","cunados":"cuñados","albanil":"albañil",
+    "albaniles":"albañiles","narino":"Nariño","quindio":"Quindío",
+    "ibanez":"Ibáñez","nunez":"Núñez","munoz":"Muñoz","ordonez":"Ordóñez",
+    "yanez":"Yáñez","castaneda":"Castañeda","penalosa":"Peñalosa",
+    "vineta":"viñeta","vinetas":"viñetas","banado":"bañado","banada":"bañada",
+    "rinon":"riñón","rinones":"riñones","panial":"pañal","paniales":"pañales",
+    "panal":"pañal","panales":"pañales","arana":"araña","aranas":"arañas",
+    "pestana":"pestaña","pestanas":"pestañas","guino":"guiño","guinos":"guiños",
+    "munequera":"muñequera","lenador":"leñador","lenadores":"leñadores",
+    "resena":"reseña","resenas":"reseñas","panuelo":"pañuelo","panuelos":"pañuelos",
+    "companerismo":"compañerismo","desengano":"desengaño","lenio":"leño","leno":"leño",
+}
+
+def corregir_tildes(texto: str) -> str:
+    if not texto: return texto
+    palabras = texto.split()
+    resultado = []
+    for p in palabras:
+        low = p.lower()
+        if low in _TILDE_MAP:
+            c = _TILDE_MAP[low]
+            if p[0].isupper() and not c[0].isupper(): c = c[0].upper() + c[1:]
+            resultado.append(c)
+        elif low in _ENIE_MAP:
+            c = _ENIE_MAP[low]
+            if p[0].isupper() and not c[0].isupper(): c = c[0].upper() + c[1:]
+            resultado.append(c)
+        else:
+            resultado.append(p)
+    return " ".join(resultado)
+
+
+# ======================================
+# CSS
+# ======================================
+def load_custom_css():
+    st.markdown("""
 <style>
-    .main-header {
-        background: linear-gradient(90deg, #1e3a8a 0%, #3b82f6 100%);
-        padding: 20px;
-        border-radius: 10px;
-        color: white;
-        text-align: center;
-        margin-bottom: 30px;
-    }
-    .metric-card {
-        background: #f8fafc;
-        padding: 20px;
-        border-radius: 10px;
-        border-left: 4px solid #3b82f6;
-        margin: 10px 0;
-    }
-    .success-box {
-        background: #dcfce7;
-        border-left: 4px solid #22c55e;
-        padding: 15px;
-        border-radius: 5px;
-        margin: 10px 0;
-    }
-    .info-box {
-        background: #dbeafe;
-        border-left: 4px solid #3b82f6;
-        padding: 15px;
-        border-radius: 5px;
-        margin: 10px 0;
-    }
-    .stProgress > div > div > div > div {
-        background: linear-gradient(90deg, #3b82f6 0%, #8b5cf6 100%);
-    }
+@import url('https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Google+Sans+Text:wght@400;500;700&family=Roboto+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+:root {
+    --bg:#f8f9fa;--s1:#ffffff;--s2:#f1f3f4;--s3:#e8eaed;
+    --border:#dadce0;--border2:#bdc1c6;--border-focus:#f97316;
+    --text:#202124;--text2:#3c4043;--text3:#5f6368;--text4:#9aa0a6;
+    --accent:#f97316;--accent2:#ea580c;--accent3:#c2410c;
+    --accent-bg:#fff7ed;--accent-bg2:#ffedd5;--accent-bdr:#fed7aa;
+    --green:#059669;--green2:#047857;--green-bg:#ecfdf5;--green-bdr:#a7f3d0;
+    --red:#dc2626;--amber:#d97706;--blue:#1a73e8;
+    --r:8px;--r2:12px;--r3:16px;--r4:20px;
+    --shadow-sm:0 1px 2px rgba(60,64,67,0.1),0 1px 3px rgba(60,64,67,0.08);
+    --shadow-md:0 1px 3px rgba(60,64,67,0.12),0 4px 8px rgba(60,64,67,0.08);
+    --shadow-lg:0 2px 6px rgba(60,64,67,0.1),0 8px 24px rgba(60,64,67,0.1);
+    --transition:all 0.2s cubic-bezier(0.4,0,0.2,1);
+}
+html,body,[data-testid="stApp"]{
+    background:var(--bg)!important;color:var(--text)!important;
+    font-family:'Google Sans Text','Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+    font-size:14px;-webkit-font-smoothing:antialiased;letter-spacing:0.01em;
+}
+#MainMenu,footer,header{visibility:hidden}.stDeployButton{display:none}
+.block-container{padding-top:1rem!important;padding-bottom:0!important}
+[data-testid="stAppViewBlockContainer"]{padding-top:1rem!important}
+.app-header{background:var(--s1);border:1px solid var(--border);border-radius:var(--r3);padding:1rem 1.5rem;margin-bottom:1rem;display:flex;align-items:center;gap:1rem;box-shadow:var(--shadow-sm);position:relative;overflow:hidden;}
+.app-header::after{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,#1e3a8a,#3b82f6,#60a5fa);}
+.app-header-icon{width:40px;height:40px;background:linear-gradient(135deg,#1e3a8a,#3b82f6);border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:1.2rem;color:white;flex-shrink:0;box-shadow:0 2px 8px rgba(30,58,138,0.3);}
+.app-header-text{flex:1}
+.app-header-title{font-family:'Google Sans',sans-serif;font-size:1.25rem;font-weight:700;color:var(--text);letter-spacing:-0.01em;line-height:1.3}
+.app-header-version{font-family:'Roboto Mono',monospace;font-size:0.65rem;color:var(--text3);letter-spacing:0.03em;margin-top:0.15rem}
+.app-header-badge{background:var(--accent-bg);border:1px solid var(--accent-bdr);color:var(--accent2);font-family:'Roboto Mono',monospace;font-size:0.6rem;font-weight:500;padding:0.25rem 0.75rem;border-radius:100px;letter-spacing:0.04em;text-transform:uppercase;white-space:nowrap;}
+[data-testid="stTabs"] [data-testid="stTabsList"]{background:var(--s1)!important;border:1px solid var(--border)!important;border-radius:var(--r2)!important;padding:4px!important;gap:4px!important;box-shadow:var(--shadow-sm)!important;margin-bottom:0.75rem!important;}
+[data-testid="stTabs"] button[data-baseweb="tab"]{font-family:'Google Sans',sans-serif!important;font-size:0.88rem!important;font-weight:500!important;color:var(--text2)!important;border-radius:var(--r)!important;padding:0.45rem 1.2rem!important;border:none!important;background:transparent!important;transition:var(--transition)!important;}
+[data-testid="stTabs"] button[data-baseweb="tab"]:hover{background:var(--s2)!important;color:var(--text)!important}
+[data-testid="stTabs"] button[data-baseweb="tab"][aria-selected="true"]{background:var(--accent-bg)!important;color:var(--accent2)!important;border:1px solid var(--accent-bdr)!important;font-weight:700!important;}
+.metrics-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:0.6rem;margin:0.8rem 0}
+.metric-card{background:var(--s1);border:1px solid var(--border);border-radius:var(--r2);padding:0.8rem 0.6rem;text-align:center;transition:var(--transition);box-shadow:var(--shadow-sm);position:relative;overflow:hidden;}
+.metric-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;border-radius:var(--r2) var(--r2) 0 0}
+.metric-card.m-total::before{background:linear-gradient(90deg,#5f6368,#9aa0a6)}
+.metric-card.m-unique::before{background:linear-gradient(90deg,#059669,#34d399)}
+.metric-card.m-dup::before{background:linear-gradient(90deg,#f59e0b,#fbbf24)}
+.metric-card.m-time::before{background:linear-gradient(90deg,#1a73e8,#4285f4)}
+.metric-card.m-cost::before{background:linear-gradient(90deg,#f97316,#fb923c)}
+.metric-card:hover{transform:translateY(-2px);box-shadow:var(--shadow-lg)}
+.metric-val{font-family:'Google Sans',sans-serif;font-size:1.5rem;font-weight:700;line-height:1;margin-bottom:0.3rem;letter-spacing:-0.01em}
+.metric-lbl{font-family:'Roboto Mono',monospace;font-size:0.62rem;color:var(--text3);text-transform:uppercase;letter-spacing:0.08em;font-weight:500}
+[data-testid="stForm"]{background:var(--s1)!important;border:1px solid var(--border)!important;border-radius:var(--r3)!important;padding:1.2rem 1.5rem!important;box-shadow:var(--shadow-md)!important;}
+.sec-label{font-family:'Google Sans',sans-serif;font-size:0.72rem;font-weight:700;color:var(--text2);letter-spacing:0.08em;text-transform:uppercase;padding-bottom:0.3rem;border-bottom:2px solid var(--s3);margin:0.8rem 0 0.5rem;display:flex;align-items:center;gap:0.5rem;}
+.sec-label::before{content:'';display:inline-block;width:3px;height:12px;background:linear-gradient(180deg,#1e3a8a,#3b82f6);border-radius:2px}
+.upload-zone{display:grid;grid-template-columns:repeat(3,1fr);gap:0.6rem;margin:0.3rem 0}
+.upload-zone-card{background:var(--s1);border:1.5px dashed var(--border);border-radius:var(--r2);padding:0.6rem 0.8rem;display:flex;align-items:center;gap:0.6rem;transition:var(--transition);}
+.upload-zone-card:hover{border-color:var(--accent);border-style:solid;transform:translateY(-1px);box-shadow:var(--shadow-md)}
+.upload-zone-icon{width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:1rem;flex-shrink:0;}
+.upload-zone-icon.uz-dossier{background:#fff7ed;color:#f97316}
+.upload-zone-icon.uz-region{background:#ecfdf5;color:#059669}
+.upload-zone-icon.uz-internet{background:#eff6ff;color:#1a73e8}
+.upload-zone-text{flex:1;min-width:0}
+.upload-zone-title{font-family:'Google Sans',sans-serif;font-size:0.82rem;font-weight:700;color:var(--text);line-height:1.2}
+.upload-zone-desc{font-size:0.7rem;color:var(--text3);line-height:1.3}
+[data-testid="stFileUploader"]{background:var(--s1)!important;border:1.5px dashed var(--border)!important;border-radius:var(--r)!important;padding:0.4rem 0.6rem!important;transition:var(--transition)!important;min-height:auto!important;}
+[data-testid="stFileUploader"]:hover{border-color:var(--accent)!important;border-style:solid!important;background:var(--accent-bg)!important;}
+[data-testid="stFileUploader"] section{padding:0.2rem!important}
+[data-testid="stFileUploader"] section>div{font-size:0.78rem!important;color:var(--text2)!important}
+[data-testid="stFileUploader"] section small{font-size:0.7rem!important;color:var(--text3)!important}
+[data-testid="stFileUploader"] button{background:var(--accent-bg)!important;border:1px solid var(--accent-bdr)!important;color:var(--accent2)!important;font-weight:500!important;font-size:0.75rem!important;border-radius:100px!important;padding:0.25rem 0.8rem!important;font-family:'Google Sans',sans-serif!important;transition:var(--transition)!important;}
+[data-testid="stFileUploader"] button:hover{background:var(--accent)!important;color:white!important;border-color:var(--accent)!important}
+[data-testid="stTextInput"] input,[data-testid="stTextArea"] textarea{background:var(--s1)!important;border:1.5px solid var(--border)!important;color:var(--text)!important;border-radius:var(--r)!important;font-family:'Google Sans Text',sans-serif!important;font-size:0.9rem!important;padding:0.5rem 0.75rem!important;transition:var(--transition)!important;}
+[data-testid="stTextInput"] input:focus,[data-testid="stTextArea"] textarea:focus{border-color:var(--accent)!important;box-shadow:0 0 0 3px rgba(249,115,22,0.12)!important;}
+[data-testid="stTextInput"] input::placeholder,[data-testid="stTextArea"] textarea::placeholder{color:var(--text4)!important;font-size:0.85rem!important;}
+label[data-testid="stWidgetLabel"] p{font-family:'Google Sans',sans-serif!important;color:var(--text2)!important;font-size:0.82rem!important;font-weight:500!important;margin-bottom:0.15rem!important;}
+.stButton>button,[data-testid="stDownloadButton"]>button{background:var(--s1)!important;border:1.5px solid var(--border)!important;color:var(--text)!important;border-radius:100px!important;font-family:'Google Sans',sans-serif!important;font-weight:500!important;font-size:0.88rem!important;transition:var(--transition)!important;padding:0.5rem 1.2rem!important;box-shadow:none!important;}
+.stButton>button:hover,[data-testid="stDownloadButton"]>button:hover{border-color:var(--accent)!important;color:var(--accent2)!important;background:var(--accent-bg)!important;box-shadow:var(--shadow-sm)!important;transform:translateY(-1px)!important;}
+.stButton>button[kind="primary"],[data-testid="stDownloadButton"]>button[kind="primary"]{background:var(--accent)!important;border:none!important;color:#fff!important;font-weight:500!important;font-size:0.92rem!important;padding:0.6rem 1.5rem!important;box-shadow:0 1px 3px rgba(249,115,22,0.3),0 4px 12px rgba(249,115,22,0.15)!important;letter-spacing:0.01em!important;}
+.stButton>button[kind="primary"]:hover,[data-testid="stDownloadButton"]>button[kind="primary"]:hover{background:var(--accent2)!important;box-shadow:0 2px 6px rgba(234,88,12,0.35),0 8px 24px rgba(234,88,12,0.18)!important;transform:translateY(-1px)!important;color:#fff!important;}
+[data-testid="stRadio"] label{font-family:'Google Sans Text',sans-serif!important;color:var(--text)!important;font-size:0.88rem!important;font-weight:400!important;}
+[data-testid="stRadio"]{margin-bottom:0!important}
+[data-testid="stRadio"]>div{gap:0!important}
+[data-testid="stStatus"]{background:var(--s1)!important;border:1px solid var(--border)!important;border-radius:var(--r2)!important;font-family:'Roboto Mono',monospace!important;font-size:0.8rem!important;}
+[data-testid="stAlert"]{background:var(--s1)!important;border:1px solid var(--border)!important;border-radius:var(--r2)!important;color:var(--text2)!important;font-size:0.85rem!important;padding:0.6rem 0.8rem!important;}
+.success-banner{background:linear-gradient(135deg,#ecfdf5,#d1fae5);border:1px solid var(--green-bdr);border-left:4px solid var(--green);border-radius:var(--r2);padding:0.8rem 1.2rem;margin:0.5rem 0 0.8rem;display:flex;align-items:center;gap:0.8rem;}
+.success-icon{width:34px;height:34px;background:linear-gradient(135deg,#059669,#047857);border-radius:50%;display:flex;align-items:center;justify-content:center;color:white;font-size:1rem;flex-shrink:0;}
+.success-title{font-family:'Google Sans',sans-serif;font-size:1rem;font-weight:700;color:#047857;margin-bottom:0.1rem}
+.success-sub{font-size:0.8rem;color:var(--text2)}
+.auth-wrap{max-width:380px;margin:8vh auto 0;text-align:center}
+.auth-icon{width:60px;height:60px;background:linear-gradient(135deg,#1e3a8a,#3b82f6);border-radius:16px;display:inline-flex;align-items:center;justify-content:center;font-size:1.6rem;color:white;margin-bottom:1rem;box-shadow:0 4px 16px rgba(30,58,138,0.3);}
+.auth-title{font-family:'Google Sans',sans-serif;font-size:1.5rem;font-weight:700;color:var(--text);margin-bottom:0.3rem}
+.auth-sub{font-size:0.85rem;color:var(--text3);margin-bottom:2rem}
+.cluster-info{background:var(--accent-bg);border:1px solid var(--accent-bdr);border-radius:var(--r);padding:0.5rem 0.8rem;margin:0.4rem 0;font-family:'Roboto Mono',monospace;font-size:0.68rem;color:var(--text2);line-height:1.6;}
+.cluster-info b{color:var(--accent2);font-size:0.72rem}
+[data-testid="stProgressBar"]>div>div{background:linear-gradient(90deg,#1e3a8a,#3b82f6,#60a5fa)!important;border-radius:100px!important;height:5px!important;}
+[data-testid="stDataFrame"]{border:1px solid var(--border)!important;border-radius:var(--r2)!important;box-shadow:var(--shadow-sm)!important;overflow:hidden!important;}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:var(--s2);border-radius:3px}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--accent)}
+.footer{font-family:'Roboto Mono',monospace;font-size:0.6rem;color:var(--text4);text-align:center;padding:0.8rem 0 0.5rem;letter-spacing:0.04em;border-top:1px solid var(--s3);margin-top:1rem;}
+.stElementContainer{margin-bottom:0!important}
+[data-testid="stVerticalBlock"]>div{gap:0.3rem!important}
+[data-testid="stHorizontalBlock"]>div{gap:0.4rem!important}
+hr{border-color:var(--s3)!important;margin:0.5rem 0!important}
+[data-testid="stSelectbox"]>div>div{font-family:'Google Sans Text',sans-serif!important;font-size:0.88rem!important;color:var(--text)!important;}
+@media(max-width:768px){
+    .metrics-grid{grid-template-columns:repeat(2,1fr)}
+    .upload-zone{grid-template-columns:1fr}
+    .app-header{flex-direction:column;text-align:center;gap:0.5rem;padding:1rem}
+}
 </style>
 """, unsafe_allow_html=True)
 
-# ==============================================================================
-# FUNCIÓN DE AUTENTICACIÓN
-# ==============================================================================
-def check_password():
-    if "password_correct" in st.session_state and st.session_state["password_correct"]:
-        return True
 
-    st.markdown('<div class="main-header"><h1>🔐 Acceso Protegido</h1><p>Sistema de Análisis de Medios - UNAL</p></div>', unsafe_allow_html=True)
-    
-    with st.form("password_form"):
-        st.markdown("Por favor, introduce la contraseña para acceder a la aplicación.")
-        password = st.text_input("Contraseña", type="password", placeholder="Ingrese la contraseña")
-        submitted = st.form_submit_button("🚀 Ingresar", use_container_width=True)
+# ======================================
+# Umbrales adaptativos según tamaño del corpus
+# ======================================
+def _umbrales_adaptativos(n: int) -> dict:
+    if n <= 5:
+        return dict(
+            subtema=0.93,
+            tema=0.85,
+            dedup_label=0.90,
+            fusion_subtemas=0.92,
+            fusion_intergrupo=0.95,
+            min_pertenencia_subtema=0.80,
+            min_pertenencia_tema=0.75,
+            coherencia_etiqueta=0.50,
+            sim_minima_agrupacion=0.93,
+            sim_minima_keywords=0.93,
+            max_iter_fusion=1,
+            num_temas_max=n,
+            usar_paso2b=False,
+            usar_fusion_iterativa=False,
+        )
+    elif n <= 10:
+        return dict(
+            subtema=0.88,
+            tema=0.80,
+            dedup_label=0.85,
+            fusion_subtemas=0.87,
+            fusion_intergrupo=0.91,
+            min_pertenencia_subtema=0.72,
+            min_pertenencia_tema=0.65,
+            coherencia_etiqueta=0.42,
+            sim_minima_agrupacion=0.88,
+            sim_minima_keywords=0.88,
+            max_iter_fusion=2,
+            num_temas_max=min(n, 5),
+            usar_paso2b=False,
+            usar_fusion_iterativa=False,
+        )
+    elif n <= 20:
+        return dict(
+            subtema=0.83,
+            tema=0.76,
+            dedup_label=0.82,
+            fusion_subtemas=0.82,
+            fusion_intergrupo=0.88,
+            min_pertenencia_subtema=0.66,
+            min_pertenencia_tema=0.58,
+            coherencia_etiqueta=0.38,
+            sim_minima_agrupacion=0.84,
+            sim_minima_keywords=0.84,
+            max_iter_fusion=3,
+            num_temas_max=min(n // 2, NUM_TEMAS_MAX),
+            usar_paso2b=True,
+            usar_fusion_iterativa=True,
+        )
+    else:
+        return dict(
+            subtema=UMBRAL_SUBTEMA,
+            tema=UMBRAL_TEMA,
+            dedup_label=UMBRAL_DEDUP_LABEL,
+            fusion_subtemas=UMBRAL_FUSION_SUBTEMAS,
+            fusion_intergrupo=UMBRAL_FUSION_INTERGRUPO,
+            min_pertenencia_subtema=UMBRAL_MIN_PERTENENCIA_SUBTEMA,
+            min_pertenencia_tema=UMBRAL_MIN_PERTENENCIA_TEMA,
+            coherencia_etiqueta=UMBRAL_COHERENCIA_ETIQUETA,
+            sim_minima_agrupacion=SIM_MINIMA_AGRUPACION_SUBTEMA,
+            sim_minima_keywords=SIM_MINIMA_KEYWORDS_RARAS,
+            max_iter_fusion=MAX_ITER_FUSION,
+            num_temas_max=NUM_TEMAS_MAX,
+            usar_paso2b=True,
+            usar_fusion_iterativa=True,
+        )
 
-        if submitted:
-            correct_password = st.secrets.get("APP_PASSWORD")
-            if not correct_password:
-                st.error("❌ Error de configuración: No se ha establecido una contraseña para la aplicación.")
-                return False
-            
-            if password == correct_password:
-                st.session_state["password_correct"] = True
-                st.rerun()
+
+# ======================================
+# Caché Global de Embeddings
+# ======================================
+class EmbeddingCache:
+    def __init__(self):
+        self._cache: Dict[str, List[float]] = {}
+        self._hits = 0
+        self._misses = 0
+
+    def _key(self, text):
+        return hashlib.md5(text[:2000].encode('utf-8', errors='ignore')).hexdigest()
+
+    def get(self, text):
+        k = self._key(text)
+        if k in self._cache:
+            self._hits += 1
+            return self._cache[k]
+        self._misses += 1
+        return None
+
+    def put(self, text, emb):
+        self._cache[self._key(text)] = emb
+
+    def get_many(self, textos):
+        results = [None] * len(textos)
+        missing = []
+        for i, t in enumerate(textos):
+            c = self.get(t)
+            if c is not None:
+                results[i] = c
             else:
-                st.error("❌ La contraseña es incorrecta.")
-    return False
+                missing.append(i)
+        return results, missing
 
-# ==============================================================================
-# FUNCIONES DE CARGA Y NORMALIZACIÓN DE CONFIGURACIÓN
-# ==============================================================================
+    def stats(self):
+        total = self._hits + self._misses
+        rate = (self._hits / total * 100) if total > 0 else 0
+        return f"Cache: {self._hits} hits, {self._misses} misses ({rate:.0f}%)"
+
+    def clear(self):
+        self._cache.clear()
+        self._hits = 0
+        self._misses = 0
+
+if '_emb_cache' not in st.session_state:
+    st.session_state['_emb_cache'] = EmbeddingCache()
+
+def get_embedding_cache():
+    return st.session_state['_emb_cache']
+
+# ======================================
+# Utilidades de Configuración Automática
+# ======================================
 def load_local_config():
-    """Busca el archivo Configuracion.xlsx automáticamente en el repositorio."""
     paths_to_try = [
         Path("Configuracion.xlsx"),
         Path("configuracion.xlsx"),
@@ -119,13 +501,11 @@ def load_local_config():
             return f
     return None
 
-def load_config_data():
-    """Carga de forma automática region_map, internet_map y sov_map desde Configuracion.xlsx."""
-    config_path = load_local_config()
-    if not config_path:
+def load_config_data(config_source):
+    if not config_source:
         return None, None, None
     try:
-        config_sheets = pd.read_excel(config_path, sheet_name=None, engine='openpyxl')
+        config_sheets = pd.read_excel(config_source, sheet_name=None, engine='openpyxl')
         region_map = pd.Series(
             config_sheets['Regiones'].iloc[:, 1].values,
             index=config_sheets['Regiones'].iloc[:, 0].astype(str).str.lower().str.strip()
@@ -157,41 +537,221 @@ def load_config_data():
         st.error(f"Error al cargar Configuracion.xlsx: {e}")
         return None, None, None
 
-# ==============================================================================
-# FUNCIONES DE LIMPIEZA, PARSEO Y DUPLICADOS
-# ==============================================================================
-@lru_cache(maxsize=10000)
-def norm_key(text: Any) -> str:
+
+# ======================================
+# Funciones Auxiliares de Limpieza, Enlaces y Conversión
+# ======================================
+def check_password():
+    if st.session_state.get("password_correct", False):
+        return True
+    st.markdown("""
+    <div class="auth-wrap">
+        <div class="auth-icon">🎓</div>
+        <div class="auth-title">Sistema de Análisis UNAL</div>
+        <div class="auth-sub">Ingresa tus credenciales para continuar</div>
+    </div>""", unsafe_allow_html=True)
+    _, col, _ = st.columns([1, 2, 1])
+    with col:
+        with st.form("pw"):
+            pw = st.text_input("Contraseña", type="password", placeholder="Ingresa tu contraseña")
+            if st.form_submit_button("Ingresar", use_container_width=True, type="primary"):
+                if pw == st.secrets.get("APP_PASSWORD", "INVALID"):
+                    st.session_state["password_correct"] = True
+                    st.rerun()
+                else:
+                    st.error("Contraseña incorrecta")
+    return False
+
+def call_with_retries(fn, *a, **kw):
+    d = 1
+    for att in range(3):
+        try:
+            return fn(*a, **kw)
+        except Exception as e:
+            if att == 2: raise e
+            time.sleep(d)
+            d *= 2
+
+async def acall_with_retries(fn, *a, **kw):
+    d = 1
+    for att in range(3):
+        try:
+            return await fn(*a, **kw)
+        except Exception as e:
+            if att == 2: raise e
+            await asyncio.sleep(d)
+            d *= 2
+
+def norm_key(text):
     if text is None: return ""
     return re.sub(r"[^a-z0-9]+", "", unidecode(str(text).strip().lower()))
 
-@lru_cache(maxsize=5000)
-def corregir_texto(text: Any) -> str:
-    if not isinstance(text, str): return ""
-    text = re.sub(r'(<br\s*/?>|\[\.\.\.\])+', ' ', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    match = re.search(r"[A-ZÁÉÍÓÚÑ]", text)
-    if match: text = text[match.start():]
+def capitalizar_etiqueta(tema):
+    if not tema or not tema.strip(): return "Sin tema"
+    tema = tema.strip().lower()
+    tema = corregir_tildes(tema)
+    return tema[0].upper() + tema[1:]
+
+def _frase_esta_completa(texto):
+    if not texto or not texto.strip(): return False
+    palabras = texto.strip().split()
+    if not palabras: return False
+    ultima = palabras[-1].lower().rstrip(".,;:!?")
+    return unidecode(ultima) not in _TRAILING_INCOMPLETE and len(ultima) > 1
+
+def _recortar_frase_completa(texto, max_palabras=7):
+    if not texto: return "Sin tema"
+    palabras = texto.strip().split()
+    if len(palabras) > max_palabras: palabras = palabras[:max_palabras]
+    while palabras and unidecode(palabras[-1].lower().rstrip(".,;:!?")) in _TRAILING_INCOMPLETE:
+        palabras.pop()
+    if not palabras: return texto.strip().split()[0] if texto.strip() else "Sin tema"
+    return " ".join(palabras)
+
+def limpiar_tema(tema):
+    if not tema: return "Sin tema"
+    tema = tema.strip().strip('"\'')
+    for px in ["subtema:", "tema:", "categoría:", "categoria:", "category:"]:
+        if tema.lower().startswith(px): tema = tema[len(px):].strip()
+    tema = _recortar_frase_completa(tema, max_palabras=7)
+    return capitalizar_etiqueta(tema) if tema else "Sin tema"
+
+def limpiar_tema_geografico(tema, marca, aliases):
+    if not tema: return "Sin tema"
+    tl = unidecode(tema.lower())
+    for n in [marca] + [a for a in aliases if a]:
+        patron = r'\b' + re.escape(unidecode(n.strip().lower())) + r'\b'
+        tl = re.sub(patron, '', tl)
+    frases_eliminar = [
+        "en colombia", "de colombia", "del pais", "en el pais",
+        "territorio nacional", "a nivel nacional", "en todo el pais",
+    ]
+    for frase in frases_eliminar:
+        tl = re.sub(r'\b' + re.escape(frase) + r'\b', '', tl)
+    tl = re.sub(r'\s+', ' ', tl).strip()
+    if not tl: return "Sin tema"
+    tokens_orig = tema.split()
+    tokens_norm = unidecode(tema.lower()).split()
+    norm_disponibles = tl.split()
+    resultado_tokens = []
+    for orig, norm in zip(tokens_orig, tokens_norm):
+        if norm_disponibles and norm == norm_disponibles[0]:
+            resultado_tokens.append(orig)
+            norm_disponibles.pop(0)
+    resultado = " ".join(resultado_tokens).strip()
+    resultado = corregir_tildes(resultado) if resultado else ""
+    return limpiar_tema(resultado) if resultado.strip() else "Sin tema"
+
+def string_norm_label(s):
+    if not s: return ""
+    s = unidecode(s.lower())
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    return " ".join(t for t in s.split() if t not in STOPWORDS_ES)
+
+def _validar_estructura_subtema(etiqueta: str) -> bool:
+    if not etiqueta or len(etiqueta.split()) < 2: return False
+    if len(etiqueta.split()) > 7: return False
+    if _PATRON_TITULAR.match(etiqueta): return False
+    if _PATRON_ESTADO.search(etiqueta): return False
+    palabras = etiqueta.split()
+    if len(palabras) <= 4:
+        nexos = {
+            "de","del","para","sobre","en","con","por","ante","hacia",
+            "entre","sin","al","las","los","una","uno","que","como",
+            "y","o","a","e","u",
+        }
+        tiene_nexo = any(unidecode(p.lower().rstrip(".,;:!?")) in nexos for p in palabras[1:])
+        if not tiene_nexo: return False
+    return True
+
+def extract_link(cell):
+    if hasattr(cell, "hyperlink") and cell.hyperlink and cell.hyperlink.target:
+        return {"value": cell.value or "Link", "url": cell.hyperlink.target}
+    if isinstance(cell.value, str) and "=HYPERLINK" in cell.value:
+        m = re.search(r'=HYPERLINK\("([^"]+)"', cell.value)
+        if m: return {"value": "Link", "url": m.group(1)}
+    return {"value": cell.value, "url": None}
+
+def extract_link_from_cell(cell):
+    if cell.hyperlink and cell.hyperlink.target:
+        return cell.hyperlink.target
+    return None
+
+def convert_html_entities(text):
+    if not isinstance(text, str):
+        return text
+    text = html.unescape(text)
+    html_entities = {
+        '&#xF3;': 'ó', '&#xE1;': 'á', '&#xE9;': 'é', '&#xED;': 'í',
+        '&#xFA;': 'ú', '&#xF1;': 'ñ', '&#xDC;': 'Ü', '&#xFC;': 'ü',
+        '&#xC1;': 'Á', '&#xC9;': 'É', '&#xCD;': 'Í', '&#xD3;': 'Ó',
+        '&#xDA;': 'Ú', '&#xD1;': 'Ñ', '&#xC7;': 'Ç', '&#xE7;': 'ç',
+    }
+    for entity, char in html_entities.items():
+        text = text.replace(entity, char)
+
+    def replace_hex_entity(match):
+        try:
+            return chr(int(match.group(1), 16))
+        except Exception:
+            return match.group(0)
+
+    def replace_decimal_entity(match):
+        try:
+            return chr(int(match.group(1)))
+        except Exception:
+            return match.group(0)
+
+    text = re.sub(r'&#x([0-9A-Fa-f]+);', replace_hex_entity, text)
+    text = re.sub(r'&#(\d+);', replace_decimal_entity, text)
+
+    for bad, good in {'\u201c': '"', '\u201d': '"', '\u2018': "'", '\u2019': "'",
+                      'Â': '', 'â': '', '€': '', '™': ''}.items():
+        text = text.replace(bad, good)
     return text
 
-def clean_title_for_output(title: Any) -> str:
-    if not isinstance(title, str): return str(title if title is not None else "")
-    return re.sub(r"\s*\|\s*[\w\s]+$", "", title).strip()
+def clean_text(text):
+    if not isinstance(text, str):
+        return text
+    return convert_html_entities(text).strip()
 
-@lru_cache(maxsize=100)
-def normalizar_tipo_medio(tipo_raw: str) -> str:
+def clean_cuerpo(text):
+    if not isinstance(text, str) or text.strip() == '':
+        return text
+    text = convert_html_entities(text)
+    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'<[^>]+>', '', text)
+    return text.strip()
+
+def normalize_title_for_comparison(title):
+    if not isinstance(title, str): return ""
+    tmp = re.split(r"\s*[:|-]\s*", title, 1)
+    return re.sub(r"\W+", " ", tmp[0]).lower().strip()
+
+def clean_title_for_output(title):
+    return re.sub(r"\s*\|\s*[\w\s]+$", "", str(title)).strip()
+
+def corregir_texto(text):
+    if not isinstance(text, str): return text
+    text = re.sub(r"(<br>|\[\.\.\.\]|\s+)", " ", text).strip()
+    m = re.search(r"[A-ZÁÉÍÓÚÑ]", text)
+    if m: text = text[m.start():]
+    if text and not text.endswith("..."): text = text.rstrip(".") + "..."
+    return text
+
+def normalizar_tipo_medio(tipo_raw):
     if not isinstance(tipo_raw, str): return str(tipo_raw)
-    t = unidecode(str(tipo_raw).strip().lower())
-    mapping = {
-        "fm": "Radio", "am": "Radio", "radio": "Radio", "aire": "Televisión", "cable": "Televisión", "tv": "Televisión",
-        "television": "Televisión", "televisión": "Televisión", "senal abierta": "Televisión", "señal abierta": "Televisión",
-        "diario": "Prensa", "prensa": "Prensa", "revista": "Revista", "revistas": "Revista", "online": "Internet",
-        "internet": "Internet", "digital": "Internet", "web": "Internet"
-    }
-    return mapping.get(t, str(tipo_raw).strip().title() if str(tipo_raw).strip() else "Otro")
+    t = unidecode(tipo_raw.strip().lower())
+    return {
+        'online': 'Internet', 'internet': 'Internet',
+        'diario': 'Prensa',
+        'am': 'Radio', 'fm': 'Radio', 'radio': 'Radio',
+        'aire': 'Televisión', 'cable': 'Televisión', 'tv': 'Televisión',
+        'television': 'Televisión', 'televisión': 'Televisión',
+        'revista': 'Revistas', 'revistas': 'Revistas',
+    }.get(t, str(tipo_raw).strip().title() or "Otro")
 
 def parse_numeric(val):
-    """Convierte de forma segura strings de datos numéricos en tipos int o float, previniendo notación científica."""
     if val is None:
         return None
     if isinstance(val, (int, float)):
@@ -227,257 +787,1340 @@ def parse_numeric(val):
     except ValueError:
         return None
 
-def extract_link(cell):
-    if hasattr(cell, "hyperlink") and cell.hyperlink and cell.hyperlink.target:
-        return {"value": cell.value or "Link", "url": cell.hyperlink.target}
-    if isinstance(cell.value, str) and "=HYPERLINK" in cell.value:
-        match = re.search(r'=HYPERLINK\("([^"]+)"', cell.value)
-        if match: return {"value": "Link", "url": match.group(1)}
-    return {"value": cell.value, "url": None}
+def texto_para_embedding(titulo, resumen, max_len=1800):
+    t = str(titulo or "").strip()
+    r = str(resumen or "").strip()
+    return f"{t}. {t}. {t}. {r}"[:max_len]
 
-def run_base_logic(sheet, progress_hook):
-    headers = [c.value for c in sheet[1] if c.value]
-    norm_keys = [norm_key(h) for h in headers]
-    key_map = {nk: nk for nk in norm_keys}
-    key_map.update({
-        "titulo": norm_key("Titulo"), "resumen": norm_key("Resumen - Aclaracion"), "menciones": norm_key("Menciones - Empresa"),
-        "medio": norm_key("Medio"), "tonoai": norm_key("Tono AI"), "tema": norm_key("Tema"), "idnoticia": norm_key("ID Noticia"),
-        "idduplicada": norm_key("ID duplicada"), "tipodemedio": norm_key("Tipo de Medio"), "link_nota": norm_key("Link Nota"),
-        "link_streaming": norm_key("Link (Streaming - Imagen)"), "region": norm_key("Region"), "hora": norm_key("Hora")
-    })
-    rows = [{norm_keys[i]: cell for i, cell in enumerate(row) if i < len(norm_keys)}
-            for row in sheet.iter_rows(min_row=2) if not all(c.value is None for c in row)]
-    split_rows = []
-    for r_cells in rows:
-        base = {k: extract_link(v) if k in [key_map["link_nota"], key_map["link_streaming"]] else v.value for k, v in r_cells.items()}
-        base[key_map["tipodemedio"]] = normalizar_tipo_medio(base.get(key_map["tipodemedio"]))
-        menciones_raw = str(base.get(key_map["menciones"], ""))
-        menciones_list = [m.strip() for m in menciones_raw.split(";") if m.strip()] or [menciones_raw]
-        for m in menciones_list:
-            new = deepcopy(base)
-            new[key_map["menciones"]] = m
-            split_rows.append(new)
-    for idx, row in enumerate(split_rows):
-        row.update({"original_index": idx, "is_duplicate": False, "tonoai": "", "tema": ""})
-    
-    processed_rows = detectar_duplicados_avanzado(split_rows, key_map, progress_hook)
-    
-    for row in processed_rows:
-        if row["is_duplicate"]:
-            row.update({key_map["tonoai"]: "Duplicada", key_map["tema"]: "Duplicada"})
-    return processed_rows, key_map
+def _validar_etiqueta_completa(etiqueta, titulos_grp=None, resumenes_grp=None, marca="", aliases=None, fallback_fn=None):
+    if not etiqueta or etiqueta.strip().lower() in ("sin tema", "varios", "n/a"):
+        if fallback_fn: return fallback_fn(titulos_grp or [])
+        return "Cobertura informativa general"
+    if _frase_esta_completa(etiqueta): return etiqueta
+    recortada = _recortar_frase_completa(etiqueta, max_palabras=7)
+    if _frase_esta_completa(recortada) and len(recortada.split()) >= 2:
+        return capitalizar_etiqueta(recortada)
+    if titulos_grp and len(titulos_grp) > 0:
+        try:
+            prompt = (
+                f"La frase '{etiqueta}' está incompleta o es genérica. "
+                f"Genera una frase temática COMPLETA en español de 4-6 palabras "
+                f"con preposición (de/del/para/sobre/en):\n\n"
+                + "\n".join(f"  · {t[:120]}" for t in titulos_grp[:4])
+                + "\n\nREGLAS: frase nominal con preposición, terminar en sustantivo/adjetivo, "
+                "tildes y ñ correctas, sin marcas ni ciudades.\n"
+                "CORRECTO: 'Proyecto de terminal de transportes', 'Operación del Canal del Dique'\n"
+                "INCORRECTO: 'Terminal transportes', 'Operación canal'\n"
+                'JSON: {"subtema":"..."}'
+            )
+            resp = call_with_retries(
+                openai.ChatCompletion.create,
+                model=OPENAI_MODEL_CLASIFICACION,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=80,
+                temperature=0.1,
+                response_format={"type": "json_object"}
+            )
+            u = resp.get('usage', {}) if isinstance(resp, dict) else getattr(resp, 'usage', {})
+            if u:
+                st.session_state['tokens_input'] += (u.get('prompt_tokens') if isinstance(u, dict) else getattr(u, 'prompt_tokens', 0)) or 0
+                st.session_state['tokens_output'] += (u.get('completion_tokens') if isinstance(u, dict) else getattr(u, 'completion_tokens', 0)) or 0
+            raw = json.loads(resp.choices[0].message.content).get("subtema", "")
+            if raw:
+                cleaned = limpiar_tema_geografico(limpiar_tema(raw), marca, aliases or [])
+                if _frase_esta_completa(cleaned) and len(cleaned.split()) >= 2:
+                    return capitalizar_etiqueta(cleaned)
+        except:
+            pass
+    if fallback_fn: return fallback_fn(titulos_grp or [])
+    return capitalizar_etiqueta(recortada) if recortada and len(recortada.split()) >= 2 else "Cobertura informativa general"
 
-def detectar_duplicados_avanzado(rows: List[Dict], key_map: Dict[str, str], progress_hook):
-    processed_rows = deepcopy(rows)
-    seen_text_key, seen_online_url, seen_broadcast = {}, {}, {}
-    id_key, id_duplicada_key = key_map.get("idnoticia", "idnoticia"), key_map.get("idduplicada", "idduplicada")
-    titulo_key, resumen_key = key_map.get("titulo", "titulo"), key_map.get("resumen", "resumen")
-    mencion_key, medio_key = key_map.get("menciones", "menciones"), key_map.get("medio", "medio")
-    tipo_medio_key, link_nota_key, hora_key = key_map.get("tipodemedio"), key_map.get("link_nota"), key_map.get("hora")
-    
-    total_rows = len(processed_rows)
-    for i, row in enumerate(processed_rows):
-        if i % 100 == 0:
-            progress_hook(i, total_rows, "Detectando duplicados...")
-        mencion_norm, medio_norm = norm_key(row.get(mencion_key)), norm_key(row.get(medio_key))
-        texto_titulo, texto_resumen = corregir_texto(row.get(titulo_key, '')), corregir_texto(row.get(resumen_key, ''))
-        texto_base = texto_titulo if texto_titulo else texto_resumen
-        if texto_base:
-            clave_texto_norm = norm_key(" ".join(texto_base.split()[:3]))
-            key = (clave_texto_norm, mencion_norm, medio_norm)
-            if clave_texto_norm and key in seen_text_key:
-                row["is_duplicate"] = True
-                row[id_duplicada_key] = processed_rows[seen_text_key[key]].get(id_key, "")
-                continue
-            else: seen_text_key[key] = i
-        tipo_medio = normalizar_tipo_medio(str(row.get(tipo_medio_key)))
-        if tipo_medio == "Internet":
-            url = (row.get(link_nota_key, {}) or {}).get("url")
-            if url and mencion_norm:
-                key_url = (url, mencion_norm)
-                if key_url in seen_online_url:
-                    row["is_duplicate"] = True
-                    row[id_duplicada_key] = processed_rows[seen_online_url[key_url]].get(id_key, "")
-                else: seen_online_url[key_url] = i
-        elif tipo_medio in ["Radio", "Televisión"]:
-            hora = str(row.get(hora_key, "")).strip()
-            if mencion_norm and medio_norm and hora:
-                key_broadcast = (mencion_norm, medio_norm, hora)
-                if key_broadcast in seen_broadcast:
-                    row["is_duplicate"] = True
-                    row[id_duplicada_key] = processed_rows[seen_broadcast[key_broadcast]].get(id_key, "")
-                else: seen_broadcast[key_broadcast] = i
-    return processed_rows
-
-def process_mappings_and_links(all_processed_rows, key_map, region_map, internet_map):
-    """Realiza el buscarv de Región utilizando el medio original antes de que Internet modifique la columna Medio."""
-    for row in all_processed_rows:
-        original_medio_key = str(row.get(key_map.get("medio"), "")).lower().strip()
-        row[key_map.get("region")] = region_map.get(original_medio_key, "N/A")
-        if original_medio_key in internet_map:
-            row[key_map.get("medio")] = internet_map[original_medio_key]
-            row[key_map.get("tipodemedio")] = "Internet"
-    return all_processed_rows
-
-def process_link_logic(all_rows, key_map):
-    """Aplica la lógica de enlaces y limpia Link (Streaming - Imagen) para medios no digitales."""
-    ln_key, ls_key = key_map.get("link_nota"), key_map.get("link_streaming")
-    for row in all_rows:
-        tipo = normalizar_tipo_medio(row.get(key_map.get("tipodemedio"), ""))
-        ln, ls = row.get(ln_key) or {}, row.get(ls_key) or {}
-        has_url = lambda x: isinstance(x, dict) and bool(x.get("url"))
-        
-        if tipo in ["Radio", "Televisión"]:
-            row[ls_key] = None
-        elif tipo == "Internet":
-            row[ln_key], row[ls_key] = ls, ln
-        elif tipo in ["Prensa", "Revista"]:
-            if not has_url(ln) and has_url(ls):
-                row[ln_key] = ls
-            row[ls_key] = None
-    return all_rows
-
-def process_sov_mapping_final(all_rows: List[Dict], key_map: Dict[str, str], sov_map: Dict[str, str]):
-    if not sov_map:
-        return all_rows
-    for r in all_rows:
-        mk = str(r.get(key_map.get("menciones"), "")).strip().lower()
-        if mk in sov_map: 
-            r[key_map.get("menciones")] = sov_map[mk]
-    return all_rows
-
-def _append_rows_to_sheet(sheet, rows_data, key_map, include_ai_columns):
-    base_order = ["ID Noticia", "Fecha", "Hora", "Medio", "Tipo de Medio", "Seccion - Programa", "Region", "Titulo", "Autor - Conductor", "Nro. Pagina", "Dimension", "Duracion - Nro. Caracteres", "CPE", "Tier", "Audiencia", "Tono", "Resumen - Aclaracion", "Link Nota", "Link (Streaming - Imagen)", "Menciones - Empresa", "ID duplicada"]
-    ai_order = ["Tono AI", "Tema"]
-    final_order = base_order[:16] + ai_order + base_order[16:] if include_ai_columns else base_order
-    sheet.append(final_order)
-    
-    font_hyperlink = Font(color="0563C1", underline="single")
-    align_left = Alignment(horizontal='left')
-    font_header = Font(bold=True)
-    
-    for i, col_name in enumerate(final_order, start=1):
-        cell = sheet.cell(row=1, column=i)
-        cell.font = font_header
-        
-    NUM = {"ID Noticia", "Nro. Pagina", "Dimension", "Duracion - Nro. Caracteres", "CPE", "Tier", "Audiencia"}
-    
-    for row_data in rows_data:
-        row_data[key_map.get("titulo")] = clean_title_for_output(row_data.get(key_map.get("titulo")))
-        row_data[key_map.get("resumen")] = corregir_texto(str(row_data.get(key_map.get("resumen"), ""))).replace("_x000D_", "")
-        
-        row_to_append, links_to_add = [], {}
-        for col_idx, header in enumerate(final_order, 1):
-            val = row_data.get(norm_key(header))
-            cell_value = None
-            
-            if header == 'Fecha' and pd.notna(val):
-                if isinstance(val, pd.Timestamp):
-                    cell_value = val.to_pydatetime()
-                elif isinstance(val, (datetime.datetime, datetime.date)):
-                    cell_value = val
-                else:
-                    cell_value = str(val) if val is not None else None
-            elif header in NUM:
-                cell_value = parse_numeric(val)
-            elif isinstance(val, dict) and val.get("url"):
-                cell_value = val.get("value", "Link")
-                links_to_add[col_idx] = val.get("url")
-            elif val is not None:
-                if isinstance(val, str) and val.startswith("http"):
-                    cell_value = "Link"
-                    links_to_add[col_idx] = val
-                else:
-                    cell_value = str(val)
-            row_to_append.append(cell_value)
-        sheet.append(row_to_append)
-        
-        current_row = sheet.max_row
-        
-        date_col_idx = final_order.index("Fecha") + 1
-        date_cell = sheet.cell(row=current_row, column=date_col_idx)
-        if isinstance(date_cell.value, (datetime.datetime, datetime.date)):
-            date_cell.number_format = 'DD/MM/YYYY'
-            
-        cpe_col_idx = final_order.index("CPE") + 1
-        tipo_medio_col_idx = final_order.index("Tipo de Medio") + 1
-        tipo_medio_val = sheet.cell(row=current_row, column=tipo_medio_col_idx).value
-        cpe_cell = sheet.cell(row=current_row, column=cpe_col_idx)
-        
-        if tipo_medio_val in ("Radio", "Televisión") and isinstance(cpe_cell.value, (int, float)):
-            cpe_cell.number_format = '#,##0'
-            
-        for col_idx, url in links_to_add.items():
-            cell = sheet.cell(row=current_row, column=col_idx)
-            cell.hyperlink = url
-            cell.font = font_hyperlink
-            cell.alignment = align_left
-            
-    for i, col_name in enumerate(final_order, start=1):
-        letter = sheet.cell(row=1, column=i).column_letter
-        if col_name in ['Titulo', 'Resumen - Aclaracion']:
-            sheet.column_dimensions[letter].width = 50
-        elif col_name in ['Link Nota', 'Link (Streaming - Imagen)']:
-            sheet.column_dimensions[letter].width = 15
-        else:
-            sheet.column_dimensions[letter].width = 20
-
-def generate_excel_output(all_processed_rows, key_map):
-    out_wb = Workbook()
-    sheet1 = out_wb.active
-    sheet1.title = "UNAL con IA"
-    unal_rows = [row for row in all_processed_rows if row.get("__is_target_brand")]
-    _append_rows_to_sheet(sheet1, unal_rows, key_map, include_ai_columns=True)
-    sheet2 = out_wb.create_sheet("Todas las Marcas")
-    _append_rows_to_sheet(sheet2, all_processed_rows, key_map, include_ai_columns=False)
-    output_buffer = io.BytesIO()
-    out_wb.save(output_buffer)
-    output_buffer.seek(0)
-    return output_buffer
-
-def agrupar_noticias_similares(rows: List[Dict], key_map: Dict[str, str]) -> List[List[int]]:
-    titulo_key, resumen_key = key_map.get("titulo", "titulo"), key_map.get("resumen", "resumen")
-    n = len(rows)
+def dedup_labels(etiquetas, umbral=UMBRAL_DEDUP_LABEL):
+    unique = list(dict.fromkeys(etiquetas))
+    if len(unique) <= 1:
+        return etiquetas
+    normed = [string_norm_label(u) for u in unique]
+    n = len(unique)
     parent = list(range(n))
 
-    def find(i):
-        if parent[i] == i: return i
-        parent[i] = find(parent[i])
-        return parent[i]
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
 
-    def union(i, j):
-        root_i, root_j = find(i), find(j)
-        if root_i != root_j: parent[root_j] = root_i
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
 
-    titulo_a_raiz, resumen_a_raiz = {}, {}
-    for idx, row in enumerate(rows):
-        titulo = corregir_texto(row.get(titulo_key, ''))
-        if titulo:
-            clave_titulo = norm_key(" ".join(titulo.strip().split()[:4]))
-            if clave_titulo:
-                if clave_titulo in titulo_a_raiz: union(idx, titulo_a_raiz[clave_titulo])
-                titulo_a_raiz[clave_titulo] = find(idx)
-        resumen = corregir_texto(row.get(resumen_key, ''))
-        if resumen:
-            clave_resumen = norm_key(" ".join(resumen.strip().split()[:6]))
-            if clave_resumen:
-                if clave_resumen in resumen_a_raiz: union(idx, resumen_a_raiz[clave_resumen])
-                resumen_a_raiz[clave_resumen] = find(idx)
+    def _es_fusion_segura(s1, s2):
+        antagonicos = [
+            ({"aprobacion", "apoyo", "acuerdo"}, {"rechazo", "caida", "desacuerdo", "hundimiento"}),
+            ({"aumento", "crecimiento", "alza", "subida"}, {"caida", "reduccion", "baja", "disminucion"}),
+            ({"apertura", "inauguracion", "inicio"}, {"cierre", "suspension", "fin", "clausura"}),
+            ({"exito", "logro", "triunfo"}, {"fracaso", "derrota", "problema"})
+        ]
+        t1 = set(s1.split())
+        t2 = set(s2.split())
+        for pos_set, neg_set in antagonicos:
+            if (t1 & pos_set and t2 & neg_set) or (t1 & neg_set and t2 & pos_set):
+                return False
+        return True
 
-    grupos_finales = defaultdict(list)
-    for i in range(n): grupos_finales[find(i)].append(i)
-    return list(grupos_finales.values())
+    for i in range(n):
+        if not normed[i]: continue
+        for j in range(i + 1, n):
+            if not normed[j] or find(i) == find(j): continue
+            if SequenceMatcher(None, normed[i], normed[j]).ratio() >= umbral:
+                if _es_fusion_segura(normed[i], normed[j]):
+                    union(i, j)
+                    
+    for i in range(n):
+        if not normed[i]: continue
+        tokens_i = set(normed[i].split())
+        if len(tokens_i) < 2: continue
+        for j in range(i + 1, n):
+            if not normed[j] or find(i) == find(j): continue
+            tokens_j = set(normed[j].split())
+            if len(tokens_j) < 2: continue
+            interseccion = tokens_i & tokens_j
+            menor = min(len(tokens_i), len(tokens_j))
+            if menor > 0 and len(interseccion) / menor >= 0.6:
+                if _es_fusion_segura(normed[i], normed[j]):
+                    union(i, j)
+                    
+    le = get_embeddings_batch(unique)
+    vp = [(i, le[i]) for i in range(n) if le[i] is not None]
+    if len(vp) >= 2:
+        vi, vv = zip(*vp)
+        sm = cosine_similarity(np.array(vv))
+        for pi in range(len(vi)):
+            for pj in range(pi + 1, len(vi)):
+                if sm[pi][pj] >= umbral:
+                    if find(vi[pi]) != find(vi[pj]):
+                        if _es_fusion_segura(normed[vi[pi]], normed[vi[pj]]):
+                            union(vi[pi], vi[pj])
 
-def consolidar_temas_similares(rows: List[Dict], key_map: Dict[str, str], umbral_similitud=85) -> Dict[str, str]:
-    tema_key = key_map.get("tema")
+    freq = Counter(etiquetas)
+    grupos = defaultdict(list)
+    for i in range(n):
+        grupos[find(i)].append(i)
+    canon = {}
+    for root, members in grupos.items():
+        cands = [unique[m] for m in members]
+        vc = [c for c in cands if c.lower() not in ("sin tema", "varios") and _frase_esta_completa(c)]
+        va = [c for c in cands if c.lower() not in ("sin tema", "varios")]
+        if vc:
+            canon[root] = max(vc, key=lambda c: (freq[c], len(c)))
+        elif va:
+            best = max(va, key=lambda c: (freq[c], len(c)))
+            r = _recortar_frase_completa(best)
+            canon[root] = r if _frase_esta_completa(r) else best
+        else:
+            canon[root] = cands[0]
+    lm = {unique[i]: canon[find(i)] for i in range(n)}
+    return [capitalizar_etiqueta(lm.get(e, e)) for e in etiquetas]
+
+def _fusionar_subtemas_semanticos(subtemas, textos_por_subtema, marca, aliases, umbral=UMBRAL_FUSION_SUBTEMAS):
+    unique_subs = list(dict.fromkeys(subtemas))
+    if len(unique_subs) <= 1: return subtemas
+    repr_texts = []
+    for sub in unique_subs:
+        txts = textos_por_subtema.get(sub, [])
+        palabras = []
+        for t in txts[:20]:
+            for w in string_norm_label(str(t)).split():
+                if len(w) > 3: palabras.append(w)
+        top_kw = " ".join(w for w, _ in Counter(palabras).most_common(10))
+        repr_texts.append(f"{sub}. {sub}. {sub}. {top_kw}"[:600])
+    emb_repr = get_embeddings_batch(repr_texts)
+    valid = [(i, emb_repr[i]) for i in range(len(unique_subs)) if emb_repr[i] is not None]
+    if len(valid) < 2: return subtemas
+    v_idx, v_emb = zip(*valid)
+    sim = cosine_similarity(np.array(v_emb))
+    n = len(v_idx)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb: parent[rb] = ra
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if find(i) == find(j): continue
+            if sim[i][j] >= umbral: union(i, j)
+            
+    grupos = defaultdict(list)
+    for i in range(n): grupos[find(i)].append(v_idx[i])
+    freq = Counter(subtemas)
+    lm = {}
+    for root, members in grupos.items():
+        cands = [unique_subs[m] for m in members]
+        if len(cands) == 1:
+            lm[cands[0]] = cands[0]
+            continue
+        vc = [c for c in cands if c.lower() not in ("sin tema", "varios") and _frase_esta_completa(c)]
+        best = max(vc, key=lambda c: (freq.get(c, 0), len(c))) if vc else max(cands, key=lambda c: (freq.get(c, 0), len(c)))
+        if len(cands) <= 3:
+            unified = _unificar_subtemas_llm(cands, textos_por_subtema, marca, aliases)
+            if unified and _frase_esta_completa(unified): best = unified
+        for c in cands: lm[c] = capitalizar_etiqueta(best)
+    return [lm.get(s, s) for s in subtemas]
+
+def _unificar_subtemas_llm(subtemas_a_unificar, textos_por_subtema, marca, aliases):
+    subs_str = "\n".join(f"  · {s}" for s in subtemas_a_unificar)
+    all_kw = []
+    for sub in subtemas_a_unificar:
+        for t in textos_por_subtema.get(sub, [])[:5]:
+            for w in string_norm_label(str(t)).split():
+                if len(w) > 3: all_kw.append(w)
+    kw_str = " · ".join(w for w, _ in Counter(all_kw).most_common(8))
+    prompt = (
+        f"Estos subtemas son variaciones del MISMO tema. "
+        f"Genera UN subtema unificado (4-6 palabras) como frase nominal completa:\n\n"
+        f"{subs_str}\n\nKeywords: {kw_str}\n\n"
+        "REGLAS: frase coherente con preposición (de/del/para/sobre/en), "
+        "sin marcas ni ciudades, tildes y ñ correctas, terminar en sustantivo/adjetivo.\n"
+        "CORRECTO: 'Regulación de tarifas eléctricas', 'Apertura de nuevas sucursales'\n"
+        "INCORRECTO: 'Tarifas energía', 'Apertura sucursales', 'Actividad corporativa'\n"
+        'JSON: {"subtema":"..."}'
+    )
+    try:
+        resp = call_with_retries(
+            openai.ChatCompletion.create,
+            model=OPENAI_MODEL_CLASIFICACION,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=60,
+            temperature=0.05,
+            response_format={"type": "json_object"}
+        )
+        u = resp.get('usage', {}) if isinstance(resp, dict) else getattr(resp, 'usage', {})
+        if u:
+            st.session_state['tokens_input'] += (u.get('prompt_tokens') if isinstance(u, dict) else getattr(u, 'prompt_tokens', 0)) or 0
+            st.session_state['tokens_output'] += (u.get('completion_tokens') if isinstance(u, dict) else getattr(u, 'completion_tokens', 0)) or 0
+        raw = json.loads(resp.choices[0].message.content).get("subtema", "")
+        if raw: return limpiar_tema_geografico(limpiar_tema(raw), marca, aliases)
+    except:
+        pass
+    return None
+
+def get_embeddings_batch(textos, batch_size=100):
+    if not textos: return []
+    cache = get_embedding_cache()
+    resultados, missing = cache.get_many(textos)
+    if not missing: return resultados
+    mt = [textos[i][:2000] if textos[i] else "" for i in missing]
+    for i in range(0, len(mt), batch_size):
+        batch = mt[i:i + batch_size]
+        bidx = missing[i:i + batch_size]
+        try:
+            resp = call_with_retries(openai.Embedding.create, input=batch, model=OPENAI_MODEL_EMBEDDING)
+            u = resp.get('usage', {}) if isinstance(resp, dict) else getattr(resp, 'usage', {})
+            if u:
+                st.session_state['tokens_embedding'] += (u.get('total_tokens') if isinstance(u, dict) else getattr(u, 'total_tokens', 0)) or 0
+            for j, d in enumerate(resp["data"]):
+                oi = bidx[j]
+                emb = d["embedding"]
+                resultados[oi] = emb
+                cache.put(textos[oi], emb)
+        except:
+            for j, t in enumerate(batch):
+                oi = bidx[j]
+                try:
+                    r = openai.Embedding.create(input=[t], model=OPENAI_MODEL_EMBEDDING)
+                    emb = r["data"][0]["embedding"]
+                    resultados[oi] = emb
+                    cache.put(textos[oi], emb)
+                except:
+                    pass
+    return resultados
+
+class DSU:
+    def __init__(self, n):
+        self.p = list(range(n))
+        self.rank = [0] * n
+
+    def find(self, i):
+        path = []
+        while self.p[i] != i:
+            path.append(i)
+            i = self.p[i]
+        for node in path: self.p[node] = i
+        return i
+
+    def union(self, i, j):
+        ri, rj = self.find(i), self.find(j)
+        if ri == rj: return
+        if self.rank[ri] < self.rank[rj]: ri, rj = rj, ri
+        self.p[rj] = ri
+        if self.rank[ri] == self.rank[rj]: self.rank[ri] += 1
+
+    def grupos(self, n):
+        c = defaultdict(list)
+        for i in range(n): c[self.find(i)].append(i)
+        return dict(c)
+
+def agrupar_textos_similares(textos, umbral):
+    if not textos: return {}
+    embs = get_embeddings_batch(textos)
+    valid = [(i, e) for i, e in enumerate(embs) if e is not None]
+    if len(valid) < 2: return {}
+    idxs, M = zip(*valid)
+    labels = AgglomerativeClustering(
+        n_clusters=None, distance_threshold=1 - umbral, metric="cosine", linkage="average"
+    ).fit(np.array(M)).labels_
+    g = defaultdict(list)
+    for k, lbl in enumerate(labels): g[lbl].append(idxs[k])
+    return dict(enumerate(g.values()))
+
+def agrupar_por_titulo_similar(titulos):
+    gid, grupos, used = 0, {}, set()
+    norm = [normalize_title_for_comparison(t) for t in titulos]
+    for i in range(len(norm)):
+        if i in used or not norm[i]: continue
+        grp = [i]
+        used.add(i)
+        for j in range(i + 1, len(norm)):
+            if j in used or not norm[j]: continue
+            if SequenceMatcher(None, norm[i], norm[j]).ratio() >= SIMILARITY_THRESHOLD_TITULOS:
+                grp.append(j)
+                used.add(j)
+        if len(grp) >= 2:
+            grupos[gid] = grp
+            gid += 1
+    return grupos
+
+def seleccionar_representante(indices, textos):
+    embs = get_embeddings_batch([textos[i] for i in indices])
+    validos = [(indices[k], e) for k, e in enumerate(embs) if e is not None]
+    if not validos: return indices[0], textos[indices[0]]
+    idxs, M = zip(*validos)
+    centro = np.mean(M, axis=0, keepdims=True)
+    best = int(np.argmax(cosine_similarity(np.array(M), centro)))
+    return idxs[best], textos[idxs[best]]
+
+
+# ======================================
+# TONO (Sistema Reputacional por IA)
+# ======================================
+class ClasificadorTono:
+    def __init__(self, marca, aliases):
+        self.marca = marca.strip()
+        self.aliases = [a.strip() for a in (aliases or []) if a.strip()]
+        self._all_names = [self.marca.lower()] + [a.lower() for a in self.aliases]
+
+    def _menciona_marca(self, texto):
+        t = unidecode(texto.lower())
+        return any(m in t for m in self._all_names)
+
+    async def _clasificar_llm(self, texto, sem):
+        async with sem:
+            if not self._menciona_marca(texto):
+                return {"tono": "Neutro"}
+
+            aliases_str = f" (también conocida como: {', '.join(self.aliases)})" if self.aliases else ""
+            prompt = (
+                f"Eres un analista de medios hiper-especializado y tu única misión es evaluar el impacto de las noticias sobre la Universidad Nacional de Colombia (UNAL).\n\n"
+                f"TEXTO A EVALUAR:\n{texto[:1600]}\n\n"
+                f"REGLAS DE CLASIFICACIÓN ESTRICTAS:\n"
+                f"🔴 NEGATIVO: Únicamente si la noticia reporta un fallo directo de la UNAL o un evento perjudicial que ocurre bajo su responsabilidad directa (ej. críticas a la gestión, disturbios en campus, escándalos).\n"
+                f"🟢 POSITIVO: Únicamente si la noticia reporta un logro o acción destacada de la UNAL. Ejemplos: "
+                f"premios, reconocimientos, avances científicos, o anuncios de conciertos, actividades, hechos o eventos organizados o alojados por la UNAL.\n"
+                f"⚪ NEUTRO: Si la UNAL NO es el actor principal de la noticia, o si su mención es meramente contextual, referencial, o como fuente de opinión. "
+                f"No importa si la noticia trata sobre violencia, política o crisis; si no afecta directamente la gestión o reputación de la UNAL, es NEUTRO.\n\n"
+                f'Responde ÚNICAMENTE con JSON en este formato: {{"tono": "Positivo|Negativo|Neutro"}}'
+            )
+
+            try:
+                resp = await acall_with_retries(
+                    openai.ChatCompletion.acreate,
+                    model=OPENAI_MODEL_CLASIFICACION,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=40,
+                    temperature=0.0,
+                    response_format={"type": "json_object"}
+                )
+                
+                u = resp.get('usage', {}) if isinstance(resp, dict) else getattr(resp, 'usage', {})
+                if u:
+                    st.session_state['tokens_input'] += (u.get('prompt_tokens') if isinstance(u, dict) else getattr(u, 'prompt_tokens', 0)) or 0
+                    st.session_state['tokens_output'] += (u.get('completion_tokens') if isinstance(u, dict) else getattr(u, 'completion_tokens', 0)) or 0
+                
+                resultado = json.loads(resp.choices[0].message.content)
+                tono = str(resultado.get("tono", "Neutro")).strip().title()
+                
+                return {"tono": tono if tono in ("Positivo", "Negativo", "Neutro") else "Neutro"}
+            except Exception as e:
+                return {"tono": "Neutro"}
+
+    async def procesar_lote_async(self, textos, pbar, resumenes, titulos):
+        n = len(textos)
+        txts = textos.tolist()
+        pbar.progress(0.05, "Agrupando noticias para análisis de tono...")
+        
+        txts_emb = [texto_para_embedding(str(titulos.iloc[i]), str(resumenes.iloc[i])) for i in range(n)]
+        dsu = DSU(n)
+        
+        for g in [agrupar_textos_similares(txts_emb, SIMILARITY_THRESHOLD_TONO), agrupar_por_titulo_similar(titulos.tolist())]:
+            for _, idxs in g.items():
+                for j in idxs[1:]: dsu.union(idxs[0], j)
+                
+        grupos = dsu.grupos(n)
+        reps = {cid: seleccionar_representante(idxs, txts)[1] for cid, idxs in grupos.items()}
+        
+        sem = asyncio.Semaphore(CONCURRENT_REQUESTS)
+        cids = list(reps.keys())
+        
+        tasks = [self._clasificar_llm(reps[c], sem) for c in cids]
+        rl = []
+        
+        for i, f in enumerate(asyncio.as_completed(tasks)):
+            rl.append(await f)
+            pbar.progress(0.1 + 0.85 * (i + 1) / len(tasks), f"Evaluando Reputación {i + 1}/{len(tasks)}")
+            
+        rpg = {cids[i]: r for i, r in enumerate(rl)}
+        final = [None] * n
+        
+        for cid, idxs in grupos.items():
+            r = rpg.get(cid, {"tono": "Neutro"})
+            for i in idxs: final[i] = r
+            
+        pbar.progress(1.0, "Análisis de Tono completado")
+        return final
+
+def analizar_tono_con_pkl(textos, pkl_file):
+    try:
+        pipeline = joblib.load(pkl_file)
+        TM = {1: "Positivo", "1": "Positivo", 0: "Neutro", "0": "Neutro", -1: "Negativo", "-1": "Negativo"}
+        return [{"tono": TM.get(p, str(p).title())} for p in pipeline.predict(textos)]
+    except Exception as e:
+        st.error(f"Error pkl: {e}")
+        return None
+
+def analizar_temas_con_pkl(textos, pkl_file):
+    try:
+        pipeline = joblib.load(pkl_file)
+        predicciones = pipeline.predict(textos)
+        return [str(p).strip() for p in predicciones]
+    except Exception as e:
+        st.error(f"Error pkl temas: {e}")
+        return None
+
+# ======================================
+# SUBTEMAS
+# ======================================
+class ClasificadorSubtema:
+    def __init__(self, marca, aliases):
+        self.marca = marca
+        self.aliases = aliases or []
+        self._cache = {}
+        self._umbrales: dict = {}
+
+    def _paso1(self, titulos, resumenes, dsu):
+        def nt(t, n):
+            return ' '.join(re.sub(r'[^a-z0-9\s]', '', unidecode(str(t).lower())).split()[:n])
+        bt, br = defaultdict(list), defaultdict(list)
+        for i, (ti, re_) in enumerate(zip(titulos, resumenes)):
+            a, b = nt(ti, 40), nt(re_, 15)
+            if a: bt[hashlib.md5(a.encode()).hexdigest()].append(i)
+            if b: br[hashlib.md5(b.encode()).hexdigest()].append(i)
+        for bk in (bt, br):
+            for idxs in bk.values():
+                for j in idxs[1:]: dsu.union(idxs[0], j)
+
+    def _paso2(self, titulos, dsu):
+        norm = [normalize_title_for_comparison(t) for t in titulos]
+        n = len(norm)
+        for i in range(n):
+            if not norm[i]: continue
+            for j in range(i + 1, n):
+                if not norm[j] or dsu.find(i) == dsu.find(j): continue
+                if SequenceMatcher(None, norm[i], norm[j]).ratio() >= SIMILARITY_THRESHOLD_TITULOS:
+                    dsu.union(i, j)
+
+    def _paso2b_keywords(self, titulos, dsu, ae):
+        sim_min = self._umbrales.get('sim_minima_keywords', SIM_MINIMA_KEYWORDS_RARAS)
+        stop = {
+            'el','la','los','las','un','una','unos','unas','de','del','al',
+            'en','con','por','para','que','se','su','sus','es','son','fue',
+            'como','mas','pero','sin','sobre','entre','tras','esta','este',
+            'esto','hay','ser','han','ha','ya','muy','otro','otra','otros',
+            'otras','todo','toda','todos','todas','puede','desde','hasta',
+            'donde','cuando','quien','cual','cada','nos','les','ante','bajo',
+            'nueva','nuevo','nuevos','nuevas','forma','hace','asi','sera',
+            'segun','tiene','fueron','sido','hacer','dice','dijo','tambien',
+        }
+        titulo_words = []
+        for t in titulos:
+            ws = set()
+            for w in re.findall(r'[a-z]+', unidecode(str(t).lower())):
+                if len(w) >= 5 and w not in stop: ws.add(w)
+            titulo_words.append(ws)
+        word_freq = Counter()
+        for ws in titulo_words:
+            for w in ws: word_freq[w] += 1
+        n = len(titulos)
+        max_freq = max(2, int(n * 0.03))
+        rare_index = defaultdict(list)
+        for i, ws in enumerate(titulo_words):
+            for w in ws:
+                if 2 <= word_freq[w] <= max_freq: rare_index[w].append(i)
+        for idxs in rare_index.values():
+            for a in range(len(idxs)):
+                for b in range(a + 1, len(idxs)):
+                    ia, ib = idxs[a], idxs[b]
+                    if dsu.find(ia) == dsu.find(ib): continue
+                    ea, eb = ae[ia], ae[ib]
+                    if ea is None or eb is None: continue
+                    sim = cosine_similarity(
+                        np.array(ea).reshape(1, -1),
+                        np.array(eb).reshape(1, -1)
+                    )[0][0]
+                    if sim >= sim_min: dsu.union(ia, ib)
+
+    def _paso3(self, et, ae, dsu, pbar, ps):
+        umbral_cluster = self._umbrales.get('subtema', UMBRAL_SUBTEMA)
+        sim_min = self._umbrales.get('sim_minima_agrupacion', SIM_MINIMA_AGRUPACION_SUBTEMA)
+        n = len(et)
+        if n < 2: return
+        B = 500
+        if n <= B:
+            pbar.progress(ps, "Clustering semántico...")
+            ok = [(k, e) for k, e in enumerate(ae) if e is not None]
+            if len(ok) < 2: return
+            io_, M = zip(*ok)
+            sim_matrix = cosine_similarity(np.array(M))
+            linkage = 'complete' if n <= 10 else 'average'
+            labels = AgglomerativeClustering(
+                n_clusters=None, distance_threshold=1 - umbral_cluster,
+                metric='precomputed', linkage=linkage
+            ).fit(1 - sim_matrix).labels_
+            g = defaultdict(list)
+            for k, lbl in enumerate(labels): g[lbl].append(io_[k])
+            for cl in g.values():
+                if len(cl) < 2: continue
+                vecs = np.array([ae[i] for i in cl if ae[i] is not None])
+                if len(vecs) < 2: continue
+                centroid = np.mean(vecs, axis=0)
+                sims_al_centroid = cosine_similarity(vecs, centroid.reshape(1, -1)).flatten()
+                todos_ok = all(s >= sim_min for s in sims_al_centroid)
+                if todos_ok:
+                    for j in cl[1:]: dsu.union(cl[0], j)
+                else:
+                    mejor_idx = int(np.argmax(sims_al_centroid))
+                    repr_vec = np.array(ae[cl[mejor_idx]]).reshape(1, -1)
+                    for k_local, i_global in enumerate(cl):
+                        if ae[i_global] is None: continue
+                        sim_vs_repr = cosine_similarity(
+                            np.array(ae[i_global]).reshape(1, -1), repr_vec
+                        )[0][0]
+                        if sim_vs_repr >= sim_min: dsu.union(cl[mejor_idx], i_global)
+            pbar.progress(ps + 0.18, "Clustering completado")
+            return
+
+        tb = max(1, (n + B - 1) // B)
+        for bn_, bs in enumerate(range(0, n, B)):
+            bi = list(range(bs, min(bs + B, n)))
+            ok = [(idx, ae[idx]) for idx in bi if ae[idx] is not None]
+            if len(ok) < 2: continue
+            io_, M = zip(*ok)
+            sim_matrix = cosine_similarity(np.array(M))
+            labels = AgglomerativeClustering(
+                n_clusters=None, distance_threshold=1 - umbral_cluster,
+                metric='precomputed', linkage='average'
+            ).fit(1 - sim_matrix).labels_
+            g = defaultdict(list)
+            for k, lbl in enumerate(labels): g[lbl].append(io_[k])
+            for cl in g.values():
+                if len(cl) < 2: continue
+                vecs = np.array([ae[i] for i in cl if ae[i] is not None])
+                if len(vecs) < 2: continue
+                centroid = np.mean(vecs, axis=0)
+                sims = cosine_similarity(vecs, centroid.reshape(1, -1)).flatten()
+                mejor_idx = int(np.argmax(sims))
+                repr_vec = np.array(ae[cl[mejor_idx]]).reshape(1, -1)
+                for k_local, i_global in enumerate(cl):
+                    if ae[i_global] is None: continue
+                    s = cosine_similarity(np.array(ae[i_global]).reshape(1, -1), repr_vec)[0][0]
+                    if s >= sim_min: dsu.union(cl[mejor_idx], i_global)
+            pbar.progress(ps + 0.15 * (bn_ + 1) / tb, f"Clustering {bn_ + 1}/{tb}...")
+
+        pbar.progress(ps + 0.16, "Unificando...")
+        usar_fusion = self._umbrales.get('usar_fusion_iterativa', True)
+        if usar_fusion: self._fusion(et, ae, dsu, pbar, ps + 0.16)
+
+    def _fusion(self, textos, ae, dsu, pbar, ps):
+        n = len(textos)
+        umbral_inter = self._umbrales.get('fusion_intergrupo', UMBRAL_FUSION_INTERGRUPO)
+        max_iter = self._umbrales.get('max_iter_fusion', MAX_ITER_FUSION)
+        sim_min = self._umbrales.get('sim_minima_agrupacion', SIM_MINIMA_AGRUPACION_SUBTEMA)
+        for it in range(max_iter):
+            grupos = dsu.grupos(n)
+            if len(grupos) < 2: break
+            centroids, vg = [], []
+            for gid, idxs in grupos.items():
+                vecs = [ae[i] for i in idxs[:50] if ae[i] is not None]
+                if vecs:
+                    centroids.append(np.mean(vecs, axis=0))
+                    vg.append(gid)
+            if len(vg) < 2: break
+            sim = cosine_similarity(np.array(centroids))
+            umbral_efectivo = max(umbral_inter, sim_min)
+            pairs = sorted(
+                [(sim[i][j], i, j) for i in range(len(vg)) for j in range(i + 1, len(vg))
+                 if sim[i][j] >= umbral_efectivo], reverse=True
+            )
+            fus = 0
+            for _, i, j in pairs:
+                ri, rj = grupos[vg[i]][0], grupos[vg[j]][0]
+                if dsu.find(ri) != dsu.find(rj):
+                    dsu.union(ri, rj)
+                    fus += 1
+            pbar.progress(min(ps + 0.04 * (it + 1), 0.52), f"Fusión {it + 1}: {fus}")
+            if fus == 0: break
+
+    def _extraer_keywords_titulos(self, titulos_grp: list, top_n: int = 6) -> list:
+        palabras = []
+        for t in titulos_grp[:10]:
+            for w in string_norm_label(t).split():
+                if len(w) > 3: palabras.append(w)
+        return [w for w, _ in Counter(palabras).most_common(top_n)]
+
+    def _generar_etiqueta(self, textos_grp, titulos_grp, resumenes_grp, subtemas_existentes=None):
+        tn = sorted(set(normalize_title_for_comparison(t) for t in titulos_grp if t))
+        ck = hashlib.md5(("|".join(tn[:12]) + f"#{len(titulos_grp)}").encode()).hexdigest()
+        if ck in self._cache: return self._cache[ck]
+
+        tm = list(dict.fromkeys(t[:130] for t in titulos_grp if t))[:6]
+        rm = [str(r)[:200] for r in resumenes_grp[:3] if r and len(str(r)) > 20]
+
+        kw_list = self._extraer_keywords_titulos(titulos_grp, top_n=8)
+        palabras_res = []
+        for r in resumenes_grp[:5]:
+            for w in string_norm_label(str(r)).split():
+                if len(w) > 4: palabras_res.append(w)
+        kw_res = [w for w, _ in Counter(palabras_res).most_common(4)
+                  if w not in {unidecode(k.lower()) for k in kw_list}]
+        kw_todos = kw_list + kw_res
+        kw = ", ".join(kw_todos[:10])
+
+        ctx_resumenes = (
+            "\nRESÚMENES (para contexto):\n"
+            + "\n".join(f"  · {r}" for r in rm)
+        ) if rm else ""
+
+        if len(kw_list) >= 3:
+            ejemplo_dinamico = (
+                f"'{kw_list[0].title()} de {kw_list[1].title()}' o "
+                f"'{kw_list[0].title()} del {kw_list[2].title()}'"
+            )
+        elif len(kw_list) >= 2:
+            ejemplo_dinamico = f"'{kw_list[0].title()} de {kw_list[1].title()}'"
+        elif len(kw_list) == 1:
+            ejemplo_dinamico = f"'{kw_list[0].title()} en la región'"
+        else:
+            ejemplo_dinamico = "'Proyecto de terminal de transportes'"
+
+        lista_existentes = ""
+        if subtemas_existentes and len(subtemas_existentes) > 0:
+            lista_existentes = (
+                "\n\nSUBTEMAS YA CREADOS (ÚSALOS SI APLICAN EXACTAMENTE):\n" +
+                ", ".join(f"'{s}'" for s in subtemas_existentes[:15]) +
+                "\nREGLA: Si este grupo de noticias trata EXACTAMENTE del mismo tema que uno de los subtemas ya creados, responde con ese subtema. Si es un tema distinto, crea uno nuevo."
+            )
+
+        prompt = (
+            "Eres editor jefe de un periódico. "
+            "Genera UN subtema periodístico (4-7 palabras) que sea una FRASE NOMINAL "
+            "— sin sujeto ni verbo conjugado — para este grupo de noticias.\n\n"
+            "TÍTULOS:\n" + "\n".join(f"  · {t}" for t in tm)
+            + ctx_resumenes
+            + f"\n\nPALABRAS CLAVE: {kw}"
+            + lista_existentes
+            + "\n\nREGLAS OBLIGATORIAS:\n"
+            "  1. FRASE NOMINAL PURA: empieza con sustantivo, usa preposición para unir conceptos.\n"
+            "     NUNCA empieces con cargo/persona ('Alcalde', 'Gobernador', 'Ministro').\n"
+            "     NUNCA incluyas verbo conjugado ('presenta', 'anuncia', 'lanza', 'inaugura').\n"
+            f"     CORRECTO: {ejemplo_dinamico}\n"
+            "     INCORRECTO: 'Alcalde presenta proyecto terminal', "
+            "'Gobernador anuncia inversión', 'Alcaldía lanza plan'\n"
+            "  2. USA preposiciones (de, del, para, sobre, en, por) para conectar conceptos.\n"
+            "  3. SÉ ESPECÍFICO: describe el asunto real, no el actor.\n"
+            "  4. Ciudades y regiones SÍ pueden aparecer si son relevantes al tema.\n"
+            "  5. Sin nombre de marcas privadas. Tildes y ñ correctas. "
+            "  6. SIN MARCA: NO incluyas bajo ninguna circunstancia 'Universidad Nacional' ni 'UNAL' en el subtema.\n\n"
+            "EJEMPLOS CORRECTOS: 'Proyecto de terminal de transportes', "
+            "'Operación del Canal del Dique', 'Plan de infraestructura vial', "
+            "'Regulación de tarifas eléctricas', 'Inversión en salud pública'\n"
+            "EJEMPLOS INCORRECTOS: 'Alcalde presenta proyecto', 'Gobernador lanza plan', "
+            "'Tarifas energía', 'Gestión corporativa', 'Actividad legislativa'\n\n"
+            'JSON: {"subtema":"..."}'
+        )
+
+        _VERBOS_FRASES = re.compile(
+            r'\b(presenta|presentan|anuncia|anuncian|lanza|lanzan|inaugura|inauguran|'
+            r'realiza|realizan|desarrolla|desarrollan|ejecuta|ejecutan|gestiona|gestionan|'
+            r'impulsa|impulsan|promueve|promueven|lidera|lideran|encabeza|encabezan|'
+            r'aprueba|aprueban|firma|firman|suscribe|suscriben|invierte|invierten|'
+            r'construye|construyen|instala|instalan|entrega|entregan|recibe|reciben|'
+            r'solicita|solicitan|visita|visitan|atiende|atienden|destaca|destacan|'
+            r'señala|señalan|indica|indican|expresa|expresan|afirma|afirman|'
+            r'propone|proponen|pide|piden|exige|exigen|apoya|apoyan|'
+            r'informa|informan|reporta|reportan|advierte|advierten)\b',
+            re.IGNORECASE
+        )
+
+        def _tiene_verbo_conjugado(s): return bool(_VERBOS_FRASES.search(s))
+
+        try:
+            resp = call_with_retries(
+                openai.ChatCompletion.create,
+                model=OPENAI_MODEL_CLASIFICACION,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=60,
+                temperature=0.0,
+                response_format={"type": "json_object"}
+            )
+            u = resp.get('usage', {}) if isinstance(resp, dict) else getattr(resp, 'usage', {})
+            if u:
+                st.session_state['tokens_input'] += (u.get('prompt_tokens') if isinstance(u, dict) else getattr(u, 'prompt_tokens', 0)) or 0
+                st.session_state['tokens_output'] += (u.get('completion_tokens') if isinstance(u, dict) else getattr(u, 'completion_tokens', 0)) or 0
+
+            raw = json.loads(resp.choices[0].message.content).get("subtema", "Varios")
+            et = limpiar_tema_geografico(limpiar_tema(raw), self.marca, self.aliases)
+
+            if not et or et.strip().lower() == "sin tema":
+                et = self._refinar(tm, kw, rm, forzar_preposicion=True)
+            if _tiene_verbo_conjugado(et):
+                et = self._refinar(tm, kw, rm, forzar_preposicion=True, prohibir_verbos=True)
+
+            def _es_robotico(s):
+                palabras = s.split()
+                if len(palabras) <= 3:
+                    nexos = {"de", "del", "para", "sobre", "en", "con", "por",
+                             "ante", "hacia", "entre", "sin", "al", "las", "los",
+                             "una", "uno", "que", "como", "y", "o", "a", "e", "u"}
+                    tiene_nexo = any(unidecode(p.lower()) in nexos for p in palabras[1:])
+                    if not tiene_nexo: return True
+                return False
+
+            genericas = {"gestión", "gestion", "actividades", "acciones", "noticias",
+                         "información", "informacion", "eventos", "varios", "sin tema",
+                         "actividad corporativa", "gestion corporativa"}
+            es_gen = string_norm_label(et) in {string_norm_label(g) for g in genericas}
+            es_rob = _es_robotico(et)
+
+            if es_gen or es_rob or len(et.split()) < 3:
+                et = self._refinar(tm, kw, rm, forzar_preposicion=True)
+
+            if not _validar_estructura_subtema(et):
+                et = self._refinar(tm, kw, rm, forzar_preposicion=True)
+                if not _validar_estructura_subtema(et):
+                    et = self._fallback(titulos_grp)
+
+            et = _validar_etiqueta_completa(
+                et, titulos_grp=titulos_grp, resumenes_grp=resumenes_grp,
+                marca=self.marca, aliases=self.aliases, fallback_fn=self._fallback
+            )
+        except:
+            et = self._fallback(titulos_grp)
+
+        et = capitalizar_etiqueta(et)
+        self._cache[ck] = et
+        return et
+
+    def _refinar(self, titulos, kw, resumenes=None, forzar_preposicion=False, prohibir_verbos=False):
+        ctx = ("\nContexto de resúmenes: " + " | ".join(r[:100] for r in resumenes[:3])) if resumenes else ""
+        kw_parts = [w.strip() for w in kw.split(",") if w.strip()]
+
+        if len(kw_parts) >= 3:
+            ej_bueno = f"'{kw_parts[0].title()} de {kw_parts[1].title()}', '{kw_parts[0].title()} en {kw_parts[2].title()}'"
+        elif len(kw_parts) >= 2:
+            ej_bueno = f"'{kw_parts[0].title()} de {kw_parts[1].title()}'"
+        elif len(kw_parts) == 1:
+            ej_bueno = f"'{kw_parts[0].title()} en la región'"
+        else:
+            ej_bueno = "'Proyecto de terminal de transportes'"
+
+        ej_malo = f"'{kw_parts[0].title()} {kw_parts[1].title()}' (sin preposición)" if len(kw_parts) >= 2 else "'Actividad corporativa', 'Gestión institucional'"
+
+        instruccion_prep = (
+            "  OBLIGATORIO: usa una preposición (de, del, para, sobre, en, por) "
+            "entre los conceptos. NUNCA dos sustantivos pegados sin nexo.\n"
+        ) if forzar_preposicion else ""
+
+        instruccion_verbo = (
+            "  PROHIBIDO: verbos conjugados ('presenta', 'anuncia', 'lanza', 'inaugura', etc.). "
+            "Solo frases nominales (sustantivos + preposiciones).\n"
+            "  NUNCA empieces con cargo ('Alcalde', 'Gobernador', 'Ministro', 'Director').\n"
+        ) if prohibir_verbos else ""
+
+        prompt = (
+            "Eres editor jefe. Genera UN subtema periodístico (4-7 palabras) "
+            "como frase nominal sin verbo conjugado.\n\n"
+            f"Títulos: {' | '.join(titulos[:5])}{ctx}\n"
+            f"Keywords: {kw}\n\n"
+            f"{instruccion_prep}{instruccion_verbo}"
+            f"CORRECTO: {ej_bueno}, 'Tarifas de energía eléctrica'\n"
+            f"INCORRECTO: {ej_malo}, 'Alcalde presenta plan'\n"
+            "Tildes y ñ correctas. Sin marcas privadas.\n"
+            'JSON: {"subtema":"..."}'
+        )
+        try:
+            resp = call_with_retries(
+                openai.ChatCompletion.create,
+                model=OPENAI_MODEL_CLASIFICACION,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=60,
+                temperature=0.2,
+                response_format={"type": "json_object"}
+            )
+            raw = json.loads(resp.choices[0].message.content).get("subtema", "Varios")
+            et = limpiar_tema_geografico(limpiar_tema(raw), self.marca, self.aliases)
+            if not _frase_esta_completa(et):
+                et = _recortar_frase_completa(et)
+                if not _frase_esta_completa(et): return self._fallback(titulos)
+            return et
+        except:
+            return self._fallback([])
+
+    def _fallback(self, titulos):
+        if not titulos: return "Cobertura informativa general"
+        palabras = []
+        for t in titulos[:5]:
+            for w in string_norm_label(t).split():
+                if len(w) > 4: palabras.append(w)
+        if palabras:
+            top = [w for w, _ in Counter(palabras).most_common(3)]
+            if len(top) >= 2:
+                frase = f"{top[0]} de {top[1]}"
+                if _frase_esta_completa(frase): return capitalizar_etiqueta(frase)
+                return capitalizar_etiqueta(f"{top[0]} {top[1]}")
+            return capitalizar_etiqueta(top[0])
+        return "Cobertura informativa general"
+
+    def _consolidar_sinonimos_llm(self, subtemas_unicos):
+        if len(subtemas_unicos) <= 1:
+            return {s: s for s in subtemas_unicos}
+            
+        prompt = (
+            "Eres un analista de datos. Tienes la siguiente lista de subtemas periodísticos:\n"
+            f"{', '.join(subtemas_unicos)}\n\n"
+            "Tu tarea es encontrar SUBTEMAS SINÓNIMOS que signifiquen exactamente lo mismo "
+            "(aunque usen palabras ligeramente distintas) y unificarlos bajo el nombre más claro y representativo.\n"
+            "REGLAS:\n"
+            "1. NO fusiones temas que sean distintos (ej. 'Inversión en vías' y 'Mantenimiento de vías' son distintos).\n"
+            "2. SÍ fusiona sinónimos (ej. 'Lanzamiento de plataforma web' y 'Estreno de portal digital').\n"
+            "3. Devuelve un objeto JSON donde las claves sean los subtemas originales y el valor sea el subtema unificado.\n\n"
+            'Ejemplo de salida:\n'
+            '{"Tendencias de consumo de pollo": "Tendencias de consumo de pollo", "Hábitos de compra de aves": "Tendencias de consumo de pollo"}'
+        )
+        try:
+            resp = call_with_retries(
+                openai.ChatCompletion.create,
+                model=OPENAI_MODEL_CLASIFICACION,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1000,
+                temperature=0.0,
+                response_format={"type": "json_object"}
+            )
+            return json.loads(resp.choices[0].message.content)
+        except:
+            return {s: s for s in subtemas_unicos}
+
+    def procesar_lote(self, col, pbar, res_puros, tit_puros):
+        textos   = col.tolist()
+        titulos  = tit_puros.tolist()
+        resumenes = res_puros.tolist()
+        n = len(textos)
+
+        self._umbrales = _umbrales_adaptativos(n)
+        u = self._umbrales
+        st.caption(
+            f"📐 Corpus: **{n}** noticias · Umbral subtema: **{u['subtema']}** · "
+            f"Sim mínima: **{u['sim_minima_agrupacion']}**"
+        )
+
+        et = [texto_para_embedding(titulos[i], resumenes[i]) for i in range(n)]
+
+        pbar.progress(0.05, "Fase 1 · Idénticas...")
+        dsu = DSU(n)
+        self._paso1(titulos, resumenes, dsu)
+        
+        pbar.progress(0.12, "Fase 2 · Títulos...")
+        self._paso2(titulos, dsu)
+
+        pbar.progress(0.18, "Embeddings...")
+        ae = get_embeddings_batch(et)
+
+        if u['usar_paso2b']:
+            pbar.progress(0.15, "Fase 2b · Keywords raras (con validación semántica)...")
+            self._paso2b_keywords(titulos, dsu, ae)
+
+        pbar.progress(0.20, "Fase 3 · Clustering...")
+        self._paso3(et, ae, dsu, pbar, 0.20)
+
+        gf = dsu.grupos(n)
+        ng = len(gf)
+        pbar.progress(0.55, f"Fase 4 · Etiquetando {ng} grupos...")
+        mapa = {}
+        sg = sorted(gf.items(), key=lambda x: -len(x[1]))
+        subtemas_aprobados = [] 
+
+        for k, (lid, idxs) in enumerate(sg):
+            if k % 10 == 0: pbar.progress(0.55 + 0.25 * (k / max(ng, 1)), f"Etiquetando {k + 1}/{ng}...")
+            
+            if len(idxs) > MAX_GRUPO_ETIQUETA:
+                subgrupos = [idxs[i:i + MAX_GRUPO_ETIQUETA] for i in range(0, len(idxs), MAX_GRUPO_ETIQUETA)]
+                for sg_ in subgrupos:
+                    e = self._generar_etiqueta(
+                        [textos[i] for i in sg_],
+                        [titulos[i] for i in sg_],
+                        [resumenes[i] for i in sg_],
+                        subtemas_existentes=subtemas_aprobados
+                    )
+                    if e not in subtemas_aprobados: subtemas_aprobados.append(e)
+                    for i in sg_: mapa[i] = e
+            else:
+                e = self._generar_etiqueta(
+                    [textos[i] for i in idxs],
+                    [titulos[i] for i in idxs],
+                    [resumenes[i] for i in idxs],
+                    subtemas_existentes=subtemas_aprobados
+                )
+                if e not in subtemas_aprobados: subtemas_aprobados.append(e)
+                for i in idxs: mapa[i] = e
+
+        subtemas = [mapa.get(i, "Varios") for i in range(n)]
+
+        pbar.progress(0.80, "Fase 4b · Coherencia etiqueta↔texto...")
+        umbral_coherencia = u['coherencia_etiqueta']
+        subtemas_unicos = list(set(subtemas))
+        embs_sub_lista = get_embeddings_batch(subtemas_unicos)
+        emb_subtemas = {sub: emb for sub, emb in zip(subtemas_unicos, embs_sub_lista) if emb is not None}
+
+        incoherentes = 0
+        for i in range(n):
+            sub = subtemas[i]
+            emb_txt = ae[i]
+            emb_sub = emb_subtemas.get(sub)
+            if emb_txt is None or emb_sub is None: continue
+            sim = cosine_similarity(np.array(emb_txt).reshape(1, -1), np.array(emb_sub).reshape(1, -1))[0][0]
+            if sim < umbral_coherencia:
+                mejor_sub, mejor_sim = sub, sim
+                for otro_sub, emb_otro in emb_subtemas.items():
+                    if otro_sub == sub: continue
+                    sim_otro = cosine_similarity(np.array(emb_txt).reshape(1, -1), np.array(emb_otro).reshape(1, -1))[0][0]
+                    if sim_otro > mejor_sim: mejor_sim = sim_otro; mejor_sub = otro_sub
+                if mejor_sub != sub and mejor_sim > umbral_coherencia:
+                    subtemas[i] = mejor_sub
+                else:
+                    nueva = self._generar_etiqueta([textos[i]], [titulos[i]], [resumenes[i]], subtemas_existentes=subtemas_aprobados)
+                    subtemas[i] = capitalizar_etiqueta(nueva)
+                    if nueva not in subtemas_aprobados: subtemas_aprobados.append(nueva)
+                incoherentes += 1
+
+        pbar.progress(0.82, "Fase 5 · Dedup...")
+        subtemas = dedup_labels(subtemas, u['dedup_label'])
+
+        pbar.progress(0.86, "Fase 5b · Fusión semántica...")
+        textos_por_sub = defaultdict(list)
+        for i, s in enumerate(subtemas): textos_por_sub[s].append(textos[i])
+        subtemas = _fusionar_subtemas_semanticos(subtemas, textos_por_sub, self.marca, self.aliases, u['fusion_subtemas'])
+
+        pbar.progress(0.90, "Fase 6 · Consistencia...")
+        subtemas = self._consistencia(subtemas, ae, pbar, u)
+
+        indices_reclass = [i for i, s in enumerate(subtemas) if s == "_RECLASSIFICAR"]
+        if indices_reclass:
+            pbar.progress(0.93, f"Fase 6b · Reclasificando...")
+            for i in indices_reclass:
+                et_ind = self._generar_etiqueta([textos[i]], [titulos[i]], [resumenes[i]], subtemas_existentes=subtemas_aprobados)
+                subtemas[i] = capitalizar_etiqueta(et_ind)
+                if et_ind not in subtemas_aprobados: subtemas_aprobados.append(et_ind)
+
+        pbar.progress(0.93, "Fase 7 · Completitud...")
+        subtemas = self._validar_completitud_final(subtemas, textos, titulos, resumenes)
+
+        pbar.progress(0.97, "Fase 8 · Dedup final...")
+        subtemas = dedup_labels(subtemas, u['dedup_label'])
+        
+        pbar.progress(0.99, "Consolidación final IA de sinónimos...")
+        unicos_finales = list(dict.fromkeys(subtemas))
+        if 1 < len(unicos_finales) <= 50:
+            mapa_sinonimos = self._consolidar_sinonimos_llm(unicos_finales)
+            subtemas = [mapa_sinonimos.get(s, s) for s in subtemas]
+
+        subtemas = [capitalizar_etiqueta(s) for s in subtemas]
+        nf = len(set(subtemas))
+        pbar.progress(1.0, f"{nf} subtemas")
+        st.info(f"Subtemas: **{nf}** · Grupos originales: **{ng}**")
+        return subtemas
+
+    def _validar_completitud_final(self, subtemas, textos, titulos, resumenes):
+        por_subtema = defaultdict(list)
+        for i, s in enumerate(subtemas): por_subtema[s].append(i)
+        resultado = list(subtemas)
+        for sub, idxs in por_subtema.items():
+            if _frase_esta_completa(sub): continue
+            recortada = _recortar_frase_completa(sub)
+            if _frase_esta_completa(recortada) and len(recortada.split()) >= 2:
+                for i in idxs: resultado[i] = capitalizar_etiqueta(recortada)
+                continue
+            tit_grp = [titulos[i] for i in idxs[:6]]
+            res_grp = [resumenes[i] for i in idxs[:3]]
+            nueva = _validar_etiqueta_completa(
+                sub, titulos_grp=tit_grp, resumenes_grp=res_grp,
+                marca=self.marca, aliases=self.aliases, fallback_fn=self._fallback
+            )
+            for i in idxs: resultado[i] = capitalizar_etiqueta(nueva)
+        return resultado
+
+    def _consistencia(self, subtemas, ae, pbar, umbrales=None):
+        min_sub = umbrales.get('min_pertenencia_subtema', UMBRAL_MIN_PERTENENCIA_SUBTEMA)
+        ps = defaultdict(list)
+        for i, s in enumerate(subtemas): ps[s].append(i)
+        r = list(subtemas)
+        centroids = {}
+        for sub, idxs in ps.items():
+            vecs = [ae[i] for i in idxs if ae[i] is not None]
+            if vecs: centroids[sub] = np.mean(vecs, axis=0)
+        for sub in [s for s in centroids if len(ps[s]) >= 3]:
+            idxs = ps[sub]
+            if sub.lower() in ("sin tema", "varios") or len(idxs) < 3: continue
+            vi = [(i, ae[i]) for i in idxs if ae[i] is not None]
+            if len(vi) < 3: continue
+            v_i, v_v = zip(*vi)
+            M = np.array(v_v)
+            sims = cosine_similarity(M, centroids[sub].reshape(1, -1)).flatten()
+            thr = max(0.60, np.mean(sims) - 2 * np.std(sims))
+            for k, (oi, sv) in enumerate(zip(v_i, sims)):
+                if sv >= thr: continue
+                bs, bsim = sub, sv
+                emb = ae[oi]
+                for os_, oc in centroids.items():
+                    if os_ == sub: continue
+                    s2 = cosine_similarity(np.array(emb).reshape(1, -1), oc.reshape(1, -1))[0][0]
+                    if s2 > bsim and s2 > 0.75: bsim = s2; bs = os_
+                if bs != sub: r[oi] = bs
+                elif sv < min_sub: r[oi] = "_RECLASSIFICAR"
+        return r
+
+# ======================================
+# TEMAS  
+# ======================================
+def _construir_representacion_grupo(subtema, textos_grupo, max_textos=30):
+    palabras = []
+    for t in textos_grupo[:max_textos]:
+        for w in string_norm_label(str(t)).split():
+            if len(w) > 3: palabras.append(w)
+    kw_str = " ".join(w for w, _ in Counter(palabras).most_common(12))
+    return f"{subtema}. {subtema}. {kw_str}"[:500]
+
+def _validar_estructura_tema(tema: str) -> bool:
+    if not tema or len(tema.split()) < 2: return False
+    if len(tema.split()) > 4: return False
+    if re.match(r'^[0-9]', tema): return False
+    num_palabras = re.compile(
+        r'^(uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|'
+        r'once|doce|veinte|cien|varios|cada)', re.IGNORECASE
+    )
+    if num_palabras.match(tema): return False
+    if _PATRON_TITULAR.match(tema): return False
+    if _PATRON_ESTADO.search(tema): return False
+    return True
+
+def _tema_es_igual_a_subtema(tema: str, subtemas_grupo: list) -> bool:
+    if not tema or not subtemas_grupo: return False
+    tn = string_norm_label(tema)
+    for sub in subtemas_grupo:
+        sn = string_norm_label(sub)
+        if not tn or not sn: continue
+        if SequenceMatcher(None, tn, sn).ratio() >= 0.80: return True
+        if tn in sn or sn in tn: return True
+    return False
+
+def _generar_nombre_tema_llm(subtemas_grupo, textos_muestra, titulos_muestra):
+    subs_list = "\n".join(f"  · {s}" for s in subtemas_grupo[:8])
+    palabras = []
+    for t in titulos_muestra[:15]:
+        for w in string_norm_label(str(t)).split():
+            if len(w) > 3: palabras.append(w)
+    kw = ", ".join(w for w, _ in Counter(palabras).most_common(6))
+    tit_muestra = "\n".join(f"  · {t[:100]}" for t in list(dict.fromkeys(titulos_muestra))[:5])
+    prompt = (
+        "Eres editor jefe de un periódico. Crea UNA sección editorial (2-4 palabras) que agrupe estos subtemas.\n\n"
+        "SUBTEMAS:\n" + subs_list + "\n\nTÍTULOS DE REFERENCIA:\n" + tit_muestra +
+        f"\n\nKEYWORDS: {kw}\n\n"
+        "REGLAS ESTRICTAS:\n"
+        "  1. Piensa en secciones de periódico: 'Política', 'Economía', 'Tecnología', 'Seguridad', 'Justicia', 'Medio Ambiente'.\n"
+        "  2. Más GENERAL y ABSTRACTO que los subtemas — nunca repitas un subtema ni copies fragmentos de titular.\n"
+        "  3. NUNCA incluyas números, cantidades ni nombres propios.\n"
+        "  4. 2-4 palabras. Sustantivo + adjetivo o sustantivo solo.\n"
+        "  5. Tildes y ñ correctas. "
+        "  6. SIN MARCA: NO incluyas bajo ninguna circunstancia 'Universidad Nacional' ni 'UNAL'.\n\n"
+        "CORRECTO: 'Política', 'Gestión legislativa', 'Justicia penal', 'Regulación financiera'\n"
+        "INCORRECTO: 'Cinco congresistas con líos', 'Congresistas electos', 'Investigación disciplinaria congreso', 'Nuevo acuerdo'\n\n"
+        'JSON: {"tema":"..."}'
+    )
+    try:
+        resp = call_with_retries(
+            openai.ChatCompletion.create,
+            model=OPENAI_MODEL_CLASIFICACION,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=40,
+            temperature=0.05,
+            response_format={"type": "json_object"}
+        )
+        raw = json.loads(resp.choices[0].message.content).get("tema", "").strip().replace('"', '').replace('.', '')
+        nombre = limpiar_tema(raw)
+        if not _validar_estructura_tema(nombre): return None
+        return nombre
+    except:
+        return None
+
+def _regenerar_tema_diferente(subtemas_grupo, titulos_muestra, intento=0):
+    subs_list = ", ".join(subtemas_grupo[:8])
+    prompt = (
+        f"Subtemas: {subs_list}\n\n"
+        "Genera UNA categoría GENERAL (2-3 palabras), diferente a los subtemas. "
+        "Piensa en sección de periódico (Economía, Política, Tecnología, Infraestructura, Cultura, Deportes…). "
+        "Tildes y ñ correctas, terminar en sustantivo/adjetivo.\n"
+        'JSON: {"tema":"..."}'
+    )
+    try:
+        resp = call_with_retries(
+            openai.ChatCompletion.create,
+            model=OPENAI_MODEL_CLASIFICACION,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=50,
+            temperature=0.2 + intento * 0.1,
+            response_format={"type": "json_object"}
+        )
+        return limpiar_tema(json.loads(resp.choices[0].message.content).get("tema", "").strip().replace('"', '').replace('.', ''))
+    except:
+        return None
+
+def consolidar_temas(subtemas, textos, pbar):
+    n = len(textos)
+    u = _umbrales_adaptativos(n)
+    pbar.progress(0.05, "Preparando temas...")
+    df = pd.DataFrame({'subtema': subtemas, 'texto': textos})
+    us = list(df['subtema'].unique())
+    if len(us) <= 1:
+        pbar.progress(1.0, "Un tema")
+        return [capitalizar_etiqueta(s) for s in subtemas]
+
+    if n <= 5 and len(us) == n:
+        pbar.progress(1.0, "Corpus pequeño: temas = subtemas")
+        st.info(f"Temas: **{n}** (corpus pequeño — cada noticia tiene tema propio)")
+        return [capitalizar_etiqueta(s) for s in subtemas]
+
+    pbar.progress(0.10, "Representaciones...")
+    textos_por_subtema = defaultdict(list)
+    for i, sub in enumerate(subtemas): textos_por_subtema[sub].append(textos[i])
+    repr_enriquecidas = [_construir_representacion_grupo(sub, textos_por_subtema[sub]) for sub in us]
+    pbar.progress(0.20, "Embeddings contenido...")
+    emb_repr = get_embeddings_batch(repr_enriquecidas)
+    emb_labels = get_embeddings_batch(us)
+    ae = get_embeddings_batch(textos)
+    centroids_contenido = {}
+    for sub in us:
+        idxs = df.index[df['subtema'] == sub].tolist()[:50]
+        vecs = [ae[i] for i in idxs if ae[i] is not None]
+        if vecs: centroids_contenido[sub] = np.mean(vecs, axis=0)
+    pbar.progress(0.35, "Similitudes...")
+    vs = [s for s in us if s in centroids_contenido]
+    if len(vs) < 2:
+        pbar.progress(1.0, "Sin agrupación")
+        return [capitalizar_etiqueta(s) for s in subtemas]
+    idx_map = {s: i for i, s in enumerate(us)}
+    M_content = np.array([centroids_contenido[s] for s in vs])
+    sim_content = cosine_similarity(M_content)
+    has_repr = all(emb_repr[idx_map[s]] is not None for s in vs)
+    has_label = all(emb_labels[idx_map[s]] is not None for s in vs)
+    if has_repr and has_label:
+        sim_combined = (0.50 * sim_content + 0.35 * cosine_similarity(np.array([emb_repr[idx_map[s]] for s in vs])) + 0.15 * cosine_similarity(np.array([emb_labels[idx_map[s]] for s in vs])))
+    elif has_repr:
+        sim_combined = (0.60 * sim_content + 0.40 * cosine_similarity(np.array([emb_repr[idx_map[s]] for s in vs])))
+    else:
+        sim_combined = sim_content
+
+    pbar.progress(0.45, "Clustering temas...")
+    dist_matrix = np.clip(1 - sim_combined, 0, 2)
+    np.fill_diagonal(dist_matrix, 0)
+    umbral_tema = u['tema']
+    num_temas_max = u['num_temas_max']
+    linkage_temas = 'complete' if len(vs) <= 6 else 'average'
+    cl = AgglomerativeClustering(
+        n_clusters=None, distance_threshold=1 - umbral_tema,
+        metric='precomputed', linkage=linkage_temas
+    ).fit(dist_matrix)
+    if len(set(cl.labels_)) > num_temas_max:
+        cl = AgglomerativeClustering(n_clusters=num_temas_max, metric='precomputed', linkage=linkage_temas).fit(dist_matrix)
+
+    clusters = defaultdict(list)
+    for i, lbl in enumerate(cl.labels_): clusters[lbl].append(vs[i])
+    uc = [s for s in us if s not in vs]
+    mt = {}
+    tc = len(clusters)
+    pbar.progress(0.50, f"Nombres {tc} temas...")
+    for k, (cid, subtemas_cluster) in enumerate(clusters.items()):
+        pbar.progress(0.50 + 0.35 * (k / max(tc, 1)), f"Tema {k + 1}/{tc}...")
+        titulos_cluster = []
+        textos_cluster = []
+        for sub in subtemas_cluster:
+            for idx in df.index[df['subtema'] == sub].tolist()[:10]:
+                txt = str(textos[idx])
+                partes = txt.split('. ')
+                if partes: titulos_cluster.append(partes[0][:120])
+                textos_cluster.append(txt[:200])
+        if len(subtemas_cluster) == 1:
+            sub_unico = subtemas_cluster[0]
+            nombre = _generar_nombre_tema_llm(subtemas_cluster, textos_cluster, titulos_cluster)
+            if not nombre or _tema_es_igual_a_subtema(nombre, subtemas_cluster):
+                nombre = _regenerar_tema_diferente(subtemas_cluster, titulos_cluster)
+            if not nombre or _tema_es_igual_a_subtema(nombre, subtemas_cluster):
+                p = sub_unico.split()
+                nombre = _recortar_frase_completa(" ".join(p), max_palabras=3) if len(p) > 3 else sub_unico
+                if _tema_es_igual_a_subtema(nombre, subtemas_cluster): nombre = sub_unico
+        else:
+            nombre = _generar_nombre_tema_llm(subtemas_cluster, textos_cluster, titulos_cluster)
+            if not nombre or _tema_es_igual_a_subtema(nombre, subtemas_cluster):
+                nombre = _regenerar_tema_diferente(subtemas_cluster, titulos_cluster)
+            if not nombre or _tema_es_igual_a_subtema(nombre, subtemas_cluster):
+                nombre = _regenerar_tema_diferente(subtemas_cluster, titulos_cluster, intento=1)
+            if not nombre or _tema_es_igual_a_subtema(nombre, subtemas_cluster):
+                all_words = []
+                for sub in subtemas_cluster:
+                    for w in string_norm_label(sub).split():
+                        if len(w) > 3: all_words.append(w)
+                nombre = capitalizar_etiqueta(" ".join(w for w, _ in Counter(all_words).most_common(2))) if all_words else subtemas_cluster[0]
+        if not _frase_esta_completa(nombre):
+            nombre = _recortar_frase_completa(nombre, max_palabras=4)
+            if not _frase_esta_completa(nombre):
+                freq = Counter(subtemas)
+                nombre = _recortar_frase_completa(max(subtemas_cluster, key=lambda s: freq.get(s, 0)), max_palabras=4)
+        nombre = capitalizar_etiqueta(nombre)
+        for sub in subtemas_cluster: mt[sub] = nombre
+    for sub in uc: mt[sub] = capitalizar_etiqueta(sub)
+
+    pbar.progress(0.87, "Validando pertenencia mínima a temas...")
+    min_tema = u['min_pertenencia_tema']
+    tf_inicial = [mt.get(sub, sub) for sub in subtemas]
+    tema_agrupacion: Dict[str, list] = defaultdict(list)
+    for i, tema in enumerate(tf_inicial):
+        if ae[i] is not None: tema_agrupacion[tema].append(ae[i])
+    tema_centroids: Dict[str, np.ndarray] = {
+        t: np.mean(vecs, axis=0) for t, vecs in tema_agrupacion.items() if vecs
+    }
+    tf_validado: List[str] = []
+    n_forzadas = 0
+    for i, (sub, tema_asignado) in enumerate(zip(subtemas, tf_inicial)):
+        emb = ae[i]
+        if emb is not None and tema_asignado in tema_centroids:
+            sim = cosine_similarity(np.array(emb).reshape(1, -1), tema_centroids[tema_asignado].reshape(1, -1))[0][0]
+            if sim < min_tema:
+                tf_validado.append(capitalizar_etiqueta(_recortar_frase_completa(sub, max_palabras=4)))
+                n_forzadas += 1
+                continue
+        tf_validado.append(capitalizar_etiqueta(tema_asignado))
+    if n_forzadas: st.caption(f"ℹ️ {n_forzadas} noticias con baja pertenencia al tema agrupado → tema propio asignado.")
+
+    pbar.progress(0.88, "Dedup temas...")
+    tf_validado = dedup_labels(tf_validado, u['dedup_label'])
+
+    pbar.progress(0.90, "Fusionando temas solapados...")
+    mapa_fusion_temas = _fusionar_temas_contenidos(tf_validado)
+    if mapa_fusion_temas:
+        tf_validado = [mapa_fusion_temas.get(t, t) for t in tf_validado]
+
+    pbar.progress(0.92, "Validando tema ≠ subtema...")
+    tf_validado = _post_validar_tema_vs_subtema(tf_validado, subtemas)
+    pbar.progress(0.95, "Completitud...")
+    tf_validado = [capitalizar_etiqueta(_recortar_frase_completa(t) if not _frase_esta_completa(t) else t) for t in tf_validado]
+    tf_validado = _unificar_tema_por_subtema(tf_validado, subtemas)
+    st.info(f"Temas: **{len(set(tf_validado))}** (de {len(set(subtemas))} subtemas) · Máx: {num_temas_max}")
+    pbar.progress(1.0, "Temas listos")
+    return tf_validado
+
+def _fusionar_temas_contenidos(temas: List[str]) -> Dict[str, str]:
+    unique = list(dict.fromkeys(temas))
+    if len(unique) < 2: return {}
+    normed = {t: string_norm_label(t) for t in unique}
+    mapa: Dict[str, str] = {}
+    for i, ta in enumerate(unique):
+        for tb in unique[i + 1:]:
+            na, nb = normed[ta], normed[tb]
+            if not na or not nb: continue
+            if (f" {na} " in f" {nb} ") or nb == na or nb.startswith(na + " ") or nb.endswith(" " + na):
+                canon = tb if len(tb) >= len(ta) else ta
+                reemplazar = ta if canon == tb else tb
+                mapa[reemplazar] = canon
+            elif (f" {nb} " in f" {na} ") or na.startswith(nb + " ") or na.endswith(" " + nb):
+                canon = ta if len(ta) >= len(tb) else tb
+                reemplazar = tb if canon == ta else ta
+                mapa[reemplazar] = canon
+    umbral_relajado = 0.70
+    candidatos = [(t, normed[t]) for t in unique if len(t.split()) <= 3 and t not in mapa]
+    if len(candidatos) >= 2:
+        textos_c = [t for t, _ in candidatos]
+        embs = get_embeddings_batch(textos_c)
+        validos = [(textos_c[i], embs[i]) for i in range(len(textos_c)) if embs[i] is not None]
+        if len(validos) >= 2:
+            etqs, vecs = zip(*validos)
+            sim = cosine_similarity(np.array(vecs))
+            for i in range(len(etqs)):
+                for j in range(i + 1, len(etqs)):
+                    if sim[i][j] >= umbral_relajado:
+                        ta, tb = etqs[i], etqs[j]
+                        if ta in mapa or tb in mapa: continue
+                        words_a = set(normed[ta].split())
+                        words_b = set(normed[tb].split())
+                        if words_a & words_b:
+                            freq = Counter(temas)
+                            canon = ta if freq.get(ta, 0) >= freq.get(tb, 0) else tb
+                            reemplazar = tb if canon == ta else ta
+                            mapa[reemplazar] = canon
+    return mapa
+
+def _post_validar_tema_vs_subtema(temas, subtemas):
+    tema_a_subtemas = defaultdict(set)
+    for t, s in zip(temas, subtemas): tema_a_subtemas[t].add(s)
+    reemplazos = {}
+    for tema, subs in tema_a_subtemas.items():
+        if len(subs) == 1:
+            sub_unico = list(subs)[0]
+            tn = string_norm_label(tema)
+            sn = string_norm_label(sub_unico)
+            if tn and sn and SequenceMatcher(None, tn, sn).ratio() >= 0.80:
+                nuevo = _regenerar_tema_diferente([sub_unico], [])
+                if nuevo and not _tema_es_igual_a_subtema(nuevo, [sub_unico]) and _frase_esta_completa(nuevo):
+                    reemplazos[tema] = capitalizar_etiqueta(nuevo)
+    return [reemplazos.get(t, t) for t in temas] if reemplazos else temas
+
+def _unificar_tema_por_subtema(temas, subtemas):
+    sub_to_temas = defaultdict(list)
+    for t, s in zip(temas, subtemas): sub_to_temas[s].append(t)
+    sub_to_best = {}
+    for sub, tema_list in sub_to_temas.items():
+        sub_to_best[sub] = Counter(tema_list).most_common(1)[0][0]
+    return [sub_to_best[s] for s in subtemas]
+
+def consolidar_temas_fuzz(rows: List[Dict], km: Dict[str, str], umbral_similitud=85) -> Dict[str, str]:
+    tema_key = km.get("tema")
     temas_unicos = list(set(
         row.get(tema_key) for row in rows 
-        if row.get(tema_key) and row.get(tema_key) not in ["Duplicada", "Error", "Excepción API"]
+        if row.get(tema_key) and str(row.get(tema_key)).strip() not in ("", "-", "Duplicada", "Error", "Excepción API")
     ))
-    
-    if not temas_unicos:
-        return {}
-
+    if not temas_unicos: return {}
     n = len(temas_unicos)
     parent = list(range(n))
 
@@ -504,242 +2147,523 @@ def consolidar_temas_similares(rows: List[Dict], key_map: Dict[str, str], umbral
     for root_idx, indices in grupos_indices.items():
         grupo_temas = [temas_unicos[i] for i in indices]
         tema_canonico = min(grupo_temas, key=len)
-        for tema in grupo_temas:
-            mapa_consolidacion[tema] = tema_canonico
-            
+        for t in grupo_temas:
+            mapa_consolidacion[t] = tema_canonico
     return mapa_consolidacion
 
 
-class CostTracker:
-    def __init__(self, limit_usd: float, input_cost_per_1m: float, output_cost_per_1m: float):
-        self.limit_usd, self.total_cost = limit_usd, 0.0
-        self.input_cost_per_token, self.output_cost_per_token = input_cost_per_1m / 1e6, output_cost_per_1m / 1e6
-        self.total_input_tokens, self.total_output_tokens = 0, 0
-    def add_cost(self, input_tokens: int, output_tokens: int):
-        cost = (input_tokens * self.input_cost_per_token) + (output_tokens * self.output_cost_per_token)
-        self.total_cost += cost; self.total_input_tokens += input_tokens; self.total_output_tokens += output_tokens
-    def is_limit_exceeded(self) -> bool: return self.total_cost >= self.limit_usd
-    def get_summary(self) -> Dict:
-        remaining = max(0, self.limit_usd - self.total_cost)
-        return {"limit": self.limit_usd, "total_cost": self.total_cost, "input_tokens": self.total_input_tokens, "output_tokens": self.total_output_tokens, "remaining": remaining}
+# ======================================
+# Duplicados y Excel (Reglas Nuevas)
+# ======================================
+def _normalizar_url(url: str) -> str:
+    if not url: return ""
+    url = url.strip().lower()
+    url = re.sub(r'^https?://', '', url)
+    url = re.sub(r'^www\.', '', url)
+    url = url.rstrip('/')
+    return url
 
-def analizar_con_openai_parallel(textos_agrupados: List[Tuple[str, List[int]]], cost_tracker: CostTracker, client: OpenAI, progress_hook, max_workers: int = 3):
-    resultados = {}
-    tools = [{"type": "function", "function": {"name": "clasificar_noticia_unal", "description": "Clasifica el tono y el tema de una noticia sobre la Universidad Nacional.", "parameters": {"type": "object", "properties": {"tono": {"type": "string", "description": "El tono de la noticia: Positivo, Negativo o Neutro.", "enum": ["Positivo", "Negativo", "Neutro"]}, "tema": {"type": "string", "description": "Tema específico de 4 a 6 palabras que resume el hecho principal. No debe incluir el nombre de la universidad ni ser genérico."}}, "required": ["tono", "tema"]}}}]
-    
-    system_prompt = """Eres un analista de medios hiper-especializado y tu única misión es evaluar el impacto de las noticias sobre la Universidad Nacional de Colombia (UNAL). Debes ser implacable en la aplicación de las siguientes reglas.
+def detectar_duplicados_avanzado(rows, km):
+    processed = deepcopy(rows)
+    seen_url, seen_bcast = {}, {}
+    seen_streaming: Dict[tuple, int] = {}
+    tb = defaultdict(list)
 
-**REGLA DE ORO INQUEBRANTABLE:**
-- Si la UNAL **NO es el actor principal** de la noticia, o si su mención es meramente contextual, referencial, o como fuente de opinión, el tono es **SIEMPRE NEUTRO**. No importa si la noticia trata sobre violencia, política o crisis; si no afecta directamente la gestión o reputación de la UNAL, es NEUTRO.
+    for i, row in enumerate(processed):
+        if row.get("is_duplicate"): continue
 
-**REGLAS DE TONO (SÓLO si la UNAL es el actor principal):**
-- **NEGATIVO:** Únicamente si la noticia reporta un **fallo directo de la UNAL** o un **evento perjudicial que ocurre bajo su responsabilidad directa** (ej. críticas a la gestión, disturbios en campus, escándalos).
-- **POSITIVO:** Únicamente si la noticia reporta un **logro o acción destacada de la UNAL**. Ejemplos:
-  - Premios, reconocimientos, avances científicos.
-  - **Anuncios de conciertos, actividades, hechos o eventos organizados o alojados por la UNAL.**
-- **NEUTRO:** Para **todo lo demás**, incluyendo menciones puramente informativas que no constituyan un logro o un fallo.
+        tipo    = normalizar_tipo_medio(str(row.get(km["tipodemedio"], "")))
+        mencion = norm_key(row.get(km["menciones"], ""))
+        medio   = norm_key(row.get(km["medio"], ""))
 
-**REGLAS CRÍTICAS PARA EL TEMA:**
-1.  **HECHO PRINCIPAL:** Describe el evento central del grupo de noticias.
-2.  **SIN MARCA:** **NO** incluyas "Universidad Nacional", "UNAL", etc.
-3.  **LONGITUD ESTRICTA:** Debe tener **entre 4 y 6 palabras.**
-
-Tu precisión es vital. Evalúa el impacto, no el sentimiento general."""
-    
-    def procesar_grupo(i, texto_representativo, indices_grupo):
-        if cost_tracker.is_limit_exceeded(): return None
-        try:
-            response = client.chat.completions.create(model="gpt-4.1-nano-2025-04-14", messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": f"Analiza este grupo de noticias: \"{texto_representativo}\""}], tools=tools, tool_choice={"type": "function", "function": {"name": "clasificar_noticia_unal"}}, temperature=0.0, max_tokens=250)
-            if response.usage: cost_tracker.add_cost(response.usage.prompt_tokens, response.usage.completion_tokens)
-            resultado_json = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
-            return (indices_grupo, resultado_json["tono"], resultado_json["tema"])
-        except Exception as e:
-            st.warning(f"Advertencia en API para grupo {i + 1}: {e}. Asignando error.")
-            return (indices_grupo, "Error", "Excepción API")
-    
-    total_grupos = len(textos_agrupados)
-    completed = 0
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(procesar_grupo, i, texto, indices): i for i, (texto, indices) in enumerate(textos_agrupados)}
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                indices_grupo, tono, tema = result
-                for idx in indices_grupo: resultados[idx] = {"tono": tono, "tema": tema}
-            completed += 1
-            progress_hook(completed, total_grupos, f"Analizando grupos con IA ({completed}/{total_grupos})...")
-    return resultados
-
-def procesar_por_lotes(target_rows: List[Dict], key_map: Dict[str, str], batch_size: int, cost_tracker: CostTracker, client: OpenAI, status_placeholder, progress_bar):
-    total_rows = len(target_rows)
-    num_batches = (total_rows + batch_size - 1) // batch_size
-    titulo_key, resumen_key = key_map.get("titulo"), key_map.get("resumen")
-    tono_key, tema_key = key_map.get("tonoai"), key_map.get("tema")
-    for batch_num in range(num_batches):
-        if cost_tracker.is_limit_exceeded(): break
-        start_idx, end_idx = batch_num * batch_size, min((batch_num + 1) * batch_size, total_rows)
-        batch_rows = target_rows[start_idx:end_idx]
-        status_placeholder.markdown(f'<div class="info-box">📦 <strong>Procesando Lote {batch_num + 1}/{num_batches}</strong> (Noticias {start_idx + 1}-{end_idx})</div>', unsafe_allow_html=True)
-        grupos_fusionados = agrupar_noticias_similares(batch_rows, key_map)
-        textos_agrupados = []
-        for indices_locales in grupos_fusionados:
-            if not indices_locales: continue
-            idx_repr = indices_locales[0]
-            texto_completo = f"TÍTULO: {corregir_texto(batch_rows[idx_repr].get(titulo_key, ''))}. RESUMEN: {corregir_texto(batch_rows[idx_repr].get(resumen_key, ''))}".strip()[:3500]
-            if texto_completo and texto_completo != "TÍTULO: . RESUMEN: ": textos_agrupados.append((texto_completo, indices_locales))
-        def progress_hook_ia(current, total, text):
-            base_progress = (batch_num / num_batches)
-            lote_progress = (current / total) * (1 / num_batches) if total > 0 else 0
-            progress_bar.progress(0.33 + (0.33 * (base_progress + lote_progress)), text=f"🤖 Lote {batch_num+1}/{num_batches}: {text}")
-        resultados_batch = analizar_con_openai_parallel(textos_agrupados, cost_tracker, client, progress_hook_ia, max_workers=3)
-        for idx_local, resultado in resultados_batch.items():
-            original_row_index_in_batch = start_idx + idx_local
-            if original_row_index_in_batch < len(target_rows):
-                target_rows[original_row_index_in_batch][tono_key] = resultado["tono"]
-                target_rows[original_row_index_in_batch][tema_key] = resultado["tema"]
-    return target_rows
-
-# ==============================================================================
-# LÓGICA PRINCIPAL DE LA APLICACIÓN
-# ==============================================================================
-if not check_password():
-    st.stop()
-
-api_key = st.secrets.get("OPENAI_API_KEY")
-if not api_key:
-    st.error("❌ Error de Configuración: La API Key de OpenAI no está configurada.")
-    st.stop()
-
-st.markdown('<div class="main-header"><h1>🎓 Sistema de Análisis de Medios UNAL</h1><p>Análisis Inteligente de Tono y Tema con IA | Desarrollado por Johnathan Cortés ©️</p></div>', unsafe_allow_html=True)
-if 'analysis_done' not in st.session_state: st.session_state.analysis_done = False
-if 'result_buffer' not in st.session_state: st.session_state.result_buffer = None
-if 'final_summary' not in st.session_state: st.session_state.final_summary = {}
-if 'analysis_stats' not in st.session_state: st.session_state.analysis_stats = {}
-
-with st.sidebar:
-    st.markdown("### 📂 Carga de Archivos")
-    dossier_file = st.file_uploader("Dossier Principal", type="xlsx", help="Archivo principal con las noticias")
-    
-    # Intento de cargar la configuración automática desde el repositorio
-    config_loaded = False
-    region_map, internet_map, sov_map = load_config_data()
-    if region_map is not None:
-        config_loaded = True
-        st.success("✅ Configuración y mapeos cargados automáticamente.")
-    else:
-        st.warning("⚠️ No se encontró Configuracion.xlsx en el repositorio.")
-        
-    st.markdown("---")
-    st.markdown("### ⚙️ Configuración")
-    col1, col2 = st.columns(2)
-    with col1: cost_limit_usd = st.number_input("💰 Límite (USD)", min_value=0.10, max_value=10.0, value=1.00, step=0.10)
-    with col2: batch_size = st.slider("📦 Lote", min_value=100, max_value=1000, value=400, step=50)
-    st.markdown("---")
-    
-    all_files_ready = bool(dossier_file and config_loaded)
-    if not all_files_ready: 
-        st.warning("⚠️ Cargue el archivo Dossier y asegúrese de que el archivo Configuracion.xlsx esté presente en el repositorio.")
-    start_button = st.button("🚀 Iniciar Análisis", type="primary", use_container_width=True, disabled=(not all_files_ready))
-
-if start_button:
-    st.session_state.analysis_done = False
-    st.session_state.result_buffer = None
-    st.session_state.analysis_stats = {}
-    client = OpenAI(api_key=api_key)
-    TARGET_BRANDS = ["U. Nacional de Colombia", "Universidad Nacional de Colombia", "Universidad Nacional de Colombia - General"]
-    progress_bar = st.progress(0, text="🚀 Iniciando proceso...")
-    status_container = st.empty()
-    metrics_container = st.container()
-    
-    def main_progress_hook(current, total, text):
-        if total > 0: progress_bar.progress(min((current / total) * 0.33, 0.32), text=text)
-        
-    start_time = time.time()
-    try:
-        # FASE 1: Preparación de datos
-        status_container.markdown('<div class="info-box">📋 <strong>Fase 1/4:</strong> Preparando y limpiando datos...</div>', unsafe_allow_html=True)
-        all_processed_rows, key_map = run_base_logic(load_workbook(dossier_file, data_only=True).active, main_progress_hook)
-        all_processed_rows = process_mappings_and_links(all_processed_rows, key_map, region_map, internet_map)
-        all_processed_rows = process_link_logic(all_processed_rows, key_map)
-        
-        for row in all_processed_rows: 
-            row["__is_target_brand"] = (row.get(key_map.get("menciones")) in TARGET_BRANDS)
+        streaming_url_raw = row.get(km["link_streaming"])
+        if isinstance(streaming_url_raw, dict):
+            streaming_url_raw = streaming_url_raw.get("url")
             
-        total_news = len(all_processed_rows)
-        unal_news = sum(1 for r in all_processed_rows if r.get('__is_target_brand'))
-        duplicates = sum(1 for r in all_processed_rows if r.get('is_duplicate'))
-        
-        with metrics_container:
-            col1, col2, col3 = st.columns(3)
-            col1.metric("📰 Total Noticias", f"{total_news:,}")
-            col2.metric("🎓 Noticias UNAL", f"{unal_news:,}")
-            col3.metric("🔄 Duplicadas", f"{duplicates:,}")
-        progress_bar.progress(0.25, text="✅ Fase 1 completada")
+        if streaming_url_raw and mencion:
+            streaming_url_norm = _normalizar_url(str(streaming_url_raw))
+            if streaming_url_norm:
+                sk = (streaming_url_norm, mencion)
+                if sk in seen_streaming:
+                    row["is_duplicate"] = True
+                    row[km["idduplicada"]] = processed[seen_streaming[sk]].get(km["idnoticia"], "")
+                    continue
+                seen_streaming[sk] = i
 
-        # FASE 2: Análisis con IA
-        status_container.markdown('<div class="info-box">🤖 <strong>Fase 2/4:</strong> Analizando con Inteligencia Artificial...</div>', unsafe_allow_html=True)
-        cost_tracker = CostTracker(cost_limit_usd, 0.10, 0.40)
-        target_rows = [row for row in all_processed_rows if row.get("__is_target_brand") and not row.get("is_duplicate")]
-        status_placeholder = st.empty()
-        
-        if target_rows:
-            target_rows_procesados = procesar_por_lotes(target_rows, key_map, batch_size, cost_tracker, client, status_placeholder, progress_bar)
-            update_map = {row['original_index']: row for row in target_rows_procesados}
-            for row in all_processed_rows:
-                if row['original_index'] in update_map:
-                    row[key_map.get("tonoai")] = update_map[row['original_index']].get(key_map.get("tonoai"))
-                    row[key_map.get("tema")] = update_map[row['original_index']].get(key_map.get("tema"))
-            st.session_state.final_summary = cost_tracker.get_summary()
-            st.session_state.analysis_stats = {"processed": len(target_rows), "time": time.time() - start_time}
-        progress_bar.progress(0.50, text="✅ Fase 2 completada")
+        if tipo == "Internet":
+            li = row.get(km["link_nota"])
+            url = li.get("url") if isinstance(li, dict) else li
+            if url and mencion:
+                url_norm = _normalizar_url(str(url))
+                k = (url_norm, mencion)
+                if k in seen_url:
+                    row["is_duplicate"] = True
+                    row[km["idduplicada"]] = processed[seen_url[k]].get(km["idnoticia"], "")
+                    continue
+                seen_url[k] = i
+            if medio and mencion:
+                tb[(medio, mencion)].append(i)
 
-        # FASE 3: Consolidación de Temas
-        status_container.markdown('<div class="info-box">✨ <strong>Fase 3/4:</strong> Consolidando temas similares...</div>', unsafe_allow_html=True)
-        mapa_consolidacion_temas = consolidar_temas_similares(all_processed_rows, key_map)
-        tema_key = key_map.get("tema")
-        for row in all_processed_rows:
-            tema_original = row.get(tema_key)
-            if tema_original and tema_original in mapa_consolidacion_temas:
-                row[tema_key] = mapa_consolidacion_temas[tema_original]
-        progress_bar.progress(0.75, text="✅ Temas consolidados")
-        
-        # FASE 4: Generación de informe
-        status_container.markdown('<div class="info-box">📄 <strong>Fase 4/4:</strong> Generando informe final...</div>', unsafe_allow_html=True)
-        final_rows = process_sov_mapping_final(all_processed_rows, key_map, sov_map)
-        st.session_state.result_buffer = generate_excel_output(final_rows, key_map)
-        progress_bar.progress(1.0, text="✅ ¡Proceso completado!")
-        st.session_state.analysis_done = True
-        status_container.markdown('<div class="success-box">🎉 <strong>¡Análisis completado exitosamente!</strong></div>', unsafe_allow_html=True)
-    except Exception as e:
-        st.error(f"❌ Error durante el proceso: {e}")
-        st.exception(e)
+        elif tipo in ("Radio", "Televisión"):
+            hora = str(row.get(km["hora"], "")).strip()
+            if mencion and medio and hora:
+                k = (mencion, medio, hora)
+                if k in seen_bcast:
+                    row["is_duplicate"] = True
+                    row[km["idduplicada"]] = processed[seen_bcast[k]].get(km["idnoticia"], "")
+                else:
+                    seen_bcast[k] = i
 
-# Mostrar resultados
-if st.session_state.analysis_done and st.session_state.result_buffer:
-    st.markdown("---")
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        st.markdown("### 📊 Resumen del Análisis")
-        summary, stats = st.session_state.get('final_summary', {}), st.session_state.get('analysis_stats', {})
-        total_cost, limit = summary.get('total_cost', 0), summary.get('limit', 0)
-        remaining = max(0, limit - total_cost)
-        input_tokens = summary.get('input_tokens', 0)
-        output_tokens = summary.get('output_tokens', 0)
-        total_tokens = input_tokens + output_tokens
-        processing_time = stats.get('time', 0)
-        processed_news = stats.get('processed', 0)
+    for idxs in tb.values():
+        if len(idxs) < 2: continue
+        for i in range(len(idxs)):
+            for j in range(i + 1, len(idxs)):
+                a, b = idxs[i], idxs[j]
+                if processed[a].get("is_duplicate") or processed[b].get("is_duplicate"): continue
+                ta  = normalize_title_for_comparison(processed[a].get(km["titulo"]))
+                tb_ = normalize_title_for_comparison(processed[b].get(km["titulo"]))
+                if ta and tb_ and SequenceMatcher(None, ta, tb_).ratio() >= SIMILARITY_THRESHOLD_TITULOS:
+                    if len(ta) < len(tb_):
+                        processed[a]["is_duplicate"] = True
+                        processed[a][km["idduplicada"]]  = processed[b].get(km["idnoticia"], "")
+                    else:
+                        processed[b]["is_duplicate"] = True
+                        processed[b][km["idduplicada"]]  = processed[a].get(km["idnoticia"], "")
+
+    return processed
+
+def run_dossier_logic(sheet):
+    headers = [c.value for c in sheet[1] if c.value]
+    nk = [norm_key(h) for h in headers]
+    km = {
+        "titulo": norm_key("Titulo"),
+        "resumen": norm_key("Resumen - Aclaracion"),
+        "menciones": norm_key("Menciones - Empresa"),
+        "medio": norm_key("Medio"),
+        "tonoiai": norm_key("Tono IA"),
+        "tema": norm_key("Tema"),
+        "subtema": norm_key("Subtema"),
+        "idnoticia": norm_key("ID Noticia"),
+        "idduplicada": norm_key("ID duplicada"),
+        "tipodemedio": norm_key("Tipo de Medio"),
+        "hora": norm_key("Hora"),
+        "fecha": norm_key("Fecha"),
+        "link_nota": norm_key("Link Nota"),
+        "link_streaming": norm_key("Link (Streaming - Imagen)"),
+        "region": norm_key("Region")
+    }
+    
+    rows, split_rows = [], []
+    for row in sheet.iter_rows(min_row=2):
+        if all(c.value is None for c in row): continue
+        rows.append({nk[i]: c for i, c in enumerate(row) if i < len(nk)})
         
-        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-        m_col1.metric("💵 Costo Total", f"${total_cost:.4f}")
-        m_col2.metric("💰 Restante", f"${remaining:.4f}")
-        m_col3.metric("🔤 Tokens", f"{total_tokens:,}")
-        m_col4.metric("⏱️ Tiempo", f"{processing_time:.1f}s")
-        st.markdown(f"""<div class="metric-card"><h4>📈 Detalles de Procesamiento</h4><ul><li><strong>Noticias Analizadas:</strong> {processed_news:,}</li><li><strong>Tokens de Entrada:</strong> {input_tokens:,}</li><li><strong>Tokens de Salida:</strong> {output_tokens:,}</li><li><strong>Límite Establecido:</strong> ${limit:.2f}</li></ul></div>""", unsafe_allow_html=True)
-    with col2:
-        st.markdown("### 📥 Descargar Informe")
-        st.download_button(label="⬇️ Descargar Excel", data=st.session_state.result_buffer, file_name=f"Informe_UNAL_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-        st.markdown("""<div class="success-box" style="margin-top: 20px;"><strong>✅ Archivo Generado</strong><br>El informe incluye:<br>• Hoja 1: UNAL con IA<br>• Hoja 2: Todas las Marcas</div>""", unsafe_allow_html=True)
-else:
-    st.markdown('<div class="info-box">👈 Configure los parámetros en la barra lateral y presione <strong>"Iniciar Análisis"</strong> para comenzar.</div>', unsafe_allow_html=True)
-st.markdown("---")
-st.markdown("<p style='text-align: center; color: #64748b;'>© 2025 Sistema de Análisis UNAL | Versión Optimizada 2.5</p>", unsafe_allow_html=True)
+    for rc in rows:
+        base = {
+            k: (extract_link(v) if k in (km["link_nota"], km["link_streaming"]) else v.value)
+            for k, v in rc.items()
+        }
+        if km["tipodemedio"] in base:
+            base[km["tipodemedio"]] = normalizar_tipo_medio(base.get(km["tipodemedio"]))
+            
+        menciones_raw = str(base.get(km["menciones"], ""))
+        menciones_list = [m.strip() for m in menciones_raw.split(";") if m.strip()] or [menciones_raw]
+        
+        for m in menciones_list:
+            nr = deepcopy(base)
+            nr[km["menciones"]] = m
+            split_rows.append(nr)
+            
+    for idx, row in enumerate(split_rows):
+        row.update({"original_index": idx, "is_duplicate": False, "tonoiai": "-", "tema": "-", "subtema": "-"})
+        
+    processed = detectar_duplicados_avanzado(split_rows, km)
+    for row in processed:
+        if row["is_duplicate"]:
+            row.update({km["tonoiai"]: "Duplicada", km["tema"]: "-", km["subtema"]: "-"})
+            
+    return processed, km
+
+def process_mappings_and_links(all_processed_rows, km, region_map, internet_map, sov_map):
+    for row in all_processed_rows:
+        original_medio_key = str(row.get(km["medio"], "")).lower().strip()
+        # 1. Asignar región antes de alterar el Medio
+        row[km["region"]] = region_map.get(original_medio_key, "N/A")
+        # 2. Modificar el medio de Internet si aplica
+        if original_medio_key in internet_map:
+            row[km["medio"]]       = internet_map[original_medio_key]
+            row[km["tipodemedio"]] = "Internet"
+            
+        # 3. Aplicar mapeo SOV en menciones
+        original_mencion_key = str(row.get(km["menciones"], "")).strip().lower()
+        if original_mencion_key in sov_map:
+            row[km["menciones"]] = sov_map[original_mencion_key]
+            
+    # 4. Lógica de limpieza de enlaces por tipo de medio
+    for row in all_processed_rows:
+        tipo = normalizar_tipo_medio(row.get(km["tipodemedio"], ""))
+        ln = row.get(km["link_nota"]) or {"value": "", "url": None}
+        ls = row.get(km["link_streaming"]) or {"value": "", "url": None}
+        has_url = lambda x: isinstance(x, dict) and bool(x.get("url"))
+        
+        if tipo in ("Radio", "Televisión"):
+            row[km["link_streaming"]] = {"value": "", "url": None}
+        elif tipo == "Internet":
+            row[km["link_nota"]], row[km["link_streaming"]] = ls, ln
+        elif tipo in ("Prensa", "Revistas"):
+            if not has_url(ln) and has_url(ls): 
+                row[km["link_nota"]] = ls
+            row[km["link_streaming"]] = {"value": "", "url": None}
+            
+    return all_processed_rows
+
+def generate_excel_output_two_sheets(rows, km):
+    wb = Workbook()
+    
+    # Hoja 1: UNAL con IA
+    ws1 = wb.active
+    ws1.title = "UNAL con IA"
+    
+    # Hoja 2: Todas las Marcas
+    ws2 = wb.create_sheet(title="Todas las Marcas")
+    
+    ORDER_IA = [
+        "ID Noticia", "Fecha", "Hora", "Medio", "Tipo de Medio", "Region",
+        "Seccion - Programa", "Titulo", "Autor - Conductor", "Nro. Pagina",
+        "Dimension", "Duracion - Nro. Caracteres", "CPE", "Audiencia", "Tier",
+        "Tono", "Tono IA", "Tema", "Subtema", "Link Nota",
+        "Resumen - Aclaracion", "Link (Streaming - Imagen)", "Menciones - Empresa",
+        "ID duplicada"
+    ]
+    
+    ORDER_TODAS = [
+        "ID Noticia", "Fecha", "Hora", "Medio", "Tipo de Medio", "Region",
+        "Seccion - Programa", "Titulo", "Autor - Conductor", "Nro. Pagina",
+        "Dimension", "Duracion - Nro. Caracteres", "CPE", "Audiencia", "Tier",
+        "Tono", "Link Nota",
+        "Resumen - Aclaracion", "Link (Streaming - Imagen)", "Menciones - Empresa",
+        "ID duplicada"
+    ]
+    
+    unal_rows = [r for r in rows if r.get("__is_target_brand")]
+    _write_sheet(ws1, unal_rows, ORDER_IA, km)
+    _write_sheet(ws2, rows, ORDER_TODAS, km)
+    
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+def _write_sheet(ws, rows_data, column_order, km):
+    ws.append(column_order)
+    font_hyperlink = Font(color="0563C1", underline="single")
+    align_left = Alignment(horizontal='left')
+    font_header = Font(bold=True)
+    
+    for i, col_name in enumerate(column_order, start=1):
+        cell = ws.cell(row=1, column=i)
+        cell.font = font_header
+        
+    NUM = {"ID Noticia", "Nro. Pagina", "Dimension", "Duracion - Nro. Caracteres", "CPE", "Tier", "Audiencia"}
+    
+    for row in rows_data:
+        tk = km.get("titulo")
+        if tk and tk in row: 
+            row[tk] = clean_title_for_output(row.get(tk))
+        rk = km.get("resumen")
+        if rk and rk in row: 
+            row[rk] = corregir_texto(row.get(rk))
+            
+        out, links = [], {}
+        for ci, h in enumerate(column_order, start=1):
+            dk = km.get(norm_key(h), norm_key(h))
+            val = row.get(dk)
+            cv = None
+            
+            if h == 'Fecha' and pd.notna(val):
+                if isinstance(val, pd.Timestamp):
+                    cv = val.to_pydatetime()
+                elif isinstance(val, (datetime.datetime, datetime.date)):
+                    cv = val
+                else:
+                    cv = str(val) if val is not None else None
+            elif h in NUM:
+                cv = parse_numeric(val)
+            elif isinstance(val, dict) and "url" in val:
+                cv = val.get("value", "Link")
+                if val.get("url"): 
+                    links[ci] = val["url"]
+            elif val is not None:
+                if isinstance(val, str) and val.startswith("http"):
+                    cv = "Link"
+                    links[ci] = val
+                else:
+                    cv = str(val)
+            out.append(cv)
+        ws.append(out)
+        
+        current_row = ws.max_row
+        
+        if "Fecha" in column_order:
+            date_col_idx = column_order.index("Fecha") + 1
+            date_cell = ws.cell(row=current_row, column=date_col_idx)
+            if isinstance(date_cell.value, (datetime.datetime, datetime.date)):
+                date_cell.number_format = 'DD/MM/YYYY'
+        
+        if "CPE" in column_order:
+            cpe_col_idx = column_order.index("CPE") + 1
+            tipo_medio_col_idx = column_order.index("Tipo de Medio") + 1
+            tipo_medio_val = ws.cell(row=current_row, column=tipo_medio_col_idx).value
+            cpe_cell = ws.cell(row=current_row, column=cpe_col_idx)
+            if tipo_medio_val in ("Radio", "Televisión") and isinstance(cpe_cell.value, (int, float)):
+                cpe_cell.number_format = '#,##0'
+                
+        for ci, url in links.items():
+            cell = ws.cell(row=current_row, column=ci)
+            cell.hyperlink = url
+            cell.font = font_hyperlink
+            cell.alignment = align_left
+            
+    for i, col_name in enumerate(column_order, start=1):
+        letter = ws.cell(row=1, column=i).column_letter
+        if col_name in ['Titulo', 'Resumen - Aclaracion']:
+            ws.column_dimensions[letter].width = 50
+        elif col_name in ['Link Nota', 'Link (Streaming - Imagen)']:
+            ws.column_dimensions[letter].width = 15
+        else:
+            ws.column_dimensions[letter].width = 20
+
+
+# ======================================
+# Proceso principal
+# ======================================
+async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=None, cliente="", voceros="", enable_scraping=False):
+    st.session_state.update({'tokens_input': 0, 'tokens_output': 0, 'tokens_embedding': 0})
+    get_embedding_cache().clear()
+    t0 = time.time()
+    
+    TARGET_BRANDS = ["U. Nacional de Colombia", "Universidad Nacional de Colombia", "Universidad Nacional de Colombia - General"]
+    
+    if "API" in mode:
+        try:
+            openai.api_key = st.secrets["OPENAI_API_KEY"]
+            openai.aiosession.set(None)
+        except:
+            st.error("OPENAI_API_KEY no encontrado.")
+            st.stop()
+            
+    with st.status("Paso 1 · Carga de Configuración y Dossier", expanded=True) as s:
+        config_path = load_local_config()
+        if not config_path:
+            st.error("❌ No se encontró el archivo 'Configuracion.xlsx' en el repositorio. Asegúrate de incluirlo en la raíz.")
+            st.stop()
+            
+        region_map, internet_map, sov_map = load_config_data(config_path)
+        
+        wb_in = load_workbook(df_file, data_only=True)
+        rows, km = run_dossier_logic(wb_in.active)
+        
+        # Mapeos prioritarios (Región se asigna usando Medio original)
+        rows = process_mappings_and_links(rows, km, region_map, internet_map, sov_map)
+        
+        for row in rows:
+            row["__is_target_brand"] = (row.get(km["menciones"]) in TARGET_BRANDS)
+            
+        s.update(label="✓ Paso 1 completado", state="complete")
+        
+    with st.status("Paso 2 · Normalización", expanded=True) as s:
+        s.update(label="✓ Paso 2 · Mapeos y normalizaciones aplicados", state="complete")
+        
+    gc.collect()
+    
+    # Identificar no duplicados
+    ta = [r for r in rows if not r.get("is_duplicate")]
+    # Filtrar solo registros UNAL no duplicados para el análisis de IA
+    ta_target = [r for r in ta if r.get("__is_target_brand")]
+    
+    if ta_target:
+        df = pd.DataFrame(ta_target)
+        df["_txt"] = df.apply(
+            lambda r: texto_para_embedding(str(r.get(km["titulo"], "")), str(r.get(km["resumen"], ""))),
+            axis=1
+        )
+        with st.status("Embeddings...", expanded=True) as s:
+            _ = get_embeddings_batch(df["_txt"].tolist())
+            s.update(label=f"✓ {get_embedding_cache().stats()}", state="complete")
+            
+        with st.status("Paso 3 · Tono (Reputación)", expanded=True) as s:
+            pb = st.progress(0)
+            if "PKL" in mode and tpkl:
+                res = analizar_tono_con_pkl(df["_txt"].tolist(), tpkl)
+                if res is None: st.stop()
+            elif "API" in mode:
+                res = await ClasificadorTono(bn, ba).procesar_lote_async(
+                    df["_txt"], pb, df[km["resumen"]], df[km["titulo"]]
+                )
+            else:
+                res = [{"tono": "N/A"}] * len(ta_target)
+            df[km["tonoiai"]] = [r["tono"] for r in res]
+            s.update(label="✓ Paso 3 · Tono (Reputación)", state="complete")
+            
+        with st.status("Paso 4 · Clasificación", expanded=True) as s:
+            pb = st.progress(0)
+            if "Solo Modelos PKL" in mode:
+                subtemas = ["N/A"] * len(ta_target)
+                temas    = ["N/A"] * len(ta_target)
+            else:
+                subtemas = ClasificadorSubtema(bn, ba).procesar_lote(
+                    df["_txt"], pb, df[km["resumen"]], df[km["titulo"]]
+                )
+                temas = consolidar_temas(subtemas, df["_txt"].tolist(), pb)
+            df[km["subtema"]] = subtemas
+            if "PKL" in mode and epkl:
+                tp = analizar_temas_con_pkl(df["_txt"].tolist(), epkl)
+                if tp: df[km["tema"]] = _unificar_tema_por_subtema(tp, subtemas)
+            else:
+                df[km["tema"]] = temas
+            s.update(label="✓ Paso 4 · Clasificación", state="complete")
+            
+        # Consolidación final de temas similares por Fuzz
+        with st.status("Consolidación final de temas por Fuzz...", expanded=True) as s:
+            mapa_consolidacion_fuzz = consolidar_temas_fuzz(ta_target, km)
+            tema_key = km["tema"]
+            for index, r_target in df.iterrows():
+                t_orig = r_target.get(tema_key)
+                if t_orig in mapa_consolidacion_fuzz:
+                    df.at[index, tema_key] = mapa_consolidacion_fuzz[t_orig]
+            s.update(label="✓ Temas consolidados", state="complete")
+            
+        # Actualizar los valores calculados por la IA en la lista de filas originales
+        rm2 = df.set_index("original_index").to_dict("index")
+        for row in rows:
+            if not row.get("is_duplicate") and row.get("__is_target_brand"):
+                row.update(rm2.get(row["original_index"], {}))
+                
+    gc.collect()
+    ci = (st.session_state['tokens_input']     / 1e6) * PRICE_INPUT_1M
+    co = (st.session_state['tokens_output']    / 1e6) * PRICE_OUTPUT_1M
+    ce = (st.session_state['tokens_embedding'] / 1e6) * PRICE_EMBEDDING_1M
+    
+    with st.status("Paso 5 · Informe", expanded=True) as s:
+        st.session_state["output_data"]     = generate_excel_output_two_sheets(rows, km)
+        st.session_state["output_filename"] = f"Informe_UNAL_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+        st.session_state["processing_complete"] = True
+        st.session_state.update({
+            "brand_name": bn, "brand_aliases": ba,
+            "total_rows": len(rows), "unique_rows": len(ta), "duplicates": len(rows) - len(ta),
+            "process_duration": f"{time.time() - t0:.0f}s",
+            "process_cost": f"${ci + co + ce:.4f} USD",
+            "cache_stats": get_embedding_cache().stats()
+        })
+        s.update(label=f"✓ Completado · {get_embedding_cache().stats()}", state="complete")
+
+
+# ======================================
+# Main
+# ======================================
+def main():
+    load_custom_css()
+    if not check_password(): return
+
+    st.markdown("""
+    <div class="app-header">
+        <div class="app-header-icon">🎓</div>
+        <div class="app-header-text">
+            <div class="app-header-title">Análisis de Noticias UNAL</div>
+            <div class="app-header-version">v18.1 · Clustering Semántico y Reputación UNAL</div>
+        </div>
+        <div class="app-header-badge">IA</div>
+    </div>""", unsafe_allow_html=True)
+
+    if not st.session_state.get("processing_complete", False):
+        st.markdown('<div class="sec-label">Configuración</div>', unsafe_allow_html=True)
+        cl, cr = st.columns([3, 2])
+        with cl:
+            bn  = st.text_input("Marca principal", value="Universidad Nacional de Colombia - General", placeholder="Ej: Universidad Nacional de Colombia - General", key="bn")
+            bat = st.text_input("Alias (separados por ;)", value="Universidad Nacional;UNAL;U. Nacional de Colombia", placeholder="Ej: Universidad Nacional;UNAL", key="ba")
+        with cr:
+            mode = st.radio(
+                "Modo de análisis",
+                ["API de OpenAI", "Solo Modelos PKL"],
+                index=0, key="mode"
+            )
+
+        tpkl, epkl = None, None
+        with st.form("main_form"):
+            st.markdown('<div class="sec-label">Archivo de entrada</div>', unsafe_allow_html=True)
+            st.markdown("""
+            <div class="upload-zone" style="grid-template-columns:1fr">
+                <div class="upload-zone-card">
+                    <div class="upload-zone-icon uz-dossier">📋</div>
+                    <div class="upload-zone-text">
+                        <div class="upload-zone-title">Dossier</div>
+                        <div class="upload-zone-desc">Sube las noticias en formato .xlsx a analizar</div>
+                    </div>
+                </div>
+            </div>""", unsafe_allow_html=True)
+            f1 = st.file_uploader("Dossier", type=["xlsx"], label_visibility="collapsed", key="f1")
+
+            st.markdown(
+                f'<div class="cluster-info">'
+                f'<b>Parámetros base</b> · Sub={UMBRAL_SUBTEMA} · Tema={UMBRAL_TEMA} · Máx={NUM_TEMAS_MAX} '
+                f'· FusInter={UMBRAL_FUSION_INTERGRUPO} · FusSem={UMBRAL_FUSION_SUBTEMAS} '
+                f'· Dedup={UMBRAL_DEDUP_LABEL} · MinSub={UMBRAL_MIN_PERTENENCIA_SUBTEMA} '
+                f'· MinTema={UMBRAL_MIN_PERTENENCIA_TEMA} · MaxGrupo={MAX_GRUPO_ETIQUETA} · '
+                f'<b>Coherencia={UMBRAL_COHERENCIA_ETIQUETA}</b> · '
+                f'<b>SimMin={SIM_MINIMA_AGRUPACION_SUBTEMA}</b> (adaptativos según n)'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+
+            if st.form_submit_button("▶ Iniciar análisis", use_container_width=True, type="primary"):
+                if not all([f1, bn.strip()]):
+                    st.error("Completa todos los campos.")
+                else:
+                    al = [a.strip() for a in bat.split(";") if a.strip()]
+                    cur_mode = st.session_state.get("mode", "API de OpenAI")
+                    asyncio.run(run_full_process_async(f1, bn, al, tpkl, epkl, cur_mode,
+                                                     xlsx_bytes=None, cliente="", voceros="",
+                                                     enable_scraping=False))
+                    st.rerun()
+    else:
+        total = st.session_state.total_rows
+        uniq  = st.session_state.unique_rows
+        dups  = st.session_state.duplicates
+        dur   = st.session_state.process_duration
+        cost  = st.session_state.get("process_cost", "$0.00")
+        st.markdown(
+            '<div class="success-banner"><div class="success-icon">✓</div>'
+            '<div><div class="success-title">Análisis completado</div>'
+            '<div class="success-sub">Informe listo para descargar</div></div></div>',
+            unsafe_allow_html=True
+        )
+        st.markdown(f"""
+        <div class="metrics-grid">
+          <div class="metric-card m-total"><div class="metric-val" style="color:var(--text)">{total}</div><div class="metric-lbl">Total</div></div>
+          <div class="metric-card m-unique"><div class="metric-val" style="color:var(--green)">{uniq}</div><div class="metric-lbl">Únicas</div></div>
+          <div class="metric-card m-dup"><div class="metric-val" style="color:var(--amber)">{dups}</div><div class="metric-lbl">Duplicados</div></div>
+          <div class="metric-card m-time"><div class="metric-val" style="color:var(--blue)">{dur}</div><div class="metric-lbl">Tiempo</div></div>
+          <div class="metric-card m-cost"><div class="metric-val" style="color:var(--accent)">{cost}</div><div class="metric-lbl">Costo</div></div>
+        </div>""", unsafe_allow_html=True)
+        if 'cache_stats' in st.session_state: st.caption(f"📊 {st.session_state['cache_stats']}")
+        c1, c2 = st.columns(2)
+        c1.download_button(
+            "⬇ Descargar informe",
+            data=st.session_state.output_data,
+            file_name=st.session_state.output_filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            type="primary"
+        )
+        if c2.button("Nuevo análisis", use_container_width=True):
+            pwd = st.session_state.get("password_correct")
+            st.session_state.clear()
+            st.session_state.password_correct = pwd
+            st.rerun()
+
+    st.markdown(
+        '<div class="footer">v18.1 · Análisis de Noticias con IA · Universidad Nacional ©</div>',
+        unsafe_allow_html=True
+    )
+
+if __name__ == "__main__":
+    main()
