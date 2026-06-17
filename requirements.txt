@@ -1,7 +1,8 @@
 streamlit
 pandas
 openpyxl
+numpy
 unidecode
+scikit-learn
 thefuzz
-openai<1.0.0
-joblib
+openai>=1.0.0
