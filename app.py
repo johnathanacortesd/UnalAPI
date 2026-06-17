@@ -1,37 +1,3 @@
-A continuación, se presentan los archivos actualizados con las siguientes
-correcciones aplicadas:
-
-1.  Equilibrio de Peso en el Análisis: Se modificó texto_para_embedding para
-    eliminar la triple repetición del título (que sesgaba el modelo) y se
-    establecieron límites proporcionales de caracteres (máximo 300 para el
-    Título y 1500 para el Resumen). Esto asegura que la IA pondere
-    prioritariamente el contexto del cuerpo/resumen de la noticia.
-2.  Pestaña "Otros" Limpia: En la pestaña Otros, las columnas de clasificación
-    (Tono, Tema) se limpian por completo y se omiten las métricas de la IA (Tono
-    IA, Subtema), tal como se solicitó.
-3.  Pestaña "UNAL": Solo se analizan las noticias que corresponden estrictamente
-    a "Universidad Nacional de Colombia - General", procesando de forma
-    balanceada su Título y Resumen.
-
-requirements.txt
-
-streamlit
-pandas
-openpyxl
-openai==0.28.0
-tqdm
-scikit-learn
-unidecode
-nltk
-joblib
-bertopic
-xgboost==2.0.3
-selenium>=4.15.0
-requests
-beautifulsoup4
-
-app.py
-
 # ======================================
 # Importaciones
 # ======================================
