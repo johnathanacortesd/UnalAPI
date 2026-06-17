@@ -1215,7 +1215,7 @@ class ClasificadorTono:
 
             try:
                 resp = await acall_with_retries(
-                    openai.ChatCompletion.acreate,
+                    openai.ChatCompletion.create,
                     model=OPENAI_MODEL_CLASIFICACION,
                     messages=[{"role": "user", "content": prompt}],
                     max_tokens=40,
@@ -1302,7 +1302,7 @@ class ClasificadorSubtema:
         self.marca = marca
         self.aliases = aliases or []
         self._cache = {}
-        self._umbrales: dict = {}
+        self._umbrales = {}
 
     def _paso1(self, titulos, resumenes, dsu):
         def nt(t, n):
@@ -1379,7 +1379,8 @@ class ClasificadorSubtema:
             io_, M = zip(*ok)
             sim_matrix = cosine_similarity(np.array(M))
             linkage = 'complete' if n <= 10 else 'average'
-            labels = agglomerative_clustering_precomputed(1 - sim_matrix, distance_threshold=1 - umbral_cluster, linkage=linkage)
+            dist_matrix = 1 - sim_matrix
+            labels = agglomerative_clustering_precomputed(dist_matrix, distance_threshold=1 - umbral_cluster, linkage=linkage)
             g = defaultdict(list)
             for k, lbl in enumerate(labels): g[lbl].append(io_[k])
             for cl in g.values():
@@ -1410,7 +1411,8 @@ class ClasificadorSubtema:
             if len(ok) < 2: continue
             io_, M = zip(*ok)
             sim_matrix = cosine_similarity(np.array(M))
-            labels = agglomerative_clustering_precomputed(1 - sim_matrix, distance_threshold=1 - umbral_cluster, linkage='average')
+            dist_matrix = 1 - sim_matrix
+            labels = agglomerative_clustering_precomputed(dist_matrix, distance_threshold=1 - umbral_cluster, linkage='average')
             g = defaultdict(list)
             for k, lbl in enumerate(labels): g[lbl].append(io_[k])
             for cl in g.values():
@@ -1740,278 +1742,134 @@ class ClasificadorSubtema:
                 elif sv < min_sub: r[oi] = "_RECLASSIFICAR"
         return r
 
+    def procesar_lote(self, col, pbar, res_puros, tit_puros):
+        textos   = col.tolist()
+        titulos  = tit_puros.tolist()
+        resumenes = res_puros.tolist()
+        n = len(textos)
 
-# ======================================
-# TEMAS  
-# ======================================
-def _construir_representacion_grupo(subtema, textos_grupo, max_textos=30):
-    palabras = []
-    for t in textos_grupo[:max_textos]:
-        for w in string_norm_label(str(t)).split():
-            if len(w) > 3: palabras.append(w)
-    kw_str = " ".join(w for w, _ in Counter(palabras).most_common(12))
-    return f"{subtema}. {subtema}. {kw_str}"[:500]
-
-def _validar_estructura_tema(tema: str) -> bool:
-    if not tema or len(tema.split()) < 2: return False
-    if len(tema.split()) > 4: return False
-    if re.match(r'^[0-9]', tema): return False
-    num_palabras = re.compile(
-        r'^(uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|'
-        r'once|doce|veinte|cien|varios|cada)', re.IGNORECASE
-    )
-    if num_palabras.match(tema): return False
-    if _PATRON_TITULAR.match(tema): return False
-    if _PATRON_ESTADO.search(tema): return False
-    return True
-
-def _tema_es_igual_a_subtema(tema: str, subtemas_grupo: list) -> bool:
-    if not tema or not subtemas_grupo: return False
-    tn = string_norm_label(tema)
-    for sub in subtemas_grupo:
-        sn = string_norm_label(sub)
-        if not tn or not sn: continue
-        if SequenceMatcher(None, tn, sn).ratio() >= 0.80: return True
-        if tn in sn or sn in tn: return True
-    return False
-
-def _generar_nombre_tema_llm(subtemas_grupo, textos_muestra, titulos_muestra):
-    subs_list = "\n".join(f"  · {s}" for s in subtemas_grupo[:8])
-    palabras = []
-    for t in titulos_muestra[:15]:
-        for w in string_norm_label(str(t)).split():
-            if len(w) > 3: palabras.append(w)
-    kw = ", ".join(w for w, _ in Counter(palabras).most_common(6))
-    tit_muestra = "\n".join(f"  · {t[:100]}" for t in list(dict.fromkeys(titulos_muestra))[:5])
-    prompt = (
-        "Eres editor jefe de un periódico. Crea UNA sección editorial (2-4 palabras) que agrupe estos subtemas.\n\n"
-        "SUBTEMAS:\n" + subs_list + "\n\nTÍTULOS DE REFERENCIA:\n" + tit_muestra +
-        f"\n\nKEYWORDS: {kw}\n\n"
-        "REGLAS ESTRICTAS:\n"
-        "  1. Piensa en secciones de periódico: 'Política', 'Economía', 'Tecnología', 'Seguridad', 'Justicia', 'Medio Ambiente'.\n"
-        "  2. Más GENERAL y ABSTRACTO que los subtemas — nunca repitas un subtema ni copies fragmentos de titular.\n"
-        "  3. NUNCA incluyas números, cantidades ni nombres propios.\n"
-        "  4. 2-4 palabras. Sustantivo + adjetivo o sustantivo solo.\n"
-        "  5. Tildes y ñ correctas. "
-        "  6. SIN MARCA: NO incluyas bajo ninguna circunstancia 'Universidad Nacional' ni 'UNAL' en la sección editorial.\n\n"
-        "CORRECTO: 'Política', 'Gestión legislativa', 'Justicia penal', 'Regulación financiera'\n"
-        "INCORRECTO: 'Cinco congresistas con líos', 'Congresistas electos', 'Investigación disciplinaria congreso', 'Nuevo acuerdo'\n\n"
-        'JSON: {"tema":"..."}'
-    )
-    try:
-        resp = call_with_retries(
-            openai.ChatCompletion.create,
-            model=OPENAI_MODEL_CLASIFICACION,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=40,
-            temperature=0.05,
-            response_format={"type": "json_object"}
+        self._umbrales = _umbrales_adaptativos(n)
+        u = self._umbrales
+        st.caption(
+            f"📐 Corpus: **{n}** noticias · Umbral subtema: **{u['subtema']}** · "
+            f"Sim mínima: **{u['sim_minima_agrupacion']}**"
         )
-        raw = json.loads(resp.choices[0].message.content).get("tema", "").strip().replace('"', '').replace('.', '')
-        nombre = limpiar_tema(raw)
-        if not _validar_estructura_tema(nombre): return None
-        return nombre
-    except:
-        return None
 
-def _regenerar_tema_diferente(subtemas_grupo, titulos_muestra, intento=0):
-    subs_list = ", ".join(subtemas_grupo[:8])
-    prompt = (
-        f"Subtemas: {subs_list}\n\n"
-        "Genera UNA categoría GENERAL (2-3 palabras), diferente a los subtemas. "
-        "Piensa en sección de periódico (Economía, Política, Tecnología, Infraestructura, Cultura, Deportes…). "
-        "Tildes y ñ correctas, terminar en sustantivo/adjetivo.\n"
-        'JSON: {"tema":"..."}'
-    )
-    try:
-        resp = call_with_retries(
-            openai.ChatCompletion.create,
-            model=OPENAI_MODEL_CLASIFICACION,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=50,
-            temperature=0.2 + intento * 0.1,
-            response_format={"type": "json_object"}
-        )
-        return limpiar_tema(json.loads(resp.choices[0].message.content).get("tema", "").strip().replace('"', '').replace('.', ''))
-    except:
-        return None
+        et = [texto_para_embedding(titulos[i], resumenes[i]) for i in range(n)]
 
-def consolidar_temas(subtemas, textos, pbar):
-    n = len(textos)
-    u = _umbrales_adaptativos(n)
-    pbar.progress(0.05, "Preparando temas...")
-    df = pd.DataFrame({'subtema': subtemas, 'texto': textos})
-    us = list(df['subtema'].unique())
-    if len(us) <= 1:
-        pbar.progress(1.0, "Un tema")
-        return [capitalizar_etiqueta(s) for s in subtemas]
+        pbar.progress(0.05, "Fase 1 · Idénticas...")
+        dsu = DSU(n)
+        self._paso1(titulos, resumenes, dsu)
+        
+        pbar.progress(0.12, "Fase 2 · Títulos...")
+        self._paso2(titulos, dsu)
 
-    if n <= 5 and len(us) == n:
-        pbar.progress(1.0, "Corpus pequeño: temas = subtemas")
-        st.info(f"Temas: **{n}** (corpus pequeño — cada noticia tiene tema propio)")
-        return [capitalizar_etiqueta(s) for s in subtemas]
+        pbar.progress(0.18, "Embeddings...")
+        ae = get_embeddings_batch(et)
 
-    pbar.progress(0.10, "Representaciones...")
-    textos_por_subtema = defaultdict(list)
-    for i, sub in enumerate(subtemas): textos_por_subtema[sub].append(textos[i])
-    repr_enriquecidas = [_construir_representacion_grupo(sub, textos_por_subtema[sub]) for sub in us]
-    pbar.progress(0.20, "Embeddings contenido...")
-    emb_repr = get_embeddings_batch(repr_enriquecidas)
-    emb_labels = get_embeddings_batch(us)
-    ae = get_embeddings_batch(textos)
-    centroids_contenido = {}
-    for sub in us:
-        idxs = df.index[df['subtema'] == sub].tolist()[:50]
-        vecs = [ae[i] for i in idxs if ae[i] is not None]
-        if vecs: centroids_contenido[sub] = np.mean(vecs, axis=0)
-    pbar.progress(0.35, "Similitudes...")
-    vs = [s for s in us if s in centroids_contenido]
-    if len(vs) < 2:
-        pbar.progress(1.0, "Sin agrupación")
-        return [capitalizar_etiqueta(s) for s in subtemas]
-    idx_map = {s: i for i, s in enumerate(us)}
-    M_content = np.array([centroids_contenido[s] for s in vs])
-    sim_content = cosine_similarity(M_content)
-    has_repr = all(emb_repr[idx_map[s]] is not None for s in vs)
-    has_label = all(emb_labels[idx_map[s]] is not None for s in vs)
-    if has_repr and has_label:
-        sim_combined = (0.50 * sim_content + 0.35 * cosine_similarity(np.array([emb_repr[idx_map[s]] for s in vs])) + 0.15 * cosine_similarity(np.array([emb_labels[idx_map[s]] for s in vs])))
-    elif has_repr:
-        sim_combined = (0.60 * sim_content + 0.40 * cosine_similarity(np.array([emb_repr[idx_map[s]] for s in vs])))
-    else:
-        sim_combined = sim_content
+        if u['usar_paso2b']:
+            pbar.progress(0.15, "Fase 2b · Keywords raras (con validación semántica)...")
+            self._paso2b_keywords(titulos, dsu, ae)
 
-    pbar.progress(0.45, "Clustering temas...")
-    dist_matrix = np.clip(1 - sim_combined, 0, 2)
-    np.fill_diagonal(dist_matrix, 0)
-    umbral_tema = u['tema']
-    num_temas_max = u['num_temas_max']
-    cl_labels = agglomerative_clustering_precomputed(dist_matrix, distance_threshold=1 - umbral_tema, linkage='average')
-    if len(set(cl_labels)) > num_temas_max:
-        cl_labels = agglomerative_clustering_precomputed(dist_matrix, n_clusters=num_temas_max, linkage='average')
+        pbar.progress(0.20, "Fase 3 · Clustering...")
+        self._paso3(et, ae, dsu, pbar, 0.20)
 
-    clusters = defaultdict(list)
-    for i, lbl in enumerate(cl_labels): clusters[lbl].append(vs[i])
-    uc = [s for s in us if s not in vs]
-    mt = {}
-    tc = len(clusters)
-    pbar.progress(0.50, f"Nombres {tc} temas...")
-    for k, (cid, subtemas_cluster) in enumerate(clusters.items()):
-        pbar.progress(0.50 + 0.35 * (k / max(tc, 1)), f"Tema {k + 1}/{tc}...")
-        titulos_cluster = []
-        textos_cluster = []
-        for sub in subtemas_cluster:
-            for idx in df.index[df['subtema'] == sub].tolist()[:10]:
-                txt = str(textos[idx])
-                partes = txt.split('. ')
-                if partes: titulos_cluster.append(partes[0][:120])
-                textos_cluster.append(txt[:200])
-        if len(subtemas_cluster) == 1:
-            sub_unico = subtemas_cluster[0]
-            nombre = _generar_nombre_tema_llm(subtemas_cluster, textos_cluster, titulos_cluster)
-            if not nombre or _tema_es_igual_a_subtema(nombre, subtemas_cluster):
-                nombre = _regenerar_tema_diferente(subtemas_cluster, titulos_cluster)
-            if not nombre or _tema_es_igual_a_subtema(nombre, subtemas_cluster):
-                p = sub_unico.split()
-                nombre = _recortar_frase_completa(" ".join(p), max_palabras=3) if len(p) > 3 else sub_unico
-                if _tema_es_igual_a_subtema(nombre, subtemas_cluster): nombre = sub_unico
-        else:
-            nombre = _generar_nombre_tema_llm(subtemas_cluster, textos_cluster, titulos_cluster)
-            if not nombre or _tema_es_igual_a_subtema(nombre, subtemas_cluster):
-                nombre = _regenerar_tema_diferente(subtemas_cluster, titulos_cluster)
-            if not nombre or _tema_es_igual_a_subtema(nombre, subtemas_cluster):
-                nombre = _regenerar_tema_diferente(subtemas_cluster, titulos_cluster, intento=1)
-            if not nombre or _tema_es_igual_a_subtema(nombre, subtemas_cluster):
-                all_words = []
-                for sub in subtemas_cluster:
-                    for w in string_norm_label(sub).split():
-                        if len(w) > 3: all_words.append(w)
-                nombre = capitalizar_etiqueta(" ".join(w for w, _ in Counter(all_words).most_common(2))) if all_words else subtemas_cluster[0]
-        if not _frase_esta_completa(nombre):
-            nombre = _recortar_frase_completa(nombre, max_palabras=4)
-            if not _frase_esta_completa(nombre):
-                freq = Counter(subtemas)
-                nombre = _recortar_frase_completa(max(subtemas_cluster, key=lambda s: freq.get(s, 0)), max_palabras=4)
-        nombre = capitalizar_etiqueta(nombre)
-        for sub in subtemas_cluster: mt[sub] = nombre
-    for sub in uc: mt[sub] = capitalizar_etiqueta(sub)
+        gf = dsu.grupos(n)
+        ng = len(gf)
+        pbar.progress(0.55, f"Fase 4 · Etiquetando {ng} grupos...")
+        mapa = {}
+        sg = sorted(gf.items(), key=lambda x: -len(x[1]))
+        subtemas_aprobados = [] 
 
-    pbar.progress(0.87, "Validando pertenencia mínima a temas...")
-    min_tema = u['min_pertenencia_tema']
-    tf_inicial = [mt.get(sub, sub) for sub in subtemas]
-    tema_agrupacion: Dict[str, list] = defaultdict(list)
-    for i, tema in enumerate(tf_inicial):
-        if ae[i] is not None: tema_agrupacion[tema].append(ae[i])
-    tema_centroids: Dict[str, np.ndarray] = {
-        t: np.mean(vecs, axis=0) for t, vecs in tema_agrupacion.items() if vecs
-    }
-    tf_validado: List[str] = []
-    n_forzadas = 0
-    for i, (sub, tema_asignado) in enumerate(zip(subtemas, tf_inicial)):
-        emb = ae[i]
-        if emb is not None and tema_asignado in tema_centroids:
-            sim = cosine_similarity(np.array(emb).reshape(1, -1), tema_centroids[tema_asignado].reshape(1, -1))[0][0]
-            if sim < min_tema:
-                tf_validado.append(capitalizar_etiqueta(_recortar_frase_completa(sub, max_palabras=4)))
-                n_forzadas += 1
-                continue
-        tf_validado.append(capitalizar_etiqueta(tema_asignado))
-    if n_forzadas: st.caption(f"ℹ️ {n_forzadas} noticias con baja pertenencia al tema agrupado → tema propio asignado.")
+        for k, (lid, idxs) in enumerate(sg):
+            if k % 10 == 0: pbar.progress(0.55 + 0.25 * (k / max(ng, 1)), f"Etiquetando {k + 1}/{ng}...")
+            
+            if len(idxs) > MAX_GRUPO_ETIQUETA:
+                subgrupos = [idxs[i:i + MAX_GRUPO_ETIQUETA] for i in range(0, len(idxs), MAX_GRUPO_ETIQUETA)]
+                for sg_ in subgrupos:
+                    e = self._generar_etiqueta(
+                        [textos[i] for i in sg_],
+                        [titulos[i] for i in sg_],
+                        [resumenes[i] for i in sg_],
+                        subtemas_existentes=subtemas_aprobados
+                    )
+                    if e not in subtemas_aprobados: subtemas_aprobados.append(e)
+                    for i in sg_: mapa[i] = e
+            else:
+                e = self._generar_etiqueta(
+                    [textos[i] for i in idxs],
+                    [titulos[i] for i in idxs],
+                    [resumenes[i] for i in idxs],
+                    subtemas_existentes=subtemas_aprobados
+                )
+                if e not in subtemas_aprobados: subtemas_aprobados.append(e)
+                for i in idxs: mapa[i] = e
 
-    pbar.progress(0.88, "Dedup temas...")
-    tf_validado = dedup_labels(tf_validado, u['dedup_label'])
+        subtemas = [mapa.get(i, "Varios") for i in range(n)]
 
-    pbar.progress(0.90, "Fusionando temas solapados...")
-    mapa_fusion_temas = _fusionar_temas_contenidos(tf_validado)
-    if mapa_fusion_temas:
-        tf_validado = [mapa_fusion_temas.get(t, t) for t in tf_validado]
+        pbar.progress(0.80, "Fase 4b · Coherencia etiqueta↔texto...")
+        umbral_coherencia = u['coherencia_etiqueta']
+        subtemas_unicos = list(set(subtemas))
+        embs_sub_lista = get_embeddings_batch(subtemas_unicos)
+        emb_subtemas = {sub: emb for sub, emb in zip(subtemas_unicos, embs_sub_lista) if emb is not None}
 
-    pbar.progress(0.92, "Validando tema ≠ subtema...")
-    tf_validado = _post_validar_tema_vs_subtema(tf_validado, subtemas)
-    pbar.progress(0.95, "Completitud...")
-    tf_validado = [capitalizar_etiqueta(_recortar_frase_completa(t) if not _frase_esta_completa(t) else t) for t in tf_validado]
-    tf_validado = _unificar_tema_por_subtema(tf_validado, subtemas)
-    st.info(f"Temas: **{len(set(tf_validado))}** (de {len(set(subtemas))} subtemas) · Máx: {num_temas_max}")
-    pbar.progress(1.0, "Temas listos")
-    return tf_validado
+        incoherentes = 0
+        for i in range(n):
+            sub = subtemas[i]
+            emb_txt = ae[i]
+            emb_sub = emb_subtemas.get(sub)
+            if emb_txt is None or emb_sub is None: continue
+            sim = cosine_similarity(np.array(emb_txt).reshape(1, -1), np.array(emb_sub).reshape(1, -1))[0][0]
+            if sim < umbral_coherencia:
+                mejor_sub, mejor_sim = sub, sim
+                for otro_sub, emb_otro in emb_subtemas.items():
+                    if otro_sub == sub: continue
+                    sim_otro = cosine_similarity(np.array(emb_txt).reshape(1, -1), np.array(emb_otro).reshape(1, -1))[0][0]
+                    if sim_otro > mejor_sim: mejor_sim = sim_otro; mejor_sub = otro_sub
+                if mejor_sub != sub and mejor_sim > umbral_coherencia:
+                    subtemas[i] = mejor_sub
+                else:
+                    nueva = self._generar_etiqueta([textos[i]], [titulos[i]], [resumenes[i]], subtemas_existentes=subtemas_aprobados)
+                    subtemas[i] = capitalizar_etiqueta(nueva)
+                    if nueva not in subtemas_aprobados: subtemas_aprobados.append(nueva)
+                incoherentes += 1
 
-def consolidar_temas_fuzz(rows: List[Dict], km: Dict[str, str], umbral_similitud=85) -> Dict[str, str]:
-    tema_key = km.get("tema")
-    temas_unicos = list(set(
-        row.get(tema_key) for row in rows 
-        if row.get(tema_key) and str(row.get(tema_key)).strip() not in ("", "-", "Duplicada", "Error", "Excepción API")
-    ))
-    if not temas_unicos: return {}
-    n = len(temas_unicos)
-    parent = list(range(n))
+        pbar.progress(0.82, "Fase 5 · Dedup...")
+        subtemas = dedup_labels(subtemas, u['dedup_label'])
 
-    def find(i):
-        if parent[i] == i: return i
-        parent[i] = find(parent[i])
-        return parent[i]
+        pbar.progress(0.86, "Fase 5b · Fusión semántica...")
+        textos_por_sub = defaultdict(list)
+        for i, s in enumerate(subtemas): textos_por_sub[s].append(textos[i])
+        subtemas = _fusionar_subtemas_semanticos(subtemas, textos_por_sub, self.marca, self.aliases, u['fusion_subtemas'])
 
-    def union(i, j):
-        root_i, root_j = find(i), find(j)
-        if root_i != root_j: parent[root_j] = root_i
+        pbar.progress(0.90, "Fase 6 · Consistencia...")
+        subtemas = self._consistencia(subtemas, ae, pbar, u)
 
-    for i in range(n):
-        for j in range(i + 1, n):
-            similitud = fuzz.token_set_ratio(temas_unicos[i], temas_unicos[j])
-            if similitud >= umbral_similitud:
-                union(i, j)
+        indices_reclass = [i for i, s in enumerate(subtemas) if s == "_RECLASSIFICAR"]
+        if indices_reclass:
+            pbar.progress(0.93, f"Fase 6b · Reclasificando...")
+            for i in indices_reclass:
+                et_ind = self._generar_etiqueta([textos[i]], [titulos[i]], [resumenes[i]], subtemas_existentes=subtemas_aprobados)
+                subtemas[i] = capitalizar_etiqueta(et_ind)
+                if et_ind not in subtemas_aprobados: subtemas_aprobados.append(et_ind)
 
-    grupos_indices = defaultdict(list)
-    for i in range(n):
-        grupos_indices[find(i)].append(i)
+        pbar.progress(0.93, "Fase 7 · Completitud...")
+        subtemas = self._validar_completitud_final(subtemas, textos, titulos, resumenes)
 
-    mapa_consolidacion = {}
-    for root_idx, indices in grupos_indices.items():
-        grupo_temas = [temas_unicos[i] for i in indices]
-        tema_canonico = min(grupo_temas, key=len)
-        for t in grupo_temas:
-            mapa_consolidacion[t] = tema_canonico
-    return mapa_consolidacion
+        pbar.progress(0.97, "Fase 8 · Dedup final...")
+        subtemas = dedup_labels(subtemas, u['dedup_label'])
+        
+        pbar.progress(0.99, "Consolidación final IA de sinónimos...")
+        unicos_finales = list(dict.fromkeys(subtemas))
+        if 1 < len(unicos_finales) <= 50:
+            mapa_sinonimos = self._consolidar_sinonimos_llm(unicos_finales)
+            subtemas = [mapa_sinonimos.get(s, s) for s in subtemas]
 
+        subtemas = [capitalizar_etiqueta(s) for s in subtemas]
+        nf = len(set(subtemas))
+        pbar.progress(1.0, f"{nf} subtemas")
+        st.info(f"Subtemas: **{nf}** · Grupos originales: **{ng}**")
+        return subtemas
 
 # ======================================
 # Duplicados y Excel (Reglas Nuevas)
