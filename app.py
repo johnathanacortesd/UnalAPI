@@ -5,6 +5,7 @@
 import streamlit as st
 import pandas as pd
 from openpyxl import load_workbook, Workbook
+from openpyxl.styles import Font, Alignment
 from collections import defaultdict
 from copy import deepcopy
 import datetime
@@ -14,12 +15,12 @@ import json
 import time
 from unidecode import unidecode
 from typing import List, Dict, Any, Tuple
-from tqdm import tqdm
 import warnings
 from openai import OpenAI
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
-from thefuzz import fuzz # Requerido para la consolidación de temas
+from thefuzz import fuzz
+from pathlib import Path
 
 warnings.filterwarnings('ignore')
 
@@ -33,7 +34,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# CSS personalizado para mejorar la interfaz
+# CSS personalizado para la interfaz
 st.markdown("""
 <style>
     .main-header {
@@ -75,7 +76,6 @@ st.markdown("""
 # FUNCIÓN DE AUTENTICACIÓN
 # ==============================================================================
 def check_password():
-    """Devuelve `True` si el usuario ha introducido la contraseña correcta."""
     if "password_correct" in st.session_state and st.session_state["password_correct"]:
         return True
 
@@ -100,7 +100,65 @@ def check_password():
     return False
 
 # ==============================================================================
-# FUNCIONES OPTIMIZADAS CON CACHE Y LÓGICA BASE (SIN CAMBIOS)
+# FUNCIONES DE CARGA Y NORMALIZACIÓN DE CONFIGURACIÓN
+# ==============================================================================
+def load_local_config():
+    """Busca el archivo Configuracion.xlsx automáticamente en el repositorio."""
+    paths_to_try = [
+        Path("Configuracion.xlsx"),
+        Path("configuracion.xlsx"),
+        Path("Config.xlsx"),
+        Path("config.xlsx")
+    ]
+    for p in paths_to_try:
+        if p.exists():
+            return p
+    base = Path(__file__).parent
+    for f in base.iterdir():
+        if f.suffix.lower() == '.xlsx' and 'config' in f.stem.lower():
+            return f
+    return None
+
+def load_config_data():
+    """Carga de forma automática region_map, internet_map y sov_map desde Configuracion.xlsx."""
+    config_path = load_local_config()
+    if not config_path:
+        return None, None, None
+    try:
+        config_sheets = pd.read_excel(config_path, sheet_name=None, engine='openpyxl')
+        region_map = pd.Series(
+            config_sheets['Regiones'].iloc[:, 1].values,
+            index=config_sheets['Regiones'].iloc[:, 0].astype(str).str.lower().str.strip()
+        ).to_dict()
+        internet_map = pd.Series(
+            config_sheets['Internet'].iloc[:, 1].values,
+            index=config_sheets['Internet'].iloc[:, 0].astype(str).str.lower().str.strip()
+        ).to_dict()
+        
+        sov_map = {}
+        if 'SOV' in config_sheets:
+            df_sov = config_sheets['SOV']
+            cols = [str(c).strip() for c in df_sov.columns]
+            menc_col_idx, name_col_idx = None, None
+            for idx, col in enumerate(cols):
+                norm = norm_key(col)
+                if "menciones" in norm:
+                    menc_col_idx = idx
+                elif "nombre" in norm:
+                    name_col_idx = idx
+            if menc_col_idx is not None and name_col_idx is not None:
+                for _, row in df_sov.iterrows():
+                    k = str(row.iloc[menc_col_idx]).strip().lower()
+                    v = str(row.iloc[name_col_idx]).strip()
+                    if k and v:
+                        sov_map[k] = v
+        return region_map, internet_map, sov_map
+    except Exception as e:
+        st.error(f"Error al cargar Configuracion.xlsx: {e}")
+        return None, None, None
+
+# ==============================================================================
+# FUNCIONES DE LIMPIEZA, PARSEO Y DUPLICADOS
 # ==============================================================================
 @lru_cache(maxsize=10000)
 def norm_key(text: Any) -> str:
@@ -131,6 +189,43 @@ def normalizar_tipo_medio(tipo_raw: str) -> str:
         "internet": "Internet", "digital": "Internet", "web": "Internet"
     }
     return mapping.get(t, str(tipo_raw).strip().title() if str(tipo_raw).strip() else "Otro")
+
+def parse_numeric(val):
+    """Convierte de forma segura strings de datos numéricos en tipos int o float, previniendo notación científica."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        if isinstance(val, float) and val.is_integer():
+            return int(val)
+        return val
+    s = str(val).strip()
+    if not s:
+        return None
+    if 'e' in s.lower():
+        s = s.replace(',', '.')
+    else:
+        if ',' in s and '.' in s:
+            if s.rfind('.') < s.rfind(','):
+                s = s.replace('.', '').replace(',', '.')
+            else:
+                s = s.replace(',', '')
+        elif ',' in s:
+            parts = s.split(',')
+            if len(parts) > 2 or (len(parts) == 2 and len(parts[1]) == 3 and not s.lower().startswith('0,')):
+                s = s.replace(',', '')
+            else:
+                s = s.replace(',', '.')
+        elif '.' in s:
+            parts = s.split('.')
+            if len(parts) > 2 or (len(parts) == 2 and len(parts[1]) == 3 and not s.lower().startswith('0.')):
+                s = s.replace('.', '')
+    try:
+        f_val = float(s)
+        if f_val.is_integer():
+            return int(f_val)
+        return f_val
+    except ValueError:
+        return None
 
 def extract_link(cell):
     if hasattr(cell, "hyperlink") and cell.hyperlink and cell.hyperlink.target:
@@ -214,11 +309,8 @@ def detectar_duplicados_avanzado(rows: List[Dict], key_map: Dict[str, str], prog
                 else: seen_broadcast[key_broadcast] = i
     return processed_rows
 
-def process_mappings_and_links(all_processed_rows, key_map, region_file, internet_file):
-    df_region = pd.read_excel(region_file)
-    region_map = {str(k).lower().strip(): v for k, v in pd.Series(df_region.iloc[:, 1].values, index=df_region.iloc[:, 0]).to_dict().items()}
-    df_internet = pd.read_excel(internet_file)
-    internet_map = {str(k).lower().strip(): v for k, v in pd.Series(df_internet.iloc[:, 1].values, index=df_internet.iloc[:, 0]).to_dict().items()}
+def process_mappings_and_links(all_processed_rows, key_map, region_map, internet_map):
+    """Realiza el buscarv de Región utilizando el medio original antes de que Internet modifique la columna Medio."""
     for row in all_processed_rows:
         original_medio_key = str(row.get(key_map.get("medio"), "")).lower().strip()
         row[key_map.get("region")] = region_map.get(original_medio_key, "N/A")
@@ -228,27 +320,30 @@ def process_mappings_and_links(all_processed_rows, key_map, region_file, interne
     return all_processed_rows
 
 def process_link_logic(all_rows, key_map):
+    """Aplica la lógica de enlaces y limpia Link (Streaming - Imagen) para medios no digitales."""
     ln_key, ls_key = key_map.get("link_nota"), key_map.get("link_streaming")
     for row in all_rows:
         tipo = normalizar_tipo_medio(row.get(key_map.get("tipodemedio"), ""))
         ln, ls = row.get(ln_key) or {}, row.get(ls_key) or {}
         has_url = lambda x: isinstance(x, dict) and bool(x.get("url"))
-        if tipo in ["Radio", "Televisión"]: row[ls_key] = None
-        elif tipo == "Internet": row[ln_key], row[ls_key] = ls, ln
+        
+        if tipo in ["Radio", "Televisión"]:
+            row[ls_key] = None
+        elif tipo == "Internet":
+            row[ln_key], row[ls_key] = ls, ln
         elif tipo in ["Prensa", "Revista"]:
-            if not has_url(ln) and has_url(ls): row[ln_key] = ls
+            if not has_url(ln) and has_url(ls):
+                row[ln_key] = ls
             row[ls_key] = None
     return all_rows
 
-def process_sov_mapping_final(all_rows: List[Dict], key_map: Dict[str, str], sov_file):
-    df_sov = pd.read_excel(sov_file)
-    cols_by_norm = {norm_key(c): c for c in df_sov.columns}
-    menc_col, name_col = cols_by_norm.get(norm_key("Menciones - Empresa")), cols_by_norm.get(norm_key("Nombre"))
-    if not menc_col or not name_col: return all_rows
-    sov_map = {str(r.get(menc_col, "")).strip().lower(): str(r.get(name_col)).strip() for _, r in df_sov.iterrows() if str(r.get(menc_col, "")).strip() and str(r.get(name_col, "")).strip()}
+def process_sov_mapping_final(all_rows: List[Dict], key_map: Dict[str, str], sov_map: Dict[str, str]):
+    if not sov_map:
+        return all_rows
     for r in all_rows:
         mk = str(r.get(key_map.get("menciones"), "")).strip().lower()
-        if mk in sov_map: r[key_map.get("menciones")] = sov_map[mk]
+        if mk in sov_map: 
+            r[key_map.get("menciones")] = sov_map[mk]
     return all_rows
 
 def _append_rows_to_sheet(sheet, rows_data, key_map, include_ai_columns):
@@ -256,23 +351,76 @@ def _append_rows_to_sheet(sheet, rows_data, key_map, include_ai_columns):
     ai_order = ["Tono AI", "Tema"]
     final_order = base_order[:16] + ai_order + base_order[16:] if include_ai_columns else base_order
     sheet.append(final_order)
+    
+    font_hyperlink = Font(color="0563C1", underline="single")
+    align_left = Alignment(horizontal='left')
+    font_header = Font(bold=True)
+    
+    for i, col_name in enumerate(final_order, start=1):
+        cell = sheet.cell(row=1, column=i)
+        cell.font = font_header
+        
+    NUM = {"ID Noticia", "Nro. Pagina", "Dimension", "Duracion - Nro. Caracteres", "CPE", "Tier", "Audiencia"}
+    
     for row_data in rows_data:
         row_data[key_map.get("titulo")] = clean_title_for_output(row_data.get(key_map.get("titulo")))
         row_data[key_map.get("resumen")] = corregir_texto(str(row_data.get(key_map.get("resumen"), ""))).replace("_x000D_", "")
+        
         row_to_append, links_to_add = [], {}
         for col_idx, header in enumerate(final_order, 1):
             val = row_data.get(norm_key(header))
             cell_value = None
-            if isinstance(val, dict) and val.get("url"):
-                cell_value, url = "Link", val.get("url")
-                links_to_add[col_idx] = url
-            elif val is not None: cell_value = str(val)
+            
+            if header == 'Fecha' and pd.notna(val):
+                if isinstance(val, pd.Timestamp):
+                    cell_value = val.to_pydatetime()
+                elif isinstance(val, (datetime.datetime, datetime.date)):
+                    cell_value = val
+                else:
+                    cell_value = str(val) if val is not None else None
+            elif header in NUM:
+                cell_value = parse_numeric(val)
+            elif isinstance(val, dict) and val.get("url"):
+                cell_value = val.get("value", "Link")
+                links_to_add[col_idx] = val.get("url")
+            elif val is not None:
+                if isinstance(val, str) and val.startswith("http"):
+                    cell_value = "Link"
+                    links_to_add[col_idx] = val
+                else:
+                    cell_value = str(val)
             row_to_append.append(cell_value)
         sheet.append(row_to_append)
+        
+        current_row = sheet.max_row
+        
+        date_col_idx = final_order.index("Fecha") + 1
+        date_cell = sheet.cell(row=current_row, column=date_col_idx)
+        if isinstance(date_cell.value, (datetime.datetime, datetime.date)):
+            date_cell.number_format = 'DD/MM/YYYY'
+            
+        cpe_col_idx = final_order.index("CPE") + 1
+        tipo_medio_col_idx = final_order.index("Tipo de Medio") + 1
+        tipo_medio_val = sheet.cell(row=current_row, column=tipo_medio_col_idx).value
+        cpe_cell = sheet.cell(row=current_row, column=cpe_col_idx)
+        
+        if tipo_medio_val in ("Radio", "Televisión") and isinstance(cpe_cell.value, (int, float)):
+            cpe_cell.number_format = '#,##0'
+            
         for col_idx, url in links_to_add.items():
-            cell = sheet.cell(row=sheet.max_row, column=col_idx)
+            cell = sheet.cell(row=current_row, column=col_idx)
             cell.hyperlink = url
-            cell.style = "Hyperlink"
+            cell.font = font_hyperlink
+            cell.alignment = align_left
+            
+    for i, col_name in enumerate(final_order, start=1):
+        letter = sheet.cell(row=1, column=i).column_letter
+        if col_name in ['Titulo', 'Resumen - Aclaracion']:
+            sheet.column_dimensions[letter].width = 50
+        elif col_name in ['Link Nota', 'Link (Streaming - Imagen)']:
+            sheet.column_dimensions[letter].width = 15
+        else:
+            sheet.column_dimensions[letter].width = 20
 
 def generate_excel_output(all_processed_rows, key_map):
     out_wb = Workbook()
@@ -320,13 +468,7 @@ def agrupar_noticias_similares(rows: List[Dict], key_map: Dict[str, str]) -> Lis
     for i in range(n): grupos_finales[find(i)].append(i)
     return list(grupos_finales.values())
 
-# <<< MEJORA CRÍTICA: Lógica de consolidación de temas totalmente reescrita para ser más potente
 def consolidar_temas_similares(rows: List[Dict], key_map: Dict[str, str], umbral_similitud=85) -> Dict[str, str]:
-    """
-    Agrupa temas semánticamente similares usando un enfoque de clustering robusto.
-    Compara todos los temas entre sí para encontrar similitudes, incluso si no son
-    lexicográficamente adyacentes.
-    """
     tema_key = key_map.get("tema")
     temas_unicos = list(set(
         row.get(tema_key) for row in rows 
@@ -348,27 +490,20 @@ def consolidar_temas_similares(rows: List[Dict], key_map: Dict[str, str], umbral
         root_i, root_j = find(i), find(j)
         if root_i != root_j: parent[root_j] = root_i
 
-    # Comparación O(n^2) entre todos los temas únicos
     for i in range(n):
         for j in range(i + 1, n):
-            # Usar token_set_ratio es clave: maneja orden de palabras y diferencias de subconjuntos
             similitud = fuzz.token_set_ratio(temas_unicos[i], temas_unicos[j])
             if similitud >= umbral_similitud:
                 union(i, j)
 
-    # Agrupar los índices de temas por su raíz
     grupos_indices = defaultdict(list)
     for i in range(n):
         grupos_indices[find(i)].append(i)
 
-    # Crear el mapa de consolidación final
     mapa_consolidacion = {}
     for root_idx, indices in grupos_indices.items():
-        # Para cada grupo, elegir un tema "canónico" (ej. el más corto)
         grupo_temas = [temas_unicos[i] for i in indices]
         tema_canonico = min(grupo_temas, key=len)
-        
-        # Mapear todos los temas del grupo al canónico
         for tema in grupo_temas:
             mapa_consolidacion[tema] = tema_canonico
             
@@ -392,7 +527,6 @@ def analizar_con_openai_parallel(textos_agrupados: List[Tuple[str, List[int]]], 
     resultados = {}
     tools = [{"type": "function", "function": {"name": "clasificar_noticia_unal", "description": "Clasifica el tono y el tema de una noticia sobre la Universidad Nacional.", "parameters": {"type": "object", "properties": {"tono": {"type": "string", "description": "El tono de la noticia: Positivo, Negativo o Neutro.", "enum": ["Positivo", "Negativo", "Neutro"]}, "tema": {"type": "string", "description": "Tema específico de 4 a 6 palabras que resume el hecho principal. No debe incluir el nombre de la universidad ni ser genérico."}}, "required": ["tono", "tema"]}}}]
     
-    # <<< MEJORA CRÍTICA: Prompt actualizado con la nueva regla de negocio sobre eventos.
     system_prompt = """Eres un analista de medios hiper-especializado y tu única misión es evaluar el impacto de las noticias sobre la Universidad Nacional de Colombia (UNAL). Debes ser implacable en la aplicación de las siguientes reglas.
 
 **REGLA DE ORO INQUEBRANTABLE:**
@@ -481,21 +615,32 @@ if 'analysis_done' not in st.session_state: st.session_state.analysis_done = Fal
 if 'result_buffer' not in st.session_state: st.session_state.result_buffer = None
 if 'final_summary' not in st.session_state: st.session_state.final_summary = {}
 if 'analysis_stats' not in st.session_state: st.session_state.analysis_stats = {}
+
 with st.sidebar:
     st.markdown("### 📂 Carga de Archivos")
     dossier_file = st.file_uploader("Dossier Principal", type="xlsx", help="Archivo principal con las noticias")
-    region_file = st.file_uploader("Mapeo de Región", type="xlsx", help="Relación Medio-Región")
-    internet_file = st.file_uploader("Mapeo de Internet", type="xlsx", help="Relación Medio-Internet")
-    sov_file = st.file_uploader("Mapeo SOV", type="xlsx", help="Relación Menciones-Marca")
+    
+    # Intento de cargar la configuración automática desde el repositorio
+    config_loaded = False
+    region_map, internet_map, sov_map = load_config_data()
+    if region_map is not None:
+        config_loaded = True
+        st.success("✅ Configuración y mapeos cargados automáticamente.")
+    else:
+        st.warning("⚠️ No se encontró Configuracion.xlsx en el repositorio.")
+        
     st.markdown("---")
     st.markdown("### ⚙️ Configuración")
     col1, col2 = st.columns(2)
     with col1: cost_limit_usd = st.number_input("💰 Límite (USD)", min_value=0.10, max_value=10.0, value=1.00, step=0.10)
     with col2: batch_size = st.slider("📦 Lote", min_value=100, max_value=1000, value=400, step=50)
     st.markdown("---")
-    all_files_ready = all([dossier_file, region_file, internet_file, sov_file])
-    if not all_files_ready: st.warning("⚠️ Cargue todos los archivos para continuar")
+    
+    all_files_ready = bool(dossier_file and config_loaded)
+    if not all_files_ready: 
+        st.warning("⚠️ Cargue el archivo Dossier y asegúrese de que el archivo Configuracion.xlsx esté presente en el repositorio.")
     start_button = st.button("🚀 Iniciar Análisis", type="primary", use_container_width=True, disabled=(not all_files_ready))
+
 if start_button:
     st.session_state.analysis_done = False
     st.session_state.result_buffer = None
@@ -505,17 +650,25 @@ if start_button:
     progress_bar = st.progress(0, text="🚀 Iniciando proceso...")
     status_container = st.empty()
     metrics_container = st.container()
+    
     def main_progress_hook(current, total, text):
         if total > 0: progress_bar.progress(min((current / total) * 0.33, 0.32), text=text)
+        
     start_time = time.time()
     try:
         # FASE 1: Preparación de datos
         status_container.markdown('<div class="info-box">📋 <strong>Fase 1/4:</strong> Preparando y limpiando datos...</div>', unsafe_allow_html=True)
         all_processed_rows, key_map = run_base_logic(load_workbook(dossier_file, data_only=True).active, main_progress_hook)
-        all_processed_rows = process_mappings_and_links(all_processed_rows, key_map, region_file, internet_file)
+        all_processed_rows = process_mappings_and_links(all_processed_rows, key_map, region_map, internet_map)
         all_processed_rows = process_link_logic(all_processed_rows, key_map)
-        for row in all_processed_rows: row["__is_target_brand"] = (row.get(key_map.get("menciones")) in TARGET_BRANDS)
-        total_news, unal_news, duplicates = len(all_processed_rows), sum(1 for r in all_processed_rows if r.get('__is_target_brand')), sum(1 for r in all_processed_rows if r.get('is_duplicate'))
+        
+        for row in all_processed_rows: 
+            row["__is_target_brand"] = (row.get(key_map.get("menciones")) in TARGET_BRANDS)
+            
+        total_news = len(all_processed_rows)
+        unal_news = sum(1 for r in all_processed_rows if r.get('__is_target_brand'))
+        duplicates = sum(1 for r in all_processed_rows if r.get('is_duplicate'))
+        
         with metrics_container:
             col1, col2, col3 = st.columns(3)
             col1.metric("📰 Total Noticias", f"{total_news:,}")
@@ -528,6 +681,7 @@ if start_button:
         cost_tracker = CostTracker(cost_limit_usd, 0.10, 0.40)
         target_rows = [row for row in all_processed_rows if row.get("__is_target_brand") and not row.get("is_duplicate")]
         status_placeholder = st.empty()
+        
         if target_rows:
             target_rows_procesados = procesar_por_lotes(target_rows, key_map, batch_size, cost_tracker, client, status_placeholder, progress_bar)
             update_map = {row['original_index']: row for row in target_rows_procesados}
@@ -551,7 +705,7 @@ if start_button:
         
         # FASE 4: Generación de informe
         status_container.markdown('<div class="info-box">📄 <strong>Fase 4/4:</strong> Generando informe final...</div>', unsafe_allow_html=True)
-        final_rows = process_sov_mapping_final(all_processed_rows, key_map, sov_file)
+        final_rows = process_sov_mapping_final(all_processed_rows, key_map, sov_map)
         st.session_state.result_buffer = generate_excel_output(final_rows, key_map)
         progress_bar.progress(1.0, text="✅ ¡Proceso completado!")
         st.session_state.analysis_done = True
@@ -568,8 +722,13 @@ if st.session_state.analysis_done and st.session_state.result_buffer:
         st.markdown("### 📊 Resumen del Análisis")
         summary, stats = st.session_state.get('final_summary', {}), st.session_state.get('analysis_stats', {})
         total_cost, limit = summary.get('total_cost', 0), summary.get('limit', 0)
-        remaining, input_tokens, output_tokens = max(0, limit - total_cost), summary.get('input_tokens', 0), summary.get('output_tokens', 0)
-        total_tokens, processing_time, processed_news = input_tokens + output_tokens, stats.get('time', 0), stats.get('processed', 0)
+        remaining = max(0, limit - total_cost)
+        input_tokens = summary.get('input_tokens', 0)
+        output_tokens = summary.get('output_tokens', 0)
+        total_tokens = input_tokens + output_tokens
+        processing_time = stats.get('time', 0)
+        processed_news = stats.get('processed', 0)
+        
         m_col1, m_col2, m_col3, m_col4 = st.columns(4)
         m_col1.metric("💵 Costo Total", f"${total_cost:.4f}")
         m_col2.metric("💰 Restante", f"${remaining:.4f}")
