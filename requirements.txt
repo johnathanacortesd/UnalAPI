@@ -1,7 +1,7 @@
 streamlit
-openai
-unidecode
 pandas
 openpyxl
-tqdm
+unidecode
 thefuzz
+openai<1.0.0
+joblib
