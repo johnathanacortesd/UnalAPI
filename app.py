@@ -731,7 +731,6 @@ def normalizar_tipo_medio(tipo_raw):
     }.get(t, str(tipo_raw).strip().title() or "Otro")
 
 def parse_numeric(val):
-    """Limpia y analiza valores numéricos que puedan venir como cadenas con coma decimal, separador de miles o formato científico."""
     if val is None:
         return None
     if isinstance(val, (int, float)):
@@ -1437,7 +1436,7 @@ class ClasificadorSubtema:
             f"     CORRECTO: {ejemplo_dinamico}\n"
             "     INCORRECTO: 'Alcalde presenta proyecto terminal', "
             "'Gobernador anuncia inversión', 'Alcaldía lanza plan'\n"
-            "  2. USA preposiciones (de, del, para, sobre, en, por) para conectar concepts.\n"
+            "  2. USA preposiciones (de, del, para, sobre, en, por) para conectar conceptos.\n"
             "  3. SÉ ESPECÍFICO: describe el asunto real, no el actor.\n"
             "  4. Ciudades y regiones SÍ pueden aparecer si son relevantes al tema.\n"
             "  5. Sin nombre de marcas privadas. Tildes y ñ correctas.\n\n"
@@ -2099,7 +2098,7 @@ def _unificar_tema_por_subtema(temas, subtemas):
     return [sub_to_best[s] for s in subtemas]
 
 # ======================================
-# Duplicados y Excel (Reglas Nuevas)
+# Duplicados y Excel (Particionado en Hojas UNAL y Otros)
 # ======================================
 def _normalizar_url(url: str) -> str:
     if not url: return ""
@@ -2316,9 +2315,23 @@ def read_and_normalize_dossier(sheet, region_map, internet_map):
 
 def generate_output_excel(rows, km):
     wb = Workbook()
-    ws = wb.active
-    ws.title = "Resultado"
-    ORDER = [
+    
+    # Separación de registros para las dos pestañas especificadas
+    rows_unal = []
+    rows_otros = []
+    for row in rows:
+        mencion = str(row.get("Menciones - Empresa", "")).strip()
+        if mencion == "Universidad Nacional de Colombia - General":
+            rows_unal.append(row)
+        else:
+            rows_otros.append(row)
+            
+    # Configuración de Hojas
+    ws_unal = wb.active
+    ws_unal.title = "UNAL"
+    ws_otros = wb.create_sheet(title="Otros")
+    
+    ORDER_UNAL = [
         "ID Noticia", "Fecha", "Hora", "Medio", "Tipo de Medio",
         "Sección - Programa", "Región", "Título", "Autor - Conductor",
         "Nro. Pagina", "Dimensión", "Duración - Nro. Caracteres",
@@ -2326,80 +2339,92 @@ def generate_output_excel(rows, km):
         "Link Nota", "Resumen - Aclaracion", "Link (Streaming - Imagen)", "Menciones - Empresa",
         "ID duplicada"
     ]
-    NUM = {"ID Noticia", "Nro. Pagina", "Dimensión", "Duración - Nro. Caracteres", "CPE", "Tier", "Audiencia"}
-    ws.append(ORDER)
     
-    font_hyperlink = Font(color="0563C1", underline="single")
-    align_left = Alignment(horizontal='left')
-    font_header = Font(bold=True)
+    ORDER_OTROS = [
+        "ID Noticia", "Fecha", "Hora", "Medio", "Tipo de Medio",
+        "Sección - Programa", "Región", "Título", "Autor - Conductor",
+        "Nro. Pagina", "Dimensión", "Duración - Nro. Caracteres",
+        "CPE", "Tier", "Audiencia", "Tono", "Tema", "Link Nota", 
+        "Resumen - Aclaracion", "Link (Streaming - Imagen)", "Menciones - Empresa",
+        "ID duplicada"
+    ]
     
-    for i, col_name in enumerate(ORDER, start=1):
-        cell = ws.cell(row=1, column=i)
-        cell.font = font_header
+    def populate_sheet(ws, sheet_rows, cols_order):
+        ws.append(cols_order)
+        font_hyperlink = Font(color="0563C1", underline="single")
+        align_left = Alignment(horizontal='left')
+        font_header = Font(bold=True)
+        NUM = {"ID Noticia", "Nro. Pagina", "Dimensión", "Duración - Nro. Caracteres", "CPE", "Tier", "Audiencia"}
         
-    for row in rows:
-        tk = km.get("titulo")
-        if tk and tk in row: row[tk] = clean_title_for_output(row.get(tk))
-        rk = km.get("resumen")
-        if rk and rk in row: row[rk] = corregir_texto(row.get(rk))
-        
-        out, links = [], {}
-        for ci, h in enumerate(ORDER, start=1):
-            dk = km.get(norm_key(h), norm_key(h))
-            val = row.get(h)
-            cv = None
+        for i, col_name in enumerate(cols_order, start=1):
+            cell = ws.cell(row=1, column=i)
+            cell.font = font_header
             
-            if h == 'Fecha' and pd.notna(val):
-                if isinstance(val, pd.Timestamp):
-                    cv = val.to_pydatetime()
-                elif isinstance(val, (datetime.datetime, datetime.date)):
-                    cv = val
-                else:
-                    cv = str(val) if val is not None else None
-            elif h in NUM:
-                cv = parse_numeric(val)
-            elif isinstance(val, dict) and "url" in val:
-                cv = val.get("value", "Link")
-                if val.get("url"): links[ci] = val["url"]
-            elif val is not None:
-                if isinstance(val, str) and val.startswith("http"):
-                    cv = "Link"
-                    links[ci] = val
-                else:
-                    cv = str(val)
-            out.append(cv)
-        ws.append(out)
-        
-        current_row = ws.max_row
-        for ci, url in links.items():
-            cell = ws.cell(row=current_row, column=ci)
-            cell.hyperlink = url
-            cell.font = font_hyperlink
-            cell.alignment = align_left
+        for row in sheet_rows:
+            row_copy = dict(row)
+            tk = km.get("titulo")
+            if tk and tk in row_copy: row_copy[tk] = clean_title_for_output(row_copy.get(tk))
+            rk = km.get("resumen")
+            if rk and rk in row_copy: row_copy[rk] = corregir_texto(row_copy.get(rk))
             
-        date_col_idx = ORDER.index("Fecha") + 1
-        date_cell = ws.cell(row=current_row, column=date_col_idx)
-        if isinstance(date_cell.value, (datetime.datetime, datetime.date)):
-            date_cell.number_format = 'DD/MM/YYYY'
+            out, links = [], {}
+            for ci, h in enumerate(cols_order, start=1):
+                val = row_copy.get(h)
+                cv = None
+                
+                if h == 'Fecha' and pd.notna(val):
+                    if isinstance(val, pd.Timestamp):
+                        cv = val.to_pydatetime()
+                    elif isinstance(val, (datetime.datetime, datetime.date)):
+                        cv = val
+                    else:
+                        cv = str(val) if val is not None else None
+                elif h in NUM:
+                    cv = parse_numeric(val)
+                elif isinstance(val, dict) and "url" in val:
+                    cv = val.get("value", "Link")
+                    if val.get("url"): links[ci] = val["url"]
+                elif val is not None:
+                    if isinstance(val, str) and val.startswith("http"):
+                        cv = "Link"
+                        links[ci] = val
+                    else:
+                        cv = str(val)
+                out.append(cv)
+            ws.append(out)
             
-        # Formatear CPE sin notación científica para Radio y Televisión (AM, FM, Aire, Cable)
-        cpe_idx = ORDER.index("CPE") + 1
-        tipo_medio_idx = ORDER.index("Tipo de Medio") + 1
-        tipo_medio_val = ws.cell(row=current_row, column=tipo_medio_idx).value
-        cpe_cell = ws.cell(row=current_row, column=cpe_idx)
-        
-        if tipo_medio_val in ("Radio", "Televisión") and isinstance(cpe_cell.value, (int, float)):
-            cpe_cell.number_format = '#,##0'
+            current_row = ws.max_row
+            for ci, url in links.items():
+                cell = ws.cell(row=current_row, column=ci)
+                cell.hyperlink = url
+                cell.font = font_hyperlink
+                cell.alignment = align_left
+                
+            date_col_idx = cols_order.index("Fecha") + 1
+            date_cell = ws.cell(row=current_row, column=date_col_idx)
+            if isinstance(date_cell.value, (datetime.datetime, datetime.date)):
+                date_cell.number_format = 'DD/MM/YYYY'
+                
+            cpe_idx = cols_order.index("CPE") + 1
+            tipo_medio_idx = cols_order.index("Tipo de Medio") + 1
+            tipo_medio_val = ws.cell(row=current_row, column=tipo_medio_idx).value
+            cpe_cell = ws.cell(row=current_row, column=cpe_idx)
             
-    for i, col_name in enumerate(ORDER, start=1):
-        letter = ws.cell(row=1, column=i).column_letter
-        if col_name in ['Título', 'Resumen - Aclaracion']:
-            ws.column_dimensions[letter].width = 50
-        elif col_name in ['Link Nota', 'Link (Streaming - Imagen)']:
-            ws.column_dimensions[letter].width = 15
-        else:
-            ws.column_dimensions[letter].width = 20
-            
+            if tipo_medio_val in ("Radio", "Televisión") and isinstance(cpe_cell.value, (int, float)):
+                cpe_cell.number_format = '#,##0'
+                
+        for i, col_name in enumerate(cols_order, start=1):
+            letter = ws.cell(row=1, column=i).column_letter
+            if col_name in ['Título', 'Resumen - Aclaracion']:
+                ws.column_dimensions[letter].width = 50
+            elif col_name in ['Link Nota', 'Link (Streaming - Imagen)']:
+                ws.column_dimensions[letter].width = 15
+            else:
+                ws.column_dimensions[letter].width = 20
+
+    populate_sheet(ws_unal, rows_unal, ORDER_UNAL)
+    populate_sheet(ws_otros, rows_otros, ORDER_OTROS)
+    
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -2500,7 +2525,7 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
         df[km["subtema"]] = "Cobertura informativa general"
         df[km["tema"]] = "Cobertura informativa general"
         
-        # Filtrado para procesar únicamente Universidad Nacional de Colombia - General con OpenAI
+        # Filtrado para procesar únicamente "Universidad Nacional de Colombia - General" con OpenAI
         is_target = df[km["menciones"]].astype(str).str.strip() == "Universidad Nacional de Colombia - General"
         df_target = df[is_target].copy()
         
@@ -2509,11 +2534,11 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
                 lambda r: texto_para_embedding(str(r.get(km["titulo"], "")), str(r.get(km["resumen"], ""))),
                 axis=1
             )
-            with st.status("Embeddings (Universidad Nacional de Colombia)...", expanded=True) as s:
+            with st.status("Embeddings (Universidad Nacional)...", expanded=True) as s:
                 _ = get_embeddings_batch(df_target["_txt"].tolist())
                 s.update(label=f"✓ {get_embedding_cache().stats()}", state="complete")
                 
-            with st.status("Paso 3 · Tono (Universidad Nacional de Colombia)", expanded=True) as s:
+            with st.status("Paso 3 · Tono (Universidad Nacional)", expanded=True) as s:
                 pb = st.progress(0)
                 if "PKL" in mode and tpkl:
                     res = analizar_tono_con_pkl(df_target["_txt"].tolist(), tpkl)
@@ -2527,7 +2552,7 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
                 df_target[km["tonoiai"]] = [r["tono"] for r in res]
                 s.update(label="✓ Paso 3 · Tono completado", state="complete")
                 
-            with st.status("Paso 4 · Clasificación (Universidad Nacional de Colombia)", expanded=True) as s:
+            with st.status("Paso 4 · Clasificación (Universidad Nacional)", expanded=True) as s:
                 pb = st.progress(0)
                 if "Solo Modelos PKL" in mode:
                     subtemas = ["N/A"] * len(df_target)
@@ -2545,7 +2570,7 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
                     df_target[km["tema"]] = temas
                 s.update(label="✓ Paso 4 · Clasificación completada", state="complete")
                 
-            # Mapear de regreso los registros procesados al DataFrame general
+            # Mapear los registros procesados al DataFrame general
             df.loc[is_target, km["tonoiai"]] = df_target[km["tonoiai"]]
             df.loc[is_target, km["subtema"]] = df_target[km["subtema"]]
             df.loc[is_target, km["tema"]] = df_target[km["tema"]]
@@ -2670,8 +2695,8 @@ def render_quick_tab():
             c1, c2 = st.columns(2)
             tc = c1.selectbox("Col. título",  cols, 0)
             sc = c2.selectbox("Col. resumen", cols, 1 if len(cols) > 1 else 0)
-            bn  = st.text_input("Marca",       placeholder="Ej: Bancolombia")
-            bat = st.text_input("Alias (;)",   placeholder="Ej: Grupo Bancolombia;Ban")
+            bn  = st.text_input("Marca",       value="Universidad Nacional")
+            bat = st.text_input("Alias (;)",   value="Universidad Nacional de Colombia; UNAL")
             if st.form_submit_button("Analizar", use_container_width=True, type="primary"):
                 if not bn:
                     st.error("Indica la marca.")
@@ -2718,8 +2743,8 @@ def main():
             st.markdown('<div class="sec-label">Configuración</div>', unsafe_allow_html=True)
             cl, cr = st.columns([3, 2])
             with cl:
-                bn  = st.text_input("Marca principal", placeholder="Ej: Bancolombia", key="bn")
-                bat = st.text_input("Alias (separados por ;)", placeholder="Ej: Grupo Bancolombia;Ban", key="ba")
+                bn  = st.text_input("Marca principal", value="Universidad Nacional", key="bn")
+                bat = st.text_input("Alias (separados por ;)", value="Universidad Nacional de Colombia; UNAL", key="ba")
             with cr:
                 mode = st.radio(
                     "Modo de análisis",
