@@ -114,7 +114,7 @@ _PATRON_TITULAR = re.compile(
 )
 _PATRON_ESTADO = re.compile(
     r"\b(calma|caos|urgente|hoy|ya|ahora|ayer|mañana|nuevo|nueva|"
-    r"gran|grande|importante|especial|exclusivo)\s*$",
+    r"gran|grande|important|especial|exclusivo)\s*$",
     re.IGNORECASE
 )
 
@@ -207,7 +207,7 @@ _ENIE_MAP = {
     "cabana":"cabaña","cabanas":"cabañas","banera":"bañera","vinedo":"viñedo",
     "vinedos":"viñedos","rebano":"rebaño","rebanos":"rebaños","extrano":"extraño",
     "extrana":"extraña","extranos":"extraños","extranas":"extrañas",
-    "enganio":"engaño","engano":"engaño","enganos":"engaños","tamanio":"tamaño",
+    "enganio":"engaño","engano":"engaño","enganos":"extraños","tamanio":"tamaño",
     "tamano":"tamaño","tamanos":"tamaños","muneca":"muñeca","munecas":"muñecas",
     "cunado":"cuñado","cunada":"cuñada","cunados":"cuñados","albanil":"albañil",
     "albaniles":"albañiles","narino":"Nariño","quindio":"Quindío",
@@ -766,10 +766,11 @@ def parse_numeric(val):
     except ValueError:
         return None
 
+# ── EQUILIBRIO DE PESO ENTRE TÍTULO Y RESUMEN (No sesgar el embedding) ──────────────────────────
 def texto_para_embedding(titulo, resumen, max_len=1800):
-    t = str(titulo or "").strip()
-    r = str(resumen or "").strip()
-    return f"{t}. {t}. {t}. {r}"[:max_len]
+    t = str(titulo or "").strip()[:300]
+    r = str(resumen or "").strip()[:1500]
+    return f"Título: {t}\nResumen: {r}"
 
 def _validar_etiqueta_completa(etiqueta, titulos_grp=None, resumenes_grp=None, marca="", aliases=None, fallback_fn=None):
     if not etiqueta or etiqueta.strip().lower() in ("sin tema", "varios", "n/a"):
@@ -1259,7 +1260,7 @@ class ClasificadorSubtema:
                 if 2 <= word_freq[w] <= max_freq: rare_index[w].append(i)
         for idxs in rare_index.values():
             for a in range(len(idxs)):
-                for b in range(a + 1, len(idxs)):
+                for b in range(i + 1, len(idxs)):
                     ia, ib = idxs[a], idxs[b]
                     if dsu.find(ia) == dsu.find(ib): continue
                     ea, eb = ae[ia], ae[ib]
@@ -2369,9 +2370,13 @@ def generate_output_excel(rows, km):
             
             out, links = [], {}
             for ci, h in enumerate(cols_order, start=1):
-                val = row_copy.get(h)
+                # ── LIMPIEZA DE TONO Y TEMA EN HOJA OTROS ──────────────────────────────
+                if ws.title == "Otros" and h in ("Tono", "Tema"):
+                    val = None
+                else:
+                    val = row_copy.get(h)
+                    
                 cv = None
-                
                 if h == 'Fecha' and pd.notna(val):
                     if isinstance(val, pd.Timestamp):
                         cv = val.to_pydatetime()
