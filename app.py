@@ -19,7 +19,6 @@ import json
 import asyncio
 import hashlib
 from typing import List, Dict, Tuple, Optional, Any
-import joblib
 import gc
 import requests
 import os
@@ -28,6 +27,12 @@ import xml.etree.ElementTree as ET
 import html
 from pathlib import Path
 from thefuzz import fuzz
+
+# Importación protegida de joblib para evitar caídas al iniciar
+try:
+    import joblib
+except ImportError:
+    joblib = None
 
 # ======================================
 # Configuración general
@@ -1266,6 +1271,9 @@ class ClasificadorTono:
         return final
 
 def analizar_tono_con_pkl(textos, pkl_file):
+    if joblib is None:
+        st.error("La librería 'joblib' no está instalada en tu entorno de Streamlit. Agrégala a tu requirements.txt para habilitar el uso de modelos PKL locales.")
+        return None
     try:
         pipeline = joblib.load(pkl_file)
         TM = {1: "Positivo", "1": "Positivo", 0: "Neutro", "0": "Neutro", -1: "Negativo", "-1": "Negativo"}
@@ -1275,6 +1283,9 @@ def analizar_tono_con_pkl(textos, pkl_file):
         return None
 
 def analizar_temas_con_pkl(textos, pkl_file):
+    if joblib is None:
+        st.error("La librería 'joblib' no está instalada en tu entorno de Streamlit. Agrégala a tu requirements.txt para habilitar el uso de modelos PKL locales.")
+        return None
     try:
         pipeline = joblib.load(pkl_file)
         predicciones = pipeline.predict(textos)
