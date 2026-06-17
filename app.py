@@ -34,7 +34,7 @@ from pathlib import Path
 # Configuración general
 # ======================================
 st.set_page_config(
-    page_title="Análisis de Noticias · API - Realizado por Johnathan Cortés",
+    page_title="Análisis de Noticias · API Universidad Nacional - Realizado por Johnathan Cortés",
     page_icon="◈",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -550,7 +550,7 @@ def check_password():
     st.markdown("""
     <div class="auth-wrap">
         <div class="auth-icon">◈</div>
-        <div class="auth-title">Sistema de Análisis universidad Nacional</div>
+        <div class="auth-title">Sistema de Análisis</div>
         <div class="auth-sub">Ingresa tus credenciales para continuar</div>
     </div>""", unsafe_allow_html=True)
     _, col, _ = st.columns([1, 2, 1])
@@ -2401,7 +2401,7 @@ def main():
     <div class="app-header">
         <div class="app-header-icon">◈</div>
         <div class="app-header-text">
-            <div class="app-header-title">Análisis de Noticias - API</div>
+            <div class="app-header-title">Análisis de Noticias - Universidad Nacional - API</div>
             <div class="app-header-version">v18.1 · Realizado por Johnathan Cortés</div>
         </div>
         <div class="app-header-badge">IA</div>
