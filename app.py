@@ -550,7 +550,7 @@ def check_password():
     st.markdown("""
     <div class="auth-wrap">
         <div class="auth-icon">◈</div>
-        <div class="auth-title">Sistema de Análisis</div>
+        <div class="auth-title">Sistema de Análisis Universidad Nacional</div>
         <div class="auth-sub">Ingresa tus credenciales para continuar</div>
     </div>""", unsafe_allow_html=True)
     _, col, _ = st.columns([1, 2, 1])
