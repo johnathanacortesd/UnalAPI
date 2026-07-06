@@ -107,7 +107,7 @@ TAXONOMIA_TEMAS = {
         "universitaria, conflictos internos y situaciones de crisis.",
     "Cultura y patrimonio":
         "Museos, archivos, colecciones, expresiones artísticas, patrimonio cultural "
-        "de la universidad, festivales y actividades culturales.",
+        "de la universidad,  festivales y actividades culturales.",
     "Salud pública y ciencias de la salud":
         "Facultades de medicina, enfermería, odontología, investigación médica, "
         "hospitales universitarios, epidemiología y respuesta a emergencias sanitarias.",
@@ -1254,7 +1254,7 @@ def generate_output_excel(rows, km):
     rows_otros = []
     for row in rows:
         mencion = str(row.get("Menciones - Empresa", "")).strip()
-        if mencion == "Universidad Nacional de Colombia - General":
+        if mencion in ("Universidad Nacional de Colombia - General", "Universidad Nacional de Colombia"):
             rows_unal.append(row)
         else:
             rows_otros.append(row)
@@ -1458,8 +1458,11 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode):
         df[km["tonoiai"]] = "Neutro"
         df[km["tema"]] = "Vida universitaria"
 
-        # Solo UNAL
-        is_target = df[km["menciones"]].astype(str).str.strip() == "Universidad Nacional de Colombia - General"
+        # Solo UNAL (acepta ambas variaciones de la marca)
+        is_target = df[km["menciones"]].astype(str).str.strip().isin([
+            "Universidad Nacional de Colombia - General",
+            "Universidad Nacional de Colombia"
+        ])
         df_target = df[is_target].copy()
 
         if not df_target.empty:
@@ -1554,7 +1557,10 @@ async def run_quick_async(df, tc, sc, bn, al):
     df['Tema IA'] = 'Vida universitaria'
 
     if menciones_col is not None:
-        is_target = df[menciones_col].astype(str).str.strip() == "Universidad Nacional de Colombia - General"
+        is_target = df[menciones_col].astype(str).str.strip().isin([
+            "Universidad Nacional de Colombia - General",
+            "Universidad Nacional de Colombia"
+        ])
     else:
         is_target = pd.Series([True] * len(df))
 
@@ -1750,7 +1756,7 @@ def main():
                 st.markdown(
                     '<div class="taxonomy-info">'
                     '<b>Taxonomía fija</b> · 18 categorías generales + 5 específicas = <b>23 temas</b> · '
-                    'Análisis de Tono e IA solo para <b>Universidad Nacional de Colombia - General</b> · '
+                    'Análisis de Tono e IA solo para <b>Universidad Nacional de Colombia</b> (General o estándar) · '
                     'El resumen completo (Resumen - Aclaracion) es la fuente principal de clasificación'
                     '</div>',
                     unsafe_allow_html=True
