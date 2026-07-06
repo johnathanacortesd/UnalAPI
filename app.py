@@ -933,8 +933,7 @@ async def _clasificar_tema_llm_async(titulo: str, resumen: str, sem: asyncio.Sem
             "  5. Si trata de protestas, paros o disturbios en campus → 'Conflicto, orden público y seguridad'.\n"
             "  6. Si trata de reforma a la Ley 30 o al sistema educativo → 'Reforma a la educación superior'.\n"
             "  7. Si un académico da declaraciones sobre un tema nacional → 'Opinión y análisis experto'.\n"
-            "  8. NUNCA inventes una categoría nueva. Debes elegir una de las 23 listadas.\n"
-            "  9. Devuelve SOLO el nombre exacto de la categoría, sin número ni descripción.\n\n"
+            "  8. NUNCA inventes una categoría nueva. Devuelve solo un elemento de la lista oficial de nombres.\n\n"
             f"Lista de nombres válidos: {_NOMBRES_TEMAS_JSON}\n\n"
             'Responde ÚNICAMENTE con JSON: {"tema": "<nombre exacto de la categoría>"}'
         )
@@ -1401,6 +1400,7 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode):
                 row_dict = row_series.to_dict()
                 row_dict['Menciones - Empresa'] = ""
                 row_dict['original_index'] = idx
+                row_dict['expanded_index'] = len(rows_expanded)
                 row_dict['is_duplicate'] = False
                 rows_expanded.append(row_dict)
             else:
@@ -1408,6 +1408,7 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode):
                     row_dict = row_series.to_dict()
                     row_dict['Menciones - Empresa'] = m
                     row_dict['original_index'] = idx
+                    row_dict['expanded_index'] = len(rows_expanded)
                     row_dict['is_duplicate'] = False
                     rows_expanded.append(row_dict)
 
@@ -1517,10 +1518,10 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode):
             df.loc[is_target, km["tonoiai"]] = df_target[km["tonoiai"]].values
             df.loc[is_target, km["tema"]]    = df_target[km["tema"]].values
 
-        rm2 = df.set_index("original_index").to_dict("index")
+        rm2 = df.set_index("expanded_index").to_dict("index")
         for idx, row in enumerate(rows):
             if not row.get("is_duplicate"):
-                row.update(rm2.get(row["original_index"], {}))
+                row.update(rm2.get(row["expanded_index"], {}))
 
     gc.collect()
     ci = (st.session_state['tokens_input']     / 1e6) * PRICE_INPUT_1M
