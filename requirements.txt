@@ -1,7 +1,7 @@
 streamlit
 pandas
 openpyxl
-openai==0.28.0
+openai>=1.60.0
 tqdm
 scikit-learn
 unidecode
