@@ -10,25 +10,25 @@ from difflib import SequenceMatcher
 from copy import deepcopy
 import datetime
 import io
-import openai
 import re
 import time
 from unidecode import unidecode
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.cluster import AgglomerativeClustering
 import json
 import asyncio
 import hashlib
 from typing import List, Dict, Tuple, Optional, Any
 import joblib
 import gc
-import requests
 import os
-import zipfile
-import xml.etree.ElementTree as ET
 import html
 from pathlib import Path
+
+from clasificador import (
+    ClasificadorIA, ErrorClasificador, NOMBRES_TEMAS, TAXONOMIA_TEMAS,
+    SIN_CLASIFICAR, costo_usd,
+)
+from textos import normalize_title_for_comparison
 
 # ======================================
 # Configuración general
@@ -40,100 +40,15 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-OPENAI_MODEL_EMBEDDING     = "text-embedding-3-small"
-OPENAI_MODEL_CLASIFICACION = "gpt-4.1-nano-2025-04-14"
-
-CONCURRENT_REQUESTS          = 50
-SIMILARITY_THRESHOLD_TONO    = 0.82
+# Modelo de clasificación: gpt-6-luna (respaldo automático gpt-5.6-luna).
+# Solo se usan modelos Luna. Desde los secrets se puede fijar otro Luna con OPENAI_MODEL = "gpt-5.6-luna"
+# (gpt-4.1-nano fue retirado por OpenAI el 2026-10-23).
 SIMILARITY_THRESHOLD_TITULOS = 0.93
-
-PRICE_INPUT_1M     = 0.10
-PRICE_OUTPUT_1M    = 0.40
-PRICE_EMBEDDING_1M = 0.02
+CONCURRENT_REQUESTS          = 30
 
 if 'tokens_input' not in st.session_state: st.session_state['tokens_input'] = 0
 if 'tokens_output' not in st.session_state: st.session_state['tokens_output'] = 0
-if 'tokens_embedding' not in st.session_state: st.session_state['tokens_embedding'] = 0
 
-# ======================================
-# Taxonomía fija de temas (18 generales + 5 específicos)
-# ======================================
-TAXONOMIA_TEMAS = {
-    # ── 18 categorías generales ──────────────────────────────────────────────
-    "Vida universitaria":
-        "Actividades del campus, bienestar estudiantil, cultura, deportes, eventos "
-        "institucionales, convivencia y cotidianidad de la comunidad universitaria.",
-    "Formación académica":
-        "Programas de pregrado, posgrado, educación continua, oferta curricular, "
-        "procesos pedagógicos y calidad de la enseñanza.",
-    "Investigación y ciencia":
-        "Proyectos de investigación, publicaciones científicas, grupos de investigación, "
-        "hallazgos, avances tecnológicos y producción de conocimiento.",
-    "Innovación y transferencia tecnológica":
-        "Spin-offs, patentes, emprendimiento universitario, alianzas industria-academia, "
-        "transferencia de resultados de investigación al sector productivo.",
-    "Extensión y proyección social":
-        "Programas de extensión, trabajo comunitario, voluntariado, vinculación con "
-        "territorios, impacto social de la universidad en poblaciones vulnerables.",
-    "Internacionalización":
-        "Convenios internacionales, movilidad académica, intercambios estudiantiles y "
-        "docentes, redes globales, doble titulación y cooperación exterior.",
-    "Política y gestión institucional":
-        "Gobierno universitario, elecciones de directivos, reformas estatutarias, "
-        "decisiones del Consejo Superior, planes de desarrollo institucional.",
-    "Financiamiento y presupuesto":
-        "Presupuesto universitario, transferencias del Estado, déficit fiscal, "
-        "inversión en infraestructura, autonomía financiera y rendición de cuentas.",
-    "Infraestructura y campus":
-        "Construcción, renovación y mantenimiento de edificios, laboratorios, "
-        "bibliotecas, sedes regionales y espacios físicos universitarios.",
-    "Tecnología e innovación digital":
-        "Transformación digital, plataformas virtuales, educación en línea, "
-        "inteligencia artificial, ciberseguridad y herramientas tecnológicas institucionales.",
-    "Bienestar universitario":
-        "Salud mental, apoyo psicosocial, alimentación, becas, subsidios, "
-        "permanencia estudiantil y programas de apoyo socioeconómico.",
-    "Diversidad e inclusión":
-        "Equidad de género, inclusión de personas con discapacidad, enfoque diferencial, "
-        "comunidades étnicas, LGBTQ+ y políticas antidiscriminación.",
-    "Medio ambiente y sostenibilidad":
-        "Gestión ambiental del campus, investigación en ecología, cambio climático, "
-        "biodiversidad, energías limpias y compromisos de sostenibilidad.",
-    "Relaciones con el Estado y política pública":
-        "Interacción con el gobierno nacional y territorial, asesoría a políticas "
-        "públicas, relación con el Congreso, Ministerio de Educación y entidades estatales.",
-    "Conflicto, orden público y seguridad":
-        "Protestas, cierres de campus, vandalismo, orden público, seguridad "
-        "universitaria, conflictos internos y situaciones de crisis.",
-    "Cultura y patrimonio":
-        "Museos, archivos, colecciones, expresiones artísticas, patrimonio cultural "
-        "de la universidad,  festivales y actividades culturales.",
-    "Salud pública y ciencias de la salud":
-        "Facultades de medicina, enfermería, odontología, investigación médica, "
-        "hospitales universitarios, epidemiología y respuesta a emergencias sanitarias.",
-    "Opinión y análisis experto":
-        "Declaraciones de académicos, columnas de opinión, análisis institucional, "
-        "posicionamiento público de la universidad ante coyunturas nacionales.",
-
-    # ── 5 categorías específicas ─────────────────────────────────────────────
-    "Reforma a la educación superior":
-        "Debates, proyectos de ley y políticas sobre el sistema de educación superior "
-        "en Colombia, reforma a la Ley 30, financiación del sistema y autonomía.",
-    "Acreditación y calidad educativa":
-        "Procesos de acreditación institucional y de programas, rankings universitarios, "
-        "evaluación de calidad, pares académicos y certificaciones.",
-    "Propiedad intelectual y derechos de autor":
-        "Conflictos sobre patentes, derechos de publicación, acceso abierto, "
-        "uso de obras académicas y política de propiedad intelectual universitaria.",
-    "Relación universidad-empresa":
-        "Contratos con el sector privado, centros de investigación financiados por "
-        "empresas, conflictos de interés, consultoría académica y spin-offs empresariales.",
-    "Crisis o emergencia institucional":
-        "Situaciones de crisis graves: paros prolongados, intervenciones externas, "
-        "escándalos administrativos, crisis de gobernanza o colapso de servicios.",
-}
-
-NOMBRES_TEMAS = list(TAXONOMIA_TEMAS.keys())
 
 STOPWORDS_ES = set("""
 a ante bajo cabe con contra de desde durante en entre hacia hasta mediante
@@ -404,57 +319,6 @@ hr{border-color:var(--s3)!important;margin:0.5rem 0!important}
 
 
 # ======================================
-# Caché Global de Embeddings
-# ======================================
-class EmbeddingCache:
-    def __init__(self):
-        self._cache: Dict[str, List[float]] = {}
-        self._hits = 0
-        self._misses = 0
-
-    def _key(self, text):
-        return hashlib.md5(text[:2000].encode('utf-8', errors='ignore')).hexdigest()
-
-    def get(self, text):
-        k = self._key(text)
-        if k in self._cache:
-            self._hits += 1
-            return self._cache[k]
-        self._misses += 1
-        return None
-
-    def put(self, text, emb):
-        self._cache[self._key(text)] = emb
-
-    def get_many(self, textos):
-        results = [None] * len(textos)
-        missing = []
-        for i, t in enumerate(textos):
-            c = self.get(t)
-            if c is not None:
-                results[i] = c
-            else:
-                missing.append(i)
-        return results, missing
-
-    def stats(self):
-        total = self._hits + self._misses
-        rate = (self._hits / total * 100) if total > 0 else 0
-        return f"Cache: {self._hits} hits, {self._misses} misses ({rate:.0f}%)"
-
-    def clear(self):
-        self._cache.clear()
-        self._hits = 0
-        self._misses = 0
-
-if '_emb_cache' not in st.session_state:
-    st.session_state['_emb_cache'] = EmbeddingCache()
-
-def get_embedding_cache():
-    return st.session_state['_emb_cache']
-
-
-# ======================================
 # Utilidades de Configuración Automática
 # ======================================
 
@@ -505,32 +369,15 @@ def check_password():
         with st.form("pw"):
             pw = st.text_input("Contraseña", type="password", placeholder="Ingresa tu contraseña")
             if st.form_submit_button("Ingresar", use_container_width=True, type="primary"):
-                if pw == st.secrets.get("APP_PASSWORD", "INVALID"):
+                clave = st.secrets.get("APP_PASSWORD", None)
+                if clave and pw == clave:
                     st.session_state["password_correct"] = True
                     st.rerun()
+                elif not clave:
+                    st.error("APP_PASSWORD no está configurada en los secrets.")
                 else:
                     st.error("Contraseña incorrecta")
     return False
-
-def call_with_retries(fn, *a, **kw):
-    d = 1
-    for att in range(3):
-        try:
-            return fn(*a, **kw)
-        except Exception as e:
-            if att == 2: raise e
-            time.sleep(d)
-            d *= 2
-
-async def acall_with_retries(fn, *a, **kw):
-    d = 1
-    for att in range(3):
-        try:
-            return await fn(*a, **kw)
-        except Exception as e:
-            if att == 2: raise e
-            await asyncio.sleep(d)
-            d *= 2
 
 def norm_key(text):
     if text is None: return ""
@@ -600,11 +447,6 @@ def clean_cuerpo(text):
     text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
     text = re.sub(r'<[^>]+>', '', text)
     return text.strip()
-
-def normalize_title_for_comparison(title):
-    if not isinstance(title, str): return ""
-    tmp = re.split(r"\s*[:|-]\s*", title, 1)
-    return re.sub(r"\W+", " ", tmp[0]).lower().strip()
 
 def clean_title_for_output(title):
     return re.sub(r"\s*\|\s*[\w\s]+$", "", str(title)).strip()
@@ -687,206 +529,6 @@ def texto_para_embedding(titulo, resumen, max_len=2200):
     return f"Título: {t}\nResumen: {r}\nContenido: {r}"
 
 
-# ======================================
-# Embeddings batch
-# ======================================
-def get_embeddings_batch(textos, batch_size=100):
-    if not textos: return []
-    cache = get_embedding_cache()
-    resultados, missing = cache.get_many(textos)
-    if not missing: return resultados
-    mt = [textos[i][:2000] if textos[i] else "" for i in missing]
-    for i in range(0, len(mt), batch_size):
-        batch = mt[i:i + batch_size]
-        bidx = missing[i:i + batch_size]
-        try:
-            resp = call_with_retries(openai.Embedding.create, input=batch, model=OPENAI_MODEL_EMBEDDING)
-            u = resp.get('usage', {}) if isinstance(resp, dict) else getattr(resp, 'usage', {})
-            if u:
-                st.session_state['tokens_embedding'] += (u.get('total_tokens') if isinstance(u, dict) else getattr(u, 'total_tokens', 0)) or 0
-            for j, d in enumerate(resp["data"]):
-                oi = bidx[j]
-                emb = d["embedding"]
-                resultados[oi] = emb
-                cache.put(textos[oi], emb)
-        except:
-            for j, t in enumerate(batch):
-                oi = bidx[j]
-                try:
-                    r = openai.Embedding.create(input=[t], model=OPENAI_MODEL_EMBEDDING)
-                    emb = r["data"][0]["embedding"]
-                    resultados[oi] = emb
-                    cache.put(textos[oi], emb)
-                except:
-                    pass
-    return resultados
-
-
-def agrupar_textos_similares(textos, umbral):
-    if not textos: return {}
-    embs = get_embeddings_batch(textos)
-    valid = [(i, e) for i, e in enumerate(embs) if e is not None]
-    if len(valid) < 2: return {}
-    idxs, M = zip(*valid)
-    labels = AgglomerativeClustering(
-        n_clusters=None, distance_threshold=1 - umbral, metric="cosine", linkage="average"
-    ).fit(np.array(M)).labels_
-    g = defaultdict(list)
-    for k, lbl in enumerate(labels): g[lbl].append(idxs[k])
-    return dict(enumerate(g.values()))
-
-def agrupar_por_titulo_similar(titulos):
-    gid, grupos, used = 0, {}, set()
-    norm = [normalize_title_for_comparison(t) for t in titulos]
-    for i in range(len(norm)):
-        if i in used or not norm[i]: continue
-        grp = [i]
-        used.add(i)
-        for j in range(i + 1, len(norm)):
-            if j in used or not norm[j]: continue
-            if SequenceMatcher(None, norm[i], norm[j]).ratio() >= SIMILARITY_THRESHOLD_TITULOS:
-                grp.append(j)
-                used.add(j)
-        if len(grp) >= 2:
-            grupos[gid] = grp
-            gid += 1
-    return grupos
-
-def seleccionar_representante(indices, textos):
-    embs = get_embeddings_batch([textos[i] for i in indices])
-    validos = [(indices[k], e) for k, e in enumerate(embs) if e is not None]
-    if not validos: return indices[0], textos[indices[0]]
-    idxs, M = zip(*validos)
-    centro = np.mean(M, axis=0, keepdims=True)
-    best = int(np.argmax(cosine_similarity(np.array(M), centro)))
-    return idxs[best], textos[idxs[best]]
-
-
-class DSU:
-    def __init__(self, n):
-        self.p = list(range(n))
-        self.rank = [0] * n
-
-    def find(self, i):
-        path = []
-        while self.p[i] != i:
-            path.append(i)
-            i = self.p[i]
-        for node in path: self.p[node] = i
-        return i
-
-    def union(self, i, j):
-        ri, rj = self.find(i), self.find(j)
-        if ri == rj: return
-        if self.rank[ri] < self.rank[rj]: ri, rj = rj, ri
-        self.p[rj] = ri
-        if self.rank[ri] == self.rank[rj]: self.rank[ri] += 1
-
-    def grupos(self, n):
-        c = defaultdict(list)
-        for i in range(n): c[self.find(i)].append(i)
-        return dict(c)
-
-
-# ======================================
-# TONO (Sistema Reputacional por IA)
-# ======================================
-class ClasificadorTono:
-    def __init__(self, marca, aliases):
-        self.marca = marca.strip()
-        self.aliases = [a.strip() for a in (aliases or []) if a.strip()]
-        self._all_names = [self.marca.lower()] + [a.lower() for a in self.aliases]
-
-    def _menciona_marca(self, texto):
-        t = unidecode(texto.lower())
-        return any(m in t for m in self._all_names)
-
-    async def _clasificar_llm(self, titulo, resumen, sem):
-        async with sem:
-            texto_completo = f"Título: {titulo}\n\nResumen completo: {resumen}"
-            if not self._menciona_marca(texto_completo):
-                return {"tono": "Neutro"}
-
-            aliases_str = f" (también conocida como: {', '.join(self.aliases)})" if self.aliases else ""
-            prompt = (
-                f"Eres un experto analista en Relaciones Públicas y Gestión de Reputación. "
-                f"Tu tarea es evaluar el impacto reputacional DIRECTO de la siguiente noticia sobre la marca '{self.marca}'{aliases_str}.\n\n"
-                f"TEXTO A EVALUAR:\n{texto_completo[:2500]}\n\n"
-                f"REGLAS DE CLASIFICACIÓN ESTRICTAS:\n"
-                f"🔴 NEGATIVO: La marca '{self.marca}' es CULPABLE o VÍCTIMA DIRECTA de algo malo. Ejemplos: "
-                f"demandas, multas, fraudes corporativos, fallas operativas graves, quejas de usuarios, o investigaciones en su contra.\n"
-                f"🟢 POSITIVO: La marca '{self.marca}' LOGRA algo bueno. Ejemplos: lanza un servicio, gana un premio, "
-                f"reporta ganancias, lidera una iniciativa positiva, hace donaciones o expansiones.\n"
-                f"⚪ NEUTRO: La marca se menciona SIN impacto a su imagen. Ejemplos:\n"
-                f"  - La noticia habla de una crisis del sector/país, pero la marca solo es mencionada informando o adaptándose.\n"
-                f"  - Se menciona a la marca como patrocinador menor o en una lista de empresas.\n"
-                f"  - Emite un comunicado regular sin connotaciones de crisis ni éxito rotundo.\n\n"
-                f"⚠️ ATENCIÓN: Ignora si la noticia es trágica a nivel general (ej. una pandemia o accidente de terceros). "
-                f"Evalúa ÚNICAMENTE si la reputación corporativa de '{self.marca}' mejora (Positivo), empeora (Negativo) o se mantiene (Neutro).\n\n"
-                f'Responde ÚNICAMENTE con JSON en este formato: {{"tono": "Positivo|Negativo|Neutro"}}'
-            )
-
-            try:
-                resp = await acall_with_retries(
-                    openai.ChatCompletion.acreate,
-                    model=OPENAI_MODEL_CLASIFICACION,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=40,
-                    temperature=0.0,
-                    response_format={"type": "json_object"}
-                )
-                u = resp.get('usage', {}) if isinstance(resp, dict) else getattr(resp, 'usage', {})
-                if u:
-                    st.session_state['tokens_input'] += (u.get('prompt_tokens') if isinstance(u, dict) else getattr(u, 'prompt_tokens', 0)) or 0
-                    st.session_state['tokens_output'] += (u.get('completion_tokens') if isinstance(u, dict) else getattr(u, 'completion_tokens', 0)) or 0
-                resultado = json.loads(resp.choices[0].message.content)
-                tono = str(resultado.get("tono", "Neutro")).strip().title()
-                return {"tono": tono if tono in ("Positivo", "Negativo", "Neutro") else "Neutro"}
-            except Exception:
-                return {"tono": "Neutro"}
-
-    async def procesar_lote_async(self, pbar, resumenes, titulos):
-        """
-        Procesa el lote usando título + resumen completo para mayor precisión de tono.
-        """
-        n = len(titulos)
-        titulos_list  = titulos.tolist() if hasattr(titulos, 'tolist') else list(titulos)
-        resumenes_list = resumenes.tolist() if hasattr(resumenes, 'tolist') else list(resumenes)
-
-        pbar.progress(0.05, "Agrupando noticias para análisis de tono...")
-
-        # Agrupamos por similitud semántica para reutilizar clasificaciones
-        txts_emb = [texto_para_embedding(titulos_list[i], resumenes_list[i]) for i in range(n)]
-        dsu = DSU(n)
-        for g in [agrupar_textos_similares(txts_emb, SIMILARITY_THRESHOLD_TONO),
-                  agrupar_por_titulo_similar(titulos_list)]:
-            for _, idxs in g.items():
-                for j in idxs[1:]: dsu.union(idxs[0], j)
-
-        grupos = dsu.grupos(n)
-        # Representante: (título_repr, resumen_repr)
-        reps = {}
-        for cid, idxs in grupos.items():
-            rep_idx, _ = seleccionar_representante(idxs, txts_emb)
-            reps[cid] = (titulos_list[rep_idx], resumenes_list[rep_idx])
-
-        sem = asyncio.Semaphore(CONCURRENT_REQUESTS)
-        cids = list(reps.keys())
-        tasks = [self._clasificar_llm(reps[c][0], reps[c][1], sem) for c in cids]
-        rl = []
-        for i, f in enumerate(asyncio.as_completed(tasks)):
-            rl.append(await f)
-            pbar.progress(0.1 + 0.85 * (i + 1) / len(tasks), f"Evaluando Reputación {i + 1}/{len(tasks)}")
-
-        rpg = {cids[i]: r for i, r in enumerate(rl)}
-        final = [None] * n
-        for cid, idxs in grupos.items():
-            r = rpg.get(cid, {"tono": "Neutro"})
-            for i in idxs: final[i] = r
-
-        pbar.progress(1.0, "Análisis de Tono completado")
-        return final
-
 def analizar_tono_con_pkl(textos, pkl_file):
     try:
         pipeline = joblib.load(pkl_file)
@@ -897,74 +539,11 @@ def analizar_tono_con_pkl(textos, pkl_file):
         return None
 
 
-# ======================================
-# CLASIFICADOR DE TEMA con taxonomía fija
-# ======================================
-
-def _construir_prompt_taxonomia() -> str:
-    """Construye la descripción de la taxonomía para incluir en el prompt."""
-    lineas = []
-    for i, (nombre, desc) in enumerate(TAXONOMIA_TEMAS.items(), 1):
-        lineas.append(f'  {i:2d}. "{nombre}": {desc}')
-    return "\n".join(lineas)
-
-_PROMPT_TAXONOMIA = _construir_prompt_taxonomia()
-_NOMBRES_TEMAS_JSON = json.dumps(NOMBRES_TEMAS, ensure_ascii=False)
-
-async def _clasificar_tema_llm_async(titulo: str, resumen: str, sem: asyncio.Semaphore) -> str:
-    """
-    Clasifica una noticia en una de las 23 categorías fijas usando título + resumen completo.
-    El resumen recibe mayor peso en el prompt para mayor precisión.
-    """
-    async with sem:
-        # Usamos el resumen largo para dar más contexto al modelo
-        prompt = (
-            "Eres un analista experto en comunicaciones de la Universidad Nacional de Colombia. "
-            "Tu tarea es clasificar la siguiente noticia en EXACTAMENTE UNA de las 23 categorías predefinidas.\n\n"
-            f"TÍTULO DE LA NOTICIA:\n{titulo[:300]}\n\n"
-            f"RESUMEN COMPLETO (léelo con atención, contiene el tema principal):\n{resumen[:2000]}\n\n"
-            "CATEGORÍAS DISPONIBLES (número · nombre · descripción):\n"
-            f"{_PROMPT_TAXONOMIA}\n\n"
-            "INSTRUCCIONES CRÍTICAS:\n"
-            "  1. Lee el RESUMEN COMPLETO, no solo el título. El resumen define el tema real.\n"
-            "  2. Elige la categoría cuya DESCRIPCIÓN mejor encaje con el contenido del resumen.\n"
-            "  3. Si el resumen trata de investigación científica → 'Investigación y ciencia'.\n"
-            "  4. Si trata de presupuesto o déficit de la universidad → 'Financiamiento y presupuesto'.\n"
-            "  5. Si trata de protestas, paros o disturbios en campus → 'Conflicto, orden público y seguridad'.\n"
-            "  6. Si trata de reforma a la Ley 30 o al sistema educativo → 'Reforma a la educación superior'.\n"
-            "  7. Si un académico da declaraciones sobre un tema nacional → 'Opinión y análisis experto'.\n"
-            "  8. NUNCA inventes una categoría nueva. Devuelve solo un elemento de la lista oficial de nombres.\n\n"
-            f"Lista de nombres válidos: {_NOMBRES_TEMAS_JSON}\n\n"
-            'Responde ÚNICAMENTE con JSON: {"tema": "<nombre exacto de la categoría>"}'
-        )
-        try:
-            resp = await acall_with_retries(
-                openai.ChatCompletion.acreate,
-                model=OPENAI_MODEL_CLASIFICACION,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=60,
-                temperature=0.0,
-                response_format={"type": "json_object"}
-            )
-            u = resp.get('usage', {}) if isinstance(resp, dict) else getattr(resp, 'usage', {})
-            if u:
-                st.session_state['tokens_input'] += (u.get('prompt_tokens') if isinstance(u, dict) else getattr(u, 'prompt_tokens', 0)) or 0
-                st.session_state['tokens_output'] += (u.get('completion_tokens') if isinstance(u, dict) else getattr(u, 'completion_tokens', 0)) or 0
-            raw = json.loads(resp.choices[0].message.content).get("tema", "").strip()
-            # Validar que esté en la taxonomía (tolerancia a mayúsculas)
-            for nombre in NOMBRES_TEMAS:
-                if unidecode(raw.lower()) == unidecode(nombre.lower()):
-                    return nombre
-            # Fallback semántico: buscar el más similar por texto
-            return _fallback_tema_semantico(raw)
-        except Exception:
-            return "Vida universitaria"
-
 def _fallback_tema_semantico(raw: str) -> str:
-    """Si el modelo devuelve algo fuera de la taxonomía, busca el más cercano por SequenceMatcher."""
+    """Para PKL: si devuelve algo fuera de la taxonomía, busca el más cercano por SequenceMatcher."""
     if not raw:
-        return "Vida universitaria"
-    best, best_score = "Vida universitaria", 0.0
+        return SIN_CLASIFICAR
+    best, best_score = SIN_CLASIFICAR, 0.0
     r = unidecode(raw.lower())
     for nombre in NOMBRES_TEMAS:
         score = SequenceMatcher(None, r, unidecode(nombre.lower())).ratio()
@@ -972,54 +551,6 @@ def _fallback_tema_semantico(raw: str) -> str:
             best_score = score
             best = nombre
     return best
-
-async def clasificar_temas_async(titulos: list, resumenes: list, pbar) -> list:
-    """
-    Clasifica todas las noticias en paralelo usando la taxonomía fija de 23 categorías.
-    Usa deduplicación semántica para ahorrar llamadas a la API.
-    """
-    n = len(titulos)
-    pbar.progress(0.05, "Preparando clasificación de temas...")
-
-    # Construir textos enriquecidos para agrupar semánticamente
-    txts_emb = [texto_para_embedding(titulos[i], resumenes[i]) for i in range(n)]
-
-    # Agrupar noticias similares para no clasificar duplicados
-    pbar.progress(0.10, "Agrupando por similitud semántica...")
-    dsu = DSU(n)
-    for g in [agrupar_textos_similares(txts_emb, 0.88),
-              agrupar_por_titulo_similar(titulos)]:
-        for _, idxs in g.items():
-            for j in idxs[1:]: dsu.union(idxs[0], j)
-
-    grupos = dsu.grupos(n)
-    # Para cada grupo, tomar el representante
-    reps = {}
-    for cid, idxs in grupos.items():
-        rep_idx, _ = seleccionar_representante(idxs, txts_emb)
-        reps[cid] = (titulos[rep_idx], resumenes[rep_idx])
-
-    sem = asyncio.Semaphore(CONCURRENT_REQUESTS)
-    cids = list(reps.keys())
-    tasks = [_clasificar_tema_llm_async(reps[c][0], reps[c][1], sem) for c in cids]
-
-    resultados_grupos = {}
-    for i, f in enumerate(asyncio.as_completed(tasks)):
-        tema = await f
-        resultados_grupos[cids[i]] = tema
-        pbar.progress(0.15 + 0.80 * (i + 1) / len(tasks), f"Clasificando tema {i + 1}/{len(tasks)}")
-
-    # Propagar el tema del representante a todos los miembros del grupo
-    temas_finales = ["Vida universitaria"] * n
-    for cid, idxs in grupos.items():
-        tema = resultados_grupos.get(cid, "Vida universitaria")
-        for i in idxs:
-            temas_finales[i] = tema
-
-    pbar.progress(1.0, f"Temas asignados: {len(set(temas_finales))} categorías distintas")
-    st.info(f"Temas: **{len(set(temas_finales))}** categorías distintas utilizadas de {len(NOMBRES_TEMAS)} disponibles")
-    return temas_finales
-
 
 def clasificar_temas_con_pkl(textos, pkl_file) -> Optional[list]:
     try:
@@ -1035,6 +566,56 @@ def clasificar_temas_con_pkl(textos, pkl_file) -> Optional[list]:
     except Exception as e:
         st.error(f"Error pkl temas: {e}")
         return None
+
+
+# ======================================
+# Ejecución de la IA (tono + tema) con GPT Luna
+# ======================================
+def crear_clasificador(marca, aliases):
+    try:
+        api_key = st.secrets["OPENAI_API_KEY"]
+    except Exception:
+        st.error("OPENAI_API_KEY no encontrada en los secrets.")
+        st.stop()
+    modelo = None
+    try:
+        modelo = st.secrets.get("OPENAI_MODEL", None)
+    except Exception:
+        pass
+    return ClasificadorIA(api_key, marca, aliases, modelo=modelo, concurrencia=CONCURRENT_REQUESTS)
+
+
+def _progreso(pb, etiqueta):
+    def _cb(hechos, total):
+        pb.progress(min(hechos / max(total, 1), 1.0), f"{etiqueta} {hechos}/{total}")
+    return _cb
+
+
+def reportar_errores_ia(clf):
+    """Muestra al usuario las noticias que NO se pudieron clasificar (nunca se ocultan)."""
+    if clf.errores:
+        st.warning(
+            f"⚠️ {len(clf.errores)} clasificación(es) fallaron y quedaron como «{SIN_CLASIFICAR}». "
+            "Revisa esas filas o vuelve a ejecutar."
+        )
+        with st.expander("Ver detalle de errores"):
+            st.code("\n".join(clf.errores[:50]))
+
+
+def costo_total_ia(clf):
+    st.session_state['tokens_input']  += clf.tokens_in
+    st.session_state['tokens_output'] += clf.tokens_out
+    return clf.costo
+
+
+async def correr_ia(clf, coro):
+    """Ejecuta una llamada de IA; ante un error fatal (modelo/credenciales/red) detiene la app con un mensaje claro."""
+    try:
+        return await coro
+    except ErrorClasificador as e:
+        await clf.cerrar()
+        st.error(f"❌ No se pudo usar la API de OpenAI. No se generó ninguna clasificación.\n\n{e}")
+        st.stop()
 
 
 # ======================================
@@ -1179,6 +760,9 @@ def read_and_normalize_dossier(sheet, region_map, internet_map):
     dim_col = 'Dimensioncm2' if 'Dimensioncm2' in df.columns else 'Dimensión'
     df['Dimensión'] = df.get(dim_col, pd.Series(dtype=str))
     df['Duración - Nro. Caracteres'] = df.get('Duración - Nro. Caracteres', pd.Series(dtype=str))
+    # pandas >= 3 usa dtype 'str' y no admite asignar enteros: se fuerza object
+    df['Dimensión'] = df['Dimensión'].astype(object)
+    df['Duración - Nro. Caracteres'] = df['Duración - Nro. Caracteres'].astype(object)
 
     df.loc[is_av, 'Dimensión'] = df.loc[is_av, 'Duración - Nro. Caracteres']
     df.loc[is_av, 'Duración - Nro. Caracteres'] = 0
@@ -1370,17 +954,10 @@ def generate_output_excel(rows, km):
 # Proceso principal
 # ======================================
 async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode):
-    st.session_state.update({'tokens_input': 0, 'tokens_output': 0, 'tokens_embedding': 0})
-    get_embedding_cache().clear()
+    st.session_state.update({'tokens_input': 0, 'tokens_output': 0})
     t0 = time.time()
-
-    if "API" in mode:
-        try:
-            openai.api_key = st.secrets["OPENAI_API_KEY"]
-            openai.aiosession.set(None)
-        except:
-            st.error("OPENAI_API_KEY no encontrado.")
-            st.stop()
+    clf = None
+    costo_ia = 0.0
 
     with st.status("Paso 1 · Carga de Configuración y Dossier", expanded=True) as s:
         config_path = load_local_config()
@@ -1455,9 +1032,9 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode):
     if ta:
         df = pd.DataFrame(ta)
 
-        # Valores por defecto
-        df[km["tonoiai"]] = "Neutro"
-        df[km["tema"]] = "Vida universitaria"
+        # Valores por defecto: lo que no se procese queda VISIBLE como "Sin clasificar"
+        df[km["tonoiai"]] = SIN_CLASIFICAR
+        df[km["tema"]] = SIN_CLASIFICAR
 
         # Solo UNAL (acepta ambas variaciones de la marca)
         is_target = df[km["menciones"]].astype(str).str.strip().isin([
@@ -1470,15 +1047,19 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode):
             titulos_target   = df_target[km["titulo"]].fillna("").tolist()
             resumenes_target = df_target[km["resumen"]].fillna("").tolist()
 
-            # Texto enriquecido para embeddings (resumen con más peso)
+            # Texto de entrada para los modelos PKL
             df_target["_txt"] = [
                 texto_para_embedding(titulos_target[i], resumenes_target[i])
                 for i in range(len(df_target))
             ]
 
-            with st.status("Embeddings (Universidad Nacional)...", expanded=True) as s:
-                _ = get_embeddings_batch(df_target["_txt"].tolist())
-                s.update(label=f"✓ {get_embedding_cache().stats()}", state="complete")
+            # Solo se omite la API si se usan PKL para tono y tema
+            necesita_api = not ("Solo Modelos PKL" in mode and tpkl and epkl)
+            if necesita_api:
+                clf = crear_clasificador(bn, ba)
+                with st.status("Verificando modelo de IA...", expanded=True) as s:
+                    modelo = await correr_ia(clf, clf.verificar())
+                    s.update(label=f"✓ Modelo de IA en uso: {modelo}", state="complete")
 
             # ── PASO 3: TONO ─────────────────────────────────────────────────
             with st.status("Paso 3 · Tono (Universidad Nacional)", expanded=True) as s:
@@ -1486,15 +1067,13 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode):
                 if "PKL" in mode and tpkl:
                     res = analizar_tono_con_pkl(df_target["_txt"].tolist(), tpkl)
                     if res is None: st.stop()
+                    tonos = [r["tono"] for r in res]
                 elif "API" in mode:
-                    res = await ClasificadorTono(bn, ba).procesar_lote_async(
-                        pb,
-                        df_target[km["resumen"]].fillna(""),
-                        df_target[km["titulo"]].fillna("")
-                    )
+                    tonos = await correr_ia(clf, clf.clasificar_tonos(
+                        titulos_target, resumenes_target, _progreso(pb, "Evaluando tono")))
                 else:
-                    res = [{"tono": "N/A"}] * len(df_target)
-                df_target[km["tonoiai"]] = [r["tono"] for r in res]
+                    tonos = ["N/A"] * len(df_target)
+                df_target[km["tonoiai"]] = tonos
                 s.update(label="✓ Paso 3 · Tono completado", state="complete")
 
             # ── PASO 4: TEMA (taxonomía fija) ─────────────────────────────────
@@ -1503,13 +1082,16 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode):
                 if "Solo Modelos PKL" in mode and epkl:
                     temas = clasificar_temas_con_pkl(df_target["_txt"].tolist(), epkl)
                     if not temas:
-                        temas = ["Vida universitaria"] * len(df_target)
+                        temas = [SIN_CLASIFICAR] * len(df_target)
                 elif "PKL" in mode and epkl:
                     temas = clasificar_temas_con_pkl(df_target["_txt"].tolist(), epkl)
                     if not temas:
-                        temas = await clasificar_temas_async(titulos_target, resumenes_target, pb)
+                        temas = await correr_ia(clf, clf.clasificar_temas(
+                            titulos_target, resumenes_target, _progreso(pb, "Clasificando tema")))
                 else:
-                    temas = await clasificar_temas_async(titulos_target, resumenes_target, pb)
+                    temas = await correr_ia(clf, clf.clasificar_temas(
+                        titulos_target, resumenes_target, _progreso(pb, "Clasificando tema")))
+                st.info(f"Temas: **{len(set(temas))}** categorías distintas utilizadas de {len(NOMBRES_TEMAS)} disponibles")
 
                 df_target[km["tema"]] = temas
                 s.update(label="✓ Paso 4 · Temas clasificados", state="complete")
@@ -1518,15 +1100,17 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode):
             df.loc[is_target, km["tonoiai"]] = df_target[km["tonoiai"]].values
             df.loc[is_target, km["tema"]]    = df_target[km["tema"]].values
 
+            if clf is not None:
+                reportar_errores_ia(clf)
+                costo_ia = costo_total_ia(clf)
+
         rm2 = df.set_index("expanded_index").to_dict("index")
         for idx, row in enumerate(rows):
             if not row.get("is_duplicate"):
                 row.update(rm2.get(row["expanded_index"], {}))
 
     gc.collect()
-    ci = (st.session_state['tokens_input']     / 1e6) * PRICE_INPUT_1M
-    co = (st.session_state['tokens_output']    / 1e6) * PRICE_OUTPUT_1M
-    ce = (st.session_state['tokens_embedding'] / 1e6) * PRICE_EMBEDDING_1M
+    info_modelo = f"Modelo: {clf.modelo_activo}" if (clf and clf.modelo_activo) else "Modelo: PKL"
 
     with st.status("Paso 5 · Generando informe", expanded=True) as s:
         st.session_state["output_data"]     = generate_output_excel(rows, km)
@@ -1538,15 +1122,14 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode):
             "brand_name": bn, "brand_aliases": ba,
             "total_rows": len(rows), "unique_rows": len(ta), "duplicates": len(rows) - len(ta),
             "process_duration": f"{time.time() - t0:.0f}s",
-            "process_cost": f"${ci + co + ce:.4f} USD",
-            "cache_stats": get_embedding_cache().stats()
+            "process_cost": f"${costo_ia:.4f} USD",
+            "cache_stats": info_modelo
         })
-        s.update(label=f"✓ Completado · {get_embedding_cache().stats()}", state="complete")
+        s.update(label=f"✓ Completado · {info_modelo}", state="complete")
 
 
 async def run_quick_async(df, tc, sc, bn, al):
-    st.session_state.update({'tokens_input': 0, 'tokens_output': 0, 'tokens_embedding': 0})
-    get_embedding_cache().clear()
+    st.session_state.update({'tokens_input': 0, 'tokens_output': 0})
 
     menciones_col = None
     for c in df.columns:
@@ -1554,8 +1137,8 @@ async def run_quick_async(df, tc, sc, bn, al):
             menciones_col = c
             break
 
-    df['Tono IA'] = 'Neutro'
-    df['Tema IA'] = 'Vida universitaria'
+    df['Tono IA'] = SIN_CLASIFICAR
+    df['Tema IA'] = SIN_CLASIFICAR
 
     if menciones_col is not None:
         is_target = df[menciones_col].astype(str).str.strip().isin([
@@ -1563,46 +1146,39 @@ async def run_quick_async(df, tc, sc, bn, al):
             "Universidad Nacional de Colombia"
         ])
     else:
-        is_target = pd.Series([True] * len(df))
+        is_target = pd.Series([True] * len(df), index=df.index)
 
     df_target = df[is_target].copy()
+    costo_ia = 0.0
 
     if not df_target.empty:
-        titulos_list   = df_target[tc].fillna("").tolist()
-        resumenes_list = df_target[sc].fillna("").tolist()
+        titulos_list   = df_target[tc].fillna("").astype(str).tolist()
+        resumenes_list = df_target[sc].fillna("").astype(str).tolist()
 
-        df_target['_txt'] = [
-            texto_para_embedding(titulos_list[i], resumenes_list[i])
-            for i in range(len(df_target))
-        ]
-
-        with st.status("Embeddings (Universidad Nacional)...", expanded=True) as s:
-            _ = get_embeddings_batch(df_target['_txt'].tolist())
-            s.update(label=f"✓ {get_embedding_cache().stats()}", state="complete")
+        clf = crear_clasificador(bn, al)
+        with st.status("Verificando modelo de IA...", expanded=True) as s:
+            modelo = await correr_ia(clf, clf.verificar())
+            s.update(label=f"✓ Modelo de IA en uso: {modelo}", state="complete")
 
         with st.status("Tono", expanded=True) as s:
             pb = st.progress(0)
-            res = await ClasificadorTono(bn, al).procesar_lote_async(
-                pb,
-                df_target[sc].fillna(''),
-                df_target[tc].fillna('')
-            )
-            df_target['Tono IA'] = [r["tono"] for r in res]
+            df_target['Tono IA'] = await correr_ia(clf, clf.clasificar_tonos(
+                titulos_list, resumenes_list, _progreso(pb, "Evaluando tono")))
             s.update(label="✓ Tono", state="complete")
 
         with st.status("Clasificación de Tema", expanded=True) as s:
             pb = st.progress(0)
-            temas = await clasificar_temas_async(titulos_list, resumenes_list, pb)
-            df_target['Tema IA'] = temas
+            df_target['Tema IA'] = await correr_ia(clf, clf.clasificar_temas(
+                titulos_list, resumenes_list, _progreso(pb, "Clasificando tema")))
             s.update(label="✓ Tema clasificado", state="complete")
 
+        await clf.cerrar()
         df.loc[is_target, 'Tono IA'] = df_target['Tono IA'].values
         df.loc[is_target, 'Tema IA'] = df_target['Tema IA'].values
+        reportar_errores_ia(clf)
+        costo_ia = costo_total_ia(clf)
 
-    ci = (st.session_state['tokens_input']     / 1e6) * PRICE_INPUT_1M
-    co = (st.session_state['tokens_output']    / 1e6) * PRICE_OUTPUT_1M
-    ce = (st.session_state['tokens_embedding'] / 1e6) * PRICE_EMBEDDING_1M
-    st.session_state['quick_cost'] = f"${ci + co + ce:.4f} USD"
+    st.session_state['quick_cost'] = f"${costo_ia:.4f} USD"
     return df
 
 
@@ -1662,12 +1238,6 @@ def render_quick_tab():
                 if not bn:
                     st.error("Indica la marca.")
                 else:
-                    try:
-                        openai.api_key = st.secrets["OPENAI_API_KEY"]
-                        openai.aiosession.set(None)
-                    except:
-                        st.error("OPENAI_API_KEY no encontrada.")
-                        st.stop()
                     al = [a.strip() for a in bat.split(";") if a.strip()]
                     with st.spinner("Procesando..."):
                         st.session_state.quick_result = asyncio.run(
@@ -1693,7 +1263,7 @@ def main():
         <div class="app-header-icon">◈</div>
         <div class="app-header-text">
             <div class="app-header-title">Análisis de Noticias - Universidad Nacional - API</div>
-            <div class="app-header-version">v19.0 · Taxonomía fija 23 categorías · Realizado por Johnathan Cortés</div>
+            <div class="app-header-version">v20.0 · GPT Luna · Taxonomía fija 23 categorías · Realizado por Johnathan Cortés</div>
         </div>
         <div class="app-header-badge">IA</div>
     </div>""", unsafe_allow_html=True)
@@ -1813,7 +1383,7 @@ def main():
         render_quick_tab()
 
     st.markdown(
-        '<div class="footer">v19.0 · Análisis de Noticias con IA · Taxonomía fija 23 categorías · Johnathan Cortés ©</div>',
+        '<div class="footer">v20.0 · Análisis de Noticias con IA · Taxonomía fija 23 categorías · Johnathan Cortés ©</div>',
         unsafe_allow_html=True
     )
 
