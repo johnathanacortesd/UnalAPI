@@ -13,7 +13,7 @@ os.chdir(ROOT)
 from test_clasificador import FakeOpenAI  # noqa: E402
 
 retirados = set(filter(None, os.environ.get("RETIRADOS", "").split(",")))
-FakeOpenAI.config = {"retirados": retirados}
+FakeOpenAI.config = {"retirados": retirados, "rate_limit": int(os.environ.get("RATE_LIMIT", "0"))}
 srv = HTTPServer(("127.0.0.1", 0), FakeOpenAI)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 os.environ["OPENAI_BASE_URL"] = f"http://127.0.0.1:{srv.server_address[1]}/v1"
@@ -46,6 +46,8 @@ filas = [
     (3, "Online", "El Espectador", "03/11/2026", "12:00", "Universidad Nacional: abre convocatoria de becas", U, "Becas para estudiantes", "", "", "http://a.com/3", 100),
     (4, "Online", "Portafolio", "03/11/2026", "13:00", "Otra empresa lanza producto", "Bancolombia", "texto", "", "", "http://a.com/4", 100),
     (5, "Online", "El Colombiano", "03/11/2026", "14:00", "Universidad Nacional: recorte del presupuesto", U, "Presupuesto en déficit", "", "", "http://a.com/5", 100),
+    (6, "Online", "La República", "03/11/2026", "15:00", "Rector advierte caída de bachilleres y bloqueo del sistema", U,
+     "José Ismael Peña, rector de la Universidad Nacional, señaló que la institución enfrenta el reto de la reducción del número de bachilleres en Colombia.", "", "", "http://a.com/6", 100),
 ]
 for f in filas: ws.append(f)
 buf = io.BytesIO(); wb.save(buf); buf.seek(0)
@@ -61,6 +63,14 @@ async def main():
     it, itn, itm = cab.index("Título"), cab.index("Tono IA"), cab.index("Tema IA")
     for r in hoja.iter_rows(min_row=2, values_only=True):
         print(f"{r[it][:45]:45} | {r[itn]:10} | {r[itm]}")
+    sin_tema = []
+    for h in out.worksheets:
+        cab_h = [c.value for c in h[1]]
+        if "Tema IA" not in cab_h:
+            continue
+        j = cab_h.index("Tema IA")
+        sin_tema += [(h.title, r) for r in h.iter_rows(min_row=2, values_only=True) if r[j] in (None, "", app.SIN_CLASIFICAR)]
+    print("SIN TEMA:", len(sin_tema), "| hojas revisadas:", [h.title for h in out.worksheets if "Tema IA" in [c.value for c in h[1]]])
     print("COSTO:", st.session_state["process_cost"], "|", st.session_state["cache_stats"])
     return 0
 

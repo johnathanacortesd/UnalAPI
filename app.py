@@ -26,7 +26,8 @@ from pathlib import Path
 
 from clasificador import (
     ClasificadorIA, ErrorClasificador, NOMBRES_TEMAS, TAXONOMIA_TEMAS,
-    SIN_CLASIFICAR, costo_usd,
+    SIN_CLASIFICAR, TEMA_RESIDUAL, TPM_LIMITE_DEFECTO, VOCEROS_POSITIVOS_DEFECTO,
+    asegurar_tema, menciona_vocero, costo_usd,
 )
 from textos import normalize_title_for_comparison
 
@@ -45,6 +46,7 @@ st.set_page_config(
 # (gpt-4.1-nano fue retirado por OpenAI el 2026-10-23).
 SIMILARITY_THRESHOLD_TITULOS = 0.93
 CONCURRENT_REQUESTS          = 30
+VOCEROS_DEFECTO_TXT          = "; ".join(VOCEROS_POSITIVOS_DEFECTO)
 
 if 'tokens_input' not in st.session_state: st.session_state['tokens_input'] = 0
 if 'tokens_output' not in st.session_state: st.session_state['tokens_output'] = 0
@@ -542,8 +544,10 @@ def analizar_tono_con_pkl(textos, pkl_file):
 def _fallback_tema_semantico(raw: str) -> str:
     """Para PKL: si devuelve algo fuera de la taxonomía, busca el más cercano por SequenceMatcher."""
     if not raw:
-        return SIN_CLASIFICAR
-    best, best_score = SIN_CLASIFICAR, 0.0
+        return TEMA_RESIDUAL
+    if raw in TAXONOMIA_TEMAS:
+        return raw
+    best, best_score = TEMA_RESIDUAL, 0.0
     r = unidecode(raw.lower())
     for nombre in NOMBRES_TEMAS:
         score = SequenceMatcher(None, r, unidecode(nombre.lower())).ratio()
@@ -571,7 +575,7 @@ def clasificar_temas_con_pkl(textos, pkl_file) -> Optional[list]:
 # ======================================
 # Ejecución de la IA (tono + tema) con GPT Luna
 # ======================================
-def crear_clasificador(marca, aliases):
+def crear_clasificador(marca, aliases, voceros=None):
     try:
         api_key = st.secrets["OPENAI_API_KEY"]
     except Exception:
@@ -582,7 +586,27 @@ def crear_clasificador(marca, aliases):
         modelo = st.secrets.get("OPENAI_MODEL", None)
     except Exception:
         pass
-    return ClasificadorIA(api_key, marca, aliases, modelo=modelo, concurrencia=CONCURRENT_REQUESTS)
+    tpm = TPM_LIMITE_DEFECTO
+    try:
+        tpm = int(st.secrets.get("OPENAI_TPM_LIMIT", TPM_LIMITE_DEFECTO))
+    except Exception:
+        pass
+    return ClasificadorIA(
+        api_key, marca, aliases, modelo=modelo, concurrencia=CONCURRENT_REQUESTS,
+        voceros_positivos=voceros, tpm_limite=tpm,
+    )
+
+
+def aplicar_voceros(tonos, titulos, resumenes, voceros):
+    """Las participaciones de los voceros configurados son siempre Positivas (también con PKL)."""
+    return [
+        "Positivo" if menciona_vocero(titulos[i], resumenes[i], voceros) else t
+        for i, t in enumerate(tonos)
+    ]
+
+
+def leer_voceros(txt):
+    return [v.strip() for v in (txt or "").split(";") if v.strip()]
 
 
 def _progreso(pb, etiqueta):
@@ -593,9 +617,20 @@ def _progreso(pb, etiqueta):
 
 def reportar_errores_ia(clf):
     """Muestra al usuario las noticias que NO se pudieron clasificar (nunca se ocultan)."""
+    if clf.reintentos_429:
+        st.info(
+            f"⏳ Se alcanzó el límite de tokens por minuto de OpenAI; se esperó y reintentó "
+            f"{clf.reintentos_429} vez/veces automáticamente."
+        )
+    if clf.tonos_por_vocero:
+        st.info(f"🎙️ {clf.tonos_por_vocero} noticia(s) con participación de voceros marcadas como Positivo.")
+    for aviso in clf.avisos:
+        st.warning("⚠️ " + aviso.split("\n", 1)[0])
+        with st.expander("Ver detalle"):
+            st.code(aviso)
     if clf.errores:
         st.warning(
-            f"⚠️ {len(clf.errores)} clasificación(es) fallaron y quedaron como «{SIN_CLASIFICAR}». "
+            f"⚠️ {len(clf.errores)} tono(s) fallaron tras varios reintentos y quedaron como «{SIN_CLASIFICAR}». "
             "Revisa esas filas o vuelve a ejecutar."
         )
         with st.expander("Ver detalle de errores"):
@@ -953,7 +988,8 @@ def generate_output_excel(rows, km):
 # ======================================
 # Proceso principal
 # ======================================
-async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode):
+async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, voceros=None):
+    voceros = list(VOCEROS_POSITIVOS_DEFECTO) if voceros is None else voceros
     st.session_state.update({'tokens_input': 0, 'tokens_output': 0})
     t0 = time.time()
     clf = None
@@ -1043,66 +1079,64 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode):
         ])
         df_target = df[is_target].copy()
 
+        # Tono y tema con IA solo para Universidad Nacional (la hoja "Otros" no exporta tema).
+        titulos_all   = df[km["titulo"]].fillna("").astype(str).tolist()
+        resumenes_all = df[km["resumen"]].fillna("").astype(str).tolist()
+        pos_target = [i for i, v in enumerate(is_target.tolist()) if v]
+        titulos_target   = [titulos_all[i] for i in pos_target]
+        resumenes_target = [resumenes_all[i] for i in pos_target]
+        txt_target = [texto_para_embedding(titulos_target[i], resumenes_target[i]) for i in range(len(pos_target))]
+
+        # Solo se omite la API si se usan PKL para tono y tema
+        necesita_api = not df_target.empty and not ("Solo Modelos PKL" in mode and tpkl and epkl)
+        if necesita_api:
+            clf = crear_clasificador(bn, ba, voceros)
+            with st.status("Verificando modelo de IA...", expanded=True) as s:
+                modelo = await correr_ia(clf, clf.verificar())
+                s.update(label=f"✓ Modelo de IA en uso: {modelo}", state="complete")
+
+        # ── PASO 3: TONO ─────────────────────────────────────────────────────
         if not df_target.empty:
-            titulos_target   = df_target[km["titulo"]].fillna("").tolist()
-            resumenes_target = df_target[km["resumen"]].fillna("").tolist()
-
-            # Texto de entrada para los modelos PKL
-            df_target["_txt"] = [
-                texto_para_embedding(titulos_target[i], resumenes_target[i])
-                for i in range(len(df_target))
-            ]
-
-            # Solo se omite la API si se usan PKL para tono y tema
-            necesita_api = not ("Solo Modelos PKL" in mode and tpkl and epkl)
-            if necesita_api:
-                clf = crear_clasificador(bn, ba)
-                with st.status("Verificando modelo de IA...", expanded=True) as s:
-                    modelo = await correr_ia(clf, clf.verificar())
-                    s.update(label=f"✓ Modelo de IA en uso: {modelo}", state="complete")
-
-            # ── PASO 3: TONO ─────────────────────────────────────────────────
             with st.status("Paso 3 · Tono (Universidad Nacional)", expanded=True) as s:
                 pb = st.progress(0)
                 if "PKL" in mode and tpkl:
-                    res = analizar_tono_con_pkl(df_target["_txt"].tolist(), tpkl)
+                    res = analizar_tono_con_pkl(txt_target, tpkl)
                     if res is None: st.stop()
-                    tonos = [r["tono"] for r in res]
+                    tonos = aplicar_voceros([r["tono"] for r in res], titulos_target, resumenes_target, voceros)
                 elif "API" in mode:
                     tonos = await correr_ia(clf, clf.clasificar_tonos(
                         titulos_target, resumenes_target, _progreso(pb, "Evaluando tono")))
                 else:
                     tonos = ["N/A"] * len(df_target)
-                df_target[km["tonoiai"]] = tonos
+                df.loc[is_target, km["tonoiai"]] = tonos
                 s.update(label="✓ Paso 3 · Tono completado", state="complete")
 
-            # ── PASO 4: TEMA (taxonomía fija) ─────────────────────────────────
+        # ── PASO 4: TEMA (taxonomía fija) ─────────────────────────────────────
+        if not df_target.empty:
             with st.status("Paso 4 · Clasificación de Tema (Universidad Nacional)", expanded=True) as s:
                 pb = st.progress(0)
-                if "Solo Modelos PKL" in mode and epkl:
-                    temas = clasificar_temas_con_pkl(df_target["_txt"].tolist(), epkl)
-                    if not temas:
-                        temas = [SIN_CLASIFICAR] * len(df_target)
-                elif "PKL" in mode and epkl:
-                    temas = clasificar_temas_con_pkl(df_target["_txt"].tolist(), epkl)
-                    if not temas:
-                        temas = await correr_ia(clf, clf.clasificar_temas(
-                            titulos_target, resumenes_target, _progreso(pb, "Clasificando tema")))
-                else:
+                temas = None
+                if "PKL" in mode and epkl:
+                    temas = clasificar_temas_con_pkl(txt_target, epkl)
+                if not temas and clf is not None:
                     temas = await correr_ia(clf, clf.clasificar_temas(
                         titulos_target, resumenes_target, _progreso(pb, "Clasificando tema")))
+                if not temas:
+                    temas = [None] * len(pos_target)
+                # Garantía final: todo tema pertenece a la taxonomía (nunca "Sin clasificar")
+                temas = [asegurar_tema(temas[i], titulos_target[i], resumenes_target[i])
+                         for i in range(len(pos_target))]
                 st.info(f"Temas: **{len(set(temas))}** categorías distintas utilizadas de {len(NOMBRES_TEMAS)} disponibles")
-
-                df_target[km["tema"]] = temas
+                df.loc[is_target, km["tema"]] = temas
                 s.update(label="✓ Paso 4 · Temas clasificados", state="complete")
+        # Notas de otras marcas: tema por palabras clave (sin costo; no se exporta en "Otros").
+        df[km["tema"]] = [asegurar_tema(t, titulos_all[i], resumenes_all[i])
+                          for i, t in enumerate(df[km["tema"]].tolist())]
 
-            # Mapear resultados al df general
-            df.loc[is_target, km["tonoiai"]] = df_target[km["tonoiai"]].values
-            df.loc[is_target, km["tema"]]    = df_target[km["tema"]].values
-
-            if clf is not None:
-                reportar_errores_ia(clf)
-                costo_ia = costo_total_ia(clf)
+        if clf is not None:
+            await clf.cerrar()
+            reportar_errores_ia(clf)
+            costo_ia = costo_total_ia(clf)
 
         rm2 = df.set_index("expanded_index").to_dict("index")
         for idx, row in enumerate(rows):
@@ -1128,7 +1162,8 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode):
         s.update(label=f"✓ Completado · {info_modelo}", state="complete")
 
 
-async def run_quick_async(df, tc, sc, bn, al):
+async def run_quick_async(df, tc, sc, bn, al, voceros=None):
+    voceros = list(VOCEROS_POSITIVOS_DEFECTO) if voceros is None else voceros
     st.session_state.update({'tokens_input': 0, 'tokens_output': 0})
 
     menciones_col = None
@@ -1147,34 +1182,40 @@ async def run_quick_async(df, tc, sc, bn, al):
         ])
     else:
         is_target = pd.Series([True] * len(df), index=df.index)
+    is_target = is_target.fillna(False).astype(bool)
 
     df_target = df[is_target].copy()
     costo_ia = 0.0
 
-    if not df_target.empty:
-        titulos_list   = df_target[tc].fillna("").astype(str).tolist()
-        resumenes_list = df_target[sc].fillna("").astype(str).tolist()
+    titulos_all   = df[tc].fillna("").astype(str).tolist()
+    resumenes_all = df[sc].fillna("").astype(str).tolist()
+    if len(df):
+        pos_target = [i for i, v in enumerate(is_target.tolist()) if v]
+        titulos_list   = [titulos_all[i] for i in pos_target]
+        resumenes_list = [resumenes_all[i] for i in pos_target]
 
-        clf = crear_clasificador(bn, al)
+        clf = crear_clasificador(bn, al, voceros)
         with st.status("Verificando modelo de IA...", expanded=True) as s:
             modelo = await correr_ia(clf, clf.verificar())
             s.update(label=f"✓ Modelo de IA en uso: {modelo}", state="complete")
 
-        with st.status("Tono", expanded=True) as s:
-            pb = st.progress(0)
-            df_target['Tono IA'] = await correr_ia(clf, clf.clasificar_tonos(
-                titulos_list, resumenes_list, _progreso(pb, "Evaluando tono")))
-            s.update(label="✓ Tono", state="complete")
+        if not df_target.empty:
+            with st.status("Tono", expanded=True) as s:
+                pb = st.progress(0)
+                tonos = await correr_ia(clf, clf.clasificar_tonos(
+                    titulos_list, resumenes_list, _progreso(pb, "Evaluando tono")))
+                df.loc[is_target.values, 'Tono IA'] = tonos
+                s.update(label="✓ Tono", state="complete")
 
+        # El tema se clasifica en TODAS las notas: ninguna queda "Sin clasificar".
         with st.status("Clasificación de Tema", expanded=True) as s:
             pb = st.progress(0)
-            df_target['Tema IA'] = await correr_ia(clf, clf.clasificar_temas(
-                titulos_list, resumenes_list, _progreso(pb, "Clasificando tema")))
+            temas = await correr_ia(clf, clf.clasificar_temas(
+                titulos_all, resumenes_all, _progreso(pb, "Clasificando tema")))
+            df['Tema IA'] = [asegurar_tema(temas[i], titulos_all[i], resumenes_all[i]) for i in range(len(df))]
             s.update(label="✓ Tema clasificado", state="complete")
 
         await clf.cerrar()
-        df.loc[is_target, 'Tono IA'] = df_target['Tono IA'].values
-        df.loc[is_target, 'Tema IA'] = df_target['Tema IA'].values
         reportar_errores_ia(clf)
         costo_ia = costo_total_ia(clf)
 
@@ -1234,6 +1275,7 @@ def render_quick_tab():
             sc = c2.selectbox("Col. resumen", cols, 1 if len(cols) > 1 else 0)
             bn  = st.text_input("Marca",     value="Universidad Nacional")
             bat = st.text_input("Alias (;)", value="Universidad Nacional de Colombia; UNAL")
+            vqt = st.text_input("Voceros con tono positivo (;)", value=VOCEROS_DEFECTO_TXT)
             if st.form_submit_button("Analizar", use_container_width=True, type="primary"):
                 if not bn:
                     st.error("Indica la marca.")
@@ -1241,7 +1283,7 @@ def render_quick_tab():
                     al = [a.strip() for a in bat.split(";") if a.strip()]
                     with st.spinner("Procesando..."):
                         st.session_state.quick_result = asyncio.run(
-                            run_quick_async(st.session_state.quick_df.copy(), tc, sc, bn, al)
+                            run_quick_async(st.session_state.quick_df.copy(), tc, sc, bn, al, leer_voceros(vqt))
                         )
                     st.rerun()
         if st.button("Otro archivo"):
@@ -1277,6 +1319,10 @@ def main():
             with cl:
                 bn  = st.text_input("Marca principal", value="Universidad Nacional", key="bn")
                 bat = st.text_input("Alias (separados por ;)", value="Universidad Nacional de Colombia; UNAL", key="ba")
+                vt  = st.text_input(
+                    "Voceros con tono positivo (separados por ;)", value=VOCEROS_DEFECTO_TXT, key="voceros",
+                    help="Las noticias donde intervienen estos voceros se marcan siempre como Positivo",
+                )
             with cr:
                 mode = st.radio(
                     "Modo de análisis",
@@ -1327,7 +1373,8 @@ def main():
                 st.markdown(
                     '<div class="taxonomy-info">'
                     '<b>Taxonomía fija</b> · 18 categorías generales + 5 específicas = <b>23 temas</b> · '
-                    'Análisis de Tono e IA solo para <b>Universidad Nacional de Colombia</b> (General o estándar) · '
+                    'Análisis de Tono y Tema con IA para <b>Universidad Nacional de Colombia</b> (General o estándar) · '
+                    'Ninguna nota queda sin tema · '
                     'El resumen completo (Resumen - Aclaracion) es la fuente principal de clasificación'
                     '</div>',
                     unsafe_allow_html=True
@@ -1341,7 +1388,8 @@ def main():
                         cur_mode = st.session_state.get("mode", "API de OpenAI")
                         cur_tpkl = st.session_state.get("tpkl")
                         cur_epkl = st.session_state.get("epkl")
-                        asyncio.run(run_full_process_async(f1, bn, al, cur_tpkl, cur_epkl, cur_mode))
+                        asyncio.run(run_full_process_async(
+                            f1, bn, al, cur_tpkl, cur_epkl, cur_mode, leer_voceros(vt)))
                         st.rerun()
         else:
             total = st.session_state.total_rows
