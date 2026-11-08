@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from clasificador import (  # noqa: E402
     NOMBRES_TEMAS, SIN_CLASIFICAR, ClasificadorIA, ErrorClasificador,
+    _espera_sugerida, menciona_vocero, tema_por_palabras_clave,
 )
 from textos import normalize_title_for_comparison  # noqa: E402
 
@@ -43,6 +44,11 @@ class FakeOpenAI(BaseHTTPRequestHandler):
         cfg = FakeOpenAI.config
         FakeOpenAI.peticiones.append(req)
         modelo = req["model"]
+        if cfg.get("rate_limit", 0) > 0:
+            cfg["rate_limit"] -= 1
+            return self._send(429, {"error": {"message": f"Rate limit reached for {modelo} on tokens per min (TPM): Limit 2000000, Used 2000000, Requested 3074. Please try again in 92ms.", "type": "tokens", "code": "rate_limit_exceeded"}})
+        if cfg.get("sin_cuota"):
+            return self._send(429, {"error": {"message": "You exceeded your current quota", "type": "insufficient_quota", "code": "insufficient_quota"}})
         if cfg.get("auth_error"):
             return self._send(401, {"error": {"message": "bad key", "type": "invalid_request_error", "code": "invalid_api_key"}})
         if modelo in cfg.get("retirados", ()):
@@ -80,8 +86,8 @@ def servidor():
     srv.shutdown()
 
 
-def nuevo(url):
-    return ClasificadorIA("sk-test", "Universidad Nacional", ["UNAL"], base_url=url)
+def nuevo(url, **kw):
+    return ClasificadorIA("sk-test", "Universidad Nacional", ["UNAL"], base_url=url, espera_base=0.01, **kw)
 
 
 def correr(coro):
@@ -187,16 +193,110 @@ def test_reasoning_effort_rechazado_se_reintenta_sin_el(servidor):
     assert "reasoning_effort" not in FakeOpenAI.peticiones[-1]
 
 
-def test_error_por_fila_queda_registrado_no_disfrazado(servidor):
+def test_error_por_fila_en_tono_queda_registrado_no_disfrazado(servidor):
     async def go():
         c = nuevo(servidor)
         try:
-            return await c.clasificar_temas(["valor_invalido", "ranking"], ["a", "b"]), c
+            return await c.clasificar_tonos(["valor_invalido", "ranking"], ["a", "b"]), c
+        finally:
+            await c.cerrar()
+    tonos, c = correr(go())
+    assert tonos == [SIN_CLASIFICAR, "Positivo"]
+    assert len(c.errores) == 1 and "fuera de catálogo" in c.errores[0]
+
+
+def test_tema_nunca_queda_sin_clasificar(servidor):
+    async def go():
+        c = nuevo(servidor)
+        try:
+            return await c.clasificar_temas(
+                ["valor_invalido: estudiantes bloquean la 26", "ranking"], ["a", "b"]), c
         finally:
             await c.cerrar()
     temas, c = correr(go())
-    assert temas == [SIN_CLASIFICAR, "Acreditación y calidad educativa"]
-    assert len(c.errores) == 1 and "fuera de catálogo" in c.errores[0]
+    assert SIN_CLASIFICAR not in temas and all(t in NOMBRES_TEMAS for t in temas)
+    assert temas[0] == "Conflicto, orden público y seguridad"   # respaldo por palabras clave
+    assert not c.errores and len(c.avisos) == 1 and "palabras clave" in c.avisos[0]
+
+
+def test_429_por_tpm_se_reintenta_y_no_pierde_noticias(servidor):
+    FakeOpenAI.config = {"rate_limit": 12}
+    titulos = [f"ranking {i}" for i in range(10)]
+
+    async def go():
+        c = nuevo(servidor, concurrencia=10)
+        try:
+            return await c.clasificar_tonos(titulos, ["x"] * 10), c
+        finally:
+            await c.cerrar()
+    tonos, c = correr(go())
+    assert tonos == ["Positivo"] * 10
+    assert not c.errores and c.reintentos_429 >= 1
+
+
+def test_429_persistente_se_recupera_en_rondas_finales(servidor):
+    # Más 429 que los reintentos de una sola petición: las rondas finales la recuperan.
+    FakeOpenAI.config = {"rate_limit": 25}
+
+    async def go():
+        c = nuevo(servidor, concurrencia=1)
+        try:
+            return await c.clasificar_temas(["ranking"], ["x"]), c
+        finally:
+            await c.cerrar()
+    temas, c = correr(go())
+    assert temas == ["Acreditación y calidad educativa"] and not c.avisos
+
+
+def test_sin_cuota_falla_ruidosamente(servidor):
+    FakeOpenAI.config = {"sin_cuota": True}
+
+    async def go():
+        c = nuevo(servidor)
+        try:
+            await c.clasificar_tonos(["t"], ["r"])
+        finally:
+            await c.cerrar()
+    with pytest.raises(ErrorClasificador, match="saldo"):
+        correr(go())
+
+
+def test_espera_sugerida():
+    assert abs(_espera_sugerida(Exception("Please try again in 92ms. Visit")) - 0.092) < 1e-9
+    assert _espera_sugerida(Exception("try again in 1m3.5s")) == 63.5
+    assert _espera_sugerida(Exception("otro error")) == 0.0
+
+
+def test_vocero_rector_siempre_positivo(servidor):
+    texto = ("José Ismael Peña, rector de la Universidad Nacional, señaló que la institución enfrenta "
+             "el reto de la reducción del número de bachilleres en Colombia. Según explicó, el país pasó "
+             "de cerca de 900.000 graduados hace 15 años a aproximadamente 450.000 en la actualidad.")
+
+    async def go():
+        c = nuevo(servidor)
+        try:
+            # "bloque" haría que el modelo simulado responda Negativo: el vocero manda.
+            return await c.clasificar_tonos(["Rector habla de bloqueos", "bloqueo en la 26"], [texto, "x"]), c
+        finally:
+            await c.cerrar()
+    tonos, c = correr(go())
+    assert tonos == ["Positivo", "Negativo"] and c.tonos_por_vocero == 1
+    assert len(FakeOpenAI.peticiones) == 1   # la noticia del vocero no gasta tokens
+    assert "José Ismael Peña" in c._sistema_tono
+
+
+def test_menciona_vocero_variantes():
+    v = ["José Ismael Peña"]
+    assert menciona_vocero("", "JOSE ISMAEL PEÑA dijo", v)
+    assert menciona_vocero("El rector Peña habló", "", v)
+    assert menciona_vocero("Ismael Peña, rector", "", v)
+    assert not menciona_vocero("Enrique Peñalosa visitó la UNAL", "", v)
+    assert not menciona_vocero("José Ismael Peña", "", [])
+
+
+def test_tema_por_palabras_clave_siempre_en_taxonomia():
+    assert tema_por_palabras_clave("", "") in NOMBRES_TEMAS
+    assert tema_por_palabras_clave("UNAL sube en el ranking QS", "") == "Acreditación y calidad educativa"
 
 
 def test_normalizador_de_titulos_no_colapsa_prefijos():

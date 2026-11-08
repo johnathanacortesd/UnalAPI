@@ -11,17 +11,28 @@ Diferencias clave frente a la versión anterior:
     se devuelven como "Sin clasificar" y la app los muestra al usuario.
   * Verificación previa (preflight) del modelo antes de procesar el dossier.
   * Cada noticia se clasifica con su propio texto (solo se deduplican textos idénticos).
+  * Límite de tokens por minuto (TPM): limitador propio + pausa global y reintentos con
+    espera exponencial ante 429, y rondas finales de reintento para lo que haya fallado.
+  * Voceros con tono fijo (p. ej. el rector José Ismael Peña => Positivo).
+  * El TEMA nunca queda "Sin clasificar": si tras los reintentos la API no responde para una
+    noticia, se asigna por palabras clave y se informa como aviso.
 """
 import asyncio
+import collections
 import hashlib
 import json
+import random
 import re
+import time
 from typing import Callable, Dict, List, Optional, Sequence
 
 from openai import (
     AsyncOpenAI,
     APIConnectionError,
+    APITimeoutError,
     AuthenticationError,
+    InternalServerError,
+    RateLimitError,
     BadRequestError,
     NotFoundError,
     PermissionDeniedError,
@@ -46,7 +57,18 @@ PRECIO_DESCONOCIDO = (1.00, 6.00)
 TEXTO_MAX_TONO = 3500
 TEXTO_MAX_TEMA = 3500
 
+# Límite de tokens por minuto de la organización (gpt-6-luna: 2.000.000 TPM). Se usa un margen
+# del 80 % porque la organización puede tener otros procesos consumiendo la misma cuota.
+TPM_LIMITE_DEFECTO = 1_600_000
+MAX_REINTENTOS_429 = 8
+RONDAS_REINTENTO = 2          # rondas extra (con menos concurrencia) para lo que haya fallado
+CONCURRENCIA_REINTENTO = 4
+
 SIN_CLASIFICAR = "Sin clasificar"
+TEMA_RESIDUAL = "Vida universitaria"
+
+# Voceros cuyas intervenciones siempre son POSITIVAS para la reputación de la institución.
+VOCEROS_POSITIVOS_DEFECTO = ("José Ismael Peña",)
 TONOS_VALIDOS = ("Positivo", "Negativo", "Neutro")
 
 
@@ -212,13 +234,16 @@ SISTEMA_TONO_TPL = (
     "(por ejemplo, un docente explicando un tema sin valorar a la universidad).\n\n"
     "Reglas: decide por el hecho principal del titular y del primer párrafo. Si hay señales mixtas, "
     "gana el hecho central. Usa NEUTRO solo cuando de verdad no haya valoración; no lo uses como "
-    "opción por defecto. Si un tercero sufre el hecho grave y la institución solo informa, es NEUTRO.\n\n"
+    "opción por defecto. Si un tercero sufre el hecho grave y la institución solo informa, es NEUTRO.\n"
+    "{regla_voceros}\n"
     "EJEMPLOS:\n"
     "- La UNAL entra al top 5 de universidades de Latinoamérica → Positivo\n"
     "- Estudiantes denuncian acoso por parte de un docente de la UNAL → Negativo\n"
     "- Un profesor de la UNAL, citado como fuente, explica cómo se calcula la inflación → Neutro\n"
     "- Paro estudiantil bloquea el ingreso al campus por tercera semana → Negativo\n"
-    "- Investigadores de la UNAL desarrollan un sensor que reduce costos de monitoreo del agua → Positivo\n\n"
+    "- Investigadores de la UNAL desarrollan un sensor que reduce costos de monitoreo del agua → Positivo\n"
+    "- El rector de la UNAL advierte que el país pasó de 900.000 a 450.000 bachilleres y que eso reta "
+    "a la educación superior → Positivo (la institución aparece como voz autorizada que analiza un reto del país)\n\n"
     'Responde solo con JSON: "evidencia" (máx. 25 palabras con el hecho que decide el tono) y "tono".'
 )
 
@@ -260,6 +285,141 @@ def _modelo_no_disponible(e: Exception) -> bool:
     return False
 
 
+def _normalizar(texto: str) -> str:
+    return re.sub(r"\s+", " ", unidecode(str(texto or "")).lower()).strip()
+
+
+def _variantes_vocero(nombre: str) -> List[str]:
+    """'José Ismael Peña' -> ['jose ismael pena', 'ismael pena', 'rector pena']."""
+    partes = _normalizar(nombre).split()
+    if not partes:
+        return []
+    variantes = {" ".join(partes)}
+    if len(partes) >= 3:
+        variantes.add(" ".join(partes[1:]))          # sin el primer nombre
+    if len(partes) >= 2:
+        variantes.add(f"rector {partes[-1]}")         # "el rector Peña"
+    return sorted(variantes, key=len, reverse=True)
+
+
+def menciona_vocero(titulo: str, resumen: str, voceros: Sequence[str]) -> Optional[str]:
+    """Devuelve el vocero mencionado en la noticia (o None)."""
+    texto = _normalizar(f"{titulo or ''} {resumen or ''}")
+    for v in voceros:
+        for var in _variantes_vocero(v):
+            if re.search(rf"\b{re.escape(var)}\b", texto):
+                return v
+    return None
+
+
+# Palabras clave para el respaldo de TEMA (solo si la API no respondió tras todos los reintentos).
+# Orden = prioridad (las específicas primero, la residual nunca aparece aquí).
+_PALABRAS_TEMA: List[tuple] = [
+    ("Reforma a la educación superior", ("ley 30", "reforma a la educacion superior", "reforma de la educacion superior")),
+    ("Acreditación y calidad educativa", ("acreditacion", "ranking", "qs ", "scimago", "times higher")),
+    ("Propiedad intelectual y derechos de autor", ("derechos de autor", "propiedad intelectual", "acceso abierto")),
+    ("Crisis o emergencia institucional", ("intervencion", "escandalo", "crisis institucional", "paro indefinido")),
+    ("Conflicto, orden público y seguridad", ("bloqueo", "bloquean", "tropel", "protesta", "disturbio", "esmad", "vandal", "agresion", "seguridad")),
+    ("Financiamiento y presupuesto", ("presupuesto", "deficit", "financiacion", "financiamiento", "recursos economicos", "billones", "millones de pesos")),
+    ("Relaciones con el Estado y política pública", ("congreso", "ministerio", "ministra", "ministro", "gobierno nacional", "politica publica")),
+    ("Política y gestión institucional", ("rector", "consejo superior", "consejo academico", "estatuto", "vicerrector")),
+    ("Salud pública y ciencias de la salud", ("salud", "medicina", "hospital", "enfermedad", "virus", "epidemi", "clinic")),
+    ("Medio ambiente y sostenibilidad", ("ambiental", "clima", "biodiversidad", "ecolog", "sostenib", "energia")),
+    ("Innovación y transferencia tecnológica", ("patente", "spin-off", "spin off", "emprendimiento", "prototipo")),
+    ("Relación universidad-empresa", ("empresa", "sector privado", "industria")),
+    ("Tecnología e innovación digital", ("inteligencia artificial", "digital", "ciberseguridad", "plataforma virtual", "software")),
+    ("Internacionalización", ("internacional", "intercambio", "doble titulacion", "movilidad academica", "extranjer")),
+    ("Infraestructura y campus", ("edificio", "obra", "construccion", "infraestructura", "laboratorio", "sede")),
+    ("Bienestar universitario", ("beca", "bienestar", "salud mental", "apoyo alimentario", "subsidio", "permanencia")),
+    ("Diversidad e inclusión", ("genero", "inclusion", "discapacidad", "indigena", "afro", "lgbt")),
+    ("Cultura y patrimonio", ("museo", "cultura", "arte", "patrimonio", "concierto", "exposicion", "festival")),
+    ("Extensión y proyección social", ("comunidad", "territorio", "voluntari", "extension")),
+    ("Investigación y ciencia", ("investigacion", "investigador", "cientific", "estudio", "hallazgo")),
+    ("Formación académica", ("programa", "pregrado", "posgrado", "maestria", "doctorado", "admision", "carrera", "bachiller")),
+    ("Opinión y análisis experto", ("profesor", "experto", "docente", "analista", "columna", "opinion")),
+]
+
+
+def tema_por_palabras_clave(titulo: str, resumen: str) -> str:
+    """Respaldo determinista: SIEMPRE devuelve un tema de la taxonomía."""
+    t = _normalizar(titulo)
+    r = _normalizar(resumen)[:TEXTO_MAX_TEMA]
+    mejor, mejor_puntaje = TEMA_RESIDUAL, 0
+    for tema, claves in _PALABRAS_TEMA:
+        puntaje = sum(3 * t.count(k) + r.count(k) for k in claves)
+        if puntaje > mejor_puntaje:
+            mejor, mejor_puntaje = tema, puntaje
+    return mejor
+
+
+def asegurar_tema(tema: Optional[str], titulo: str = "", resumen: str = "") -> str:
+    """Garantiza que el tema pertenezca a la taxonomía."""
+    if tema in TAXONOMIA_TEMAS:
+        return tema
+    return tema_por_palabras_clave(titulo, resumen)
+
+
+_RE_ESPERA = re.compile(r"try again in\s+((?:\d+(?:\.\d+)?\s*(?:ms|s|m|h)\s*)+)", re.I)
+
+
+def _espera_sugerida(e: Exception) -> float:
+    """Segundos que sugiere la API (cabeceras retry-after o el texto 'try again in 92ms')."""
+    resp = getattr(e, "response", None)
+    headers = getattr(resp, "headers", None) or {}
+    try:
+        if headers.get("retry-after-ms"):
+            return float(headers["retry-after-ms"]) / 1000
+        if headers.get("retry-after"):
+            return float(headers["retry-after"])
+    except (TypeError, ValueError):
+        pass
+    m = _RE_ESPERA.search(str(e))
+    if not m:
+        return 0.0
+    total = 0.0
+    for num, unidad in re.findall(r"(\d+(?:\.\d+)?)\s*(ms|s|m|h)", m.group(1)):
+        total += float(num) * {"ms": 0.001, "s": 1, "m": 60, "h": 3600}[unidad]
+    return total
+
+
+def _es_sin_cuota(e: Exception) -> bool:
+    """429 por falta de saldo/cuota: no se arregla reintentando."""
+    cuerpo = getattr(e, "body", None)
+    code = (cuerpo or {}).get("code") if isinstance(cuerpo, dict) else None
+    return getattr(e, "code", None) == "insufficient_quota" or code == "insufficient_quota" \
+        or "insufficient_quota" in str(e) or "exceeded your current quota" in str(e).lower()
+
+
+class LimitadorTPM:
+    """Ventana deslizante de 60 s: no deja salir peticiones que superen `limite` tokens/minuto."""
+
+    def __init__(self, limite: Optional[int]):
+        self.limite = limite if limite and limite > 0 else None
+        self._eventos: collections.deque = collections.deque()
+        self._usados = 0
+        self._lock = asyncio.Lock()
+
+    async def reservar(self, tokens: int) -> None:
+        if self.limite is None:
+            return
+        tokens = min(tokens, self.limite)
+        async with self._lock:
+            while True:
+                ahora = time.monotonic()
+                while self._eventos and ahora - self._eventos[0][0] >= 60:
+                    self._usados -= self._eventos.popleft()[1]
+                if self._usados + tokens <= self.limite:
+                    self._eventos.append((ahora, tokens))
+                    self._usados += tokens
+                    return
+                await asyncio.sleep(max(60 - (ahora - self._eventos[0][0]), 0.05))
+
+
+def _estimar_tokens(kwargs: dict) -> int:
+    chars = sum(len(m["content"]) for m in kwargs["messages"])
+    return int(chars / 3) + kwargs.get("max_completion_tokens", 0)
+
+
 def costo_usd(modelo: Optional[str], tokens_in: int, tokens_out: int) -> float:
     p_in, p_out = PRECIOS_MODELO.get(modelo or "", PRECIO_DESCONOCIDO)
     return tokens_in / 1e6 * p_in + tokens_out / 1e6 * p_out
@@ -277,12 +437,18 @@ class ClasificadorIA:
         modelo: Optional[str] = None,
         concurrencia: int = 30,
         base_url: Optional[str] = None,
+        voceros_positivos: Optional[Sequence[str]] = None,
+        tpm_limite: Optional[int] = TPM_LIMITE_DEFECTO,
+        espera_base: float = 1.0,
     ):
         self.api_key = api_key
         self.base_url = base_url
         self.marca = marca.strip()
         self.aliases = [a.strip() for a in (aliases or []) if a.strip()]
         self.concurrencia = concurrencia
+        self.voceros = [v.strip() for v in (
+            VOCEROS_POSITIVOS_DEFECTO if voceros_positivos is None else voceros_positivos
+        ) if v and v.strip()]
         # Siempre Luna: un modelo forzado solo se acepta si pertenece a la familia Luna.
         if modelo and "luna" in modelo.lower():
             self.cadena = [modelo] + [m for m in CADENA_MODELOS if m != modelo]
@@ -292,17 +458,39 @@ class ClasificadorIA:
         self.tokens_in = 0
         self.tokens_out = 0
         self.errores: List[str] = []
+        self.avisos: List[str] = []
+        self.reintentos_429 = 0
+        self.tonos_por_vocero = 0
         self._client: Optional[AsyncOpenAI] = None
         self._sin_reasoning_effort = False
+        self._tpm = LimitadorTPM(tpm_limite)
+        self._espera_base = espera_base
+        self._pausa_hasta = 0.0   # pausa GLOBAL: tras un 429 todas las tareas esperan
 
         alias_txt = f" (también llamada: {', '.join(self.aliases)})" if self.aliases else ""
-        self._sistema_tono = SISTEMA_TONO_TPL.format(marca=self.marca, aliases=alias_txt)
+        if self.voceros:
+            regla = (
+                "VOCEROS: las intervenciones, declaraciones o análisis de "
+                + ", ".join(self.voceros)
+                + " (vocero oficial de la institución) son SIEMPRE POSITIVAS, aunque hable de "
+                "problemas o retos del país o del sector: la institución aparece como referente.\n"
+            )
+        else:
+            regla = ""
+        regla += (
+            "Cuando un directivo de la institución (rector, vicerrector, decano) analiza un reto o "
+            "problema del país o del sector educativo, NO es negativo para la institución.\n"
+        )
+        self._sistema_tono = SISTEMA_TONO_TPL.format(
+            marca=self.marca, aliases=alias_txt, regla_voceros=regla
+        )
 
     # ── infraestructura ──────────────────────────────────────────────────────
     def _cliente(self) -> AsyncOpenAI:
         if self._client is None:
+            # Los 429 los maneja _crear (pausa global + espera exponencial); el SDK solo reintenta 1 vez.
             self._client = AsyncOpenAI(
-                api_key=self.api_key, base_url=self.base_url, max_retries=4, timeout=90.0
+                api_key=self.api_key, base_url=self.base_url, max_retries=1, timeout=90.0
             )
         return self._client
 
@@ -314,6 +502,39 @@ class ClasificadorIA:
     @property
     def costo(self) -> float:
         return costo_usd(self.modelo_activo or self.cadena[0], self.tokens_in, self.tokens_out)
+
+    async def _esperar_pausa(self) -> None:
+        while True:
+            falta = self._pausa_hasta - time.monotonic()
+            if falta <= 0:
+                return
+            await asyncio.sleep(falta)
+
+    async def _crear(self, kwargs: dict):
+        """chat.completions.create con control de TPM y reintentos ante 429 / 5xx / timeout."""
+        intento = 0
+        while True:
+            await self._esperar_pausa()
+            await self._tpm.reservar(_estimar_tokens(kwargs))
+            try:
+                return await self._cliente().chat.completions.create(**kwargs)
+            except RateLimitError as e:
+                if _es_sin_cuota(e):
+                    raise ErrorClasificador(
+                        f"La cuenta de OpenAI no tiene saldo/cuota disponible: {e}"
+                    ) from e
+                intento += 1
+                self.reintentos_429 += 1
+                if intento > MAX_REINTENTOS_429:
+                    raise
+                espera = max(_espera_sugerida(e), self._espera_base * 2 ** (intento - 1))
+                espera = min(espera, 60.0) + random.uniform(0, self._espera_base)
+                self._pausa_hasta = max(self._pausa_hasta, time.monotonic() + espera)
+            except (APITimeoutError, InternalServerError):
+                intento += 1
+                if intento > 4:
+                    raise
+                await asyncio.sleep(min(self._espera_base * 2 ** intento, 30.0))
 
     async def _json(self, sistema: str, usuario: str, nombre: str, esquema: dict, campo: str) -> str:
         """Llama al modelo con salida estructurada y devuelve el valor de `campo`."""
@@ -335,7 +556,7 @@ class ClasificadorIA:
                 kwargs["reasoning_effort"] = "none"   # clasificación: sin "pensar", más rápido y barato
             for _ in range(2):
                 try:
-                    resp = await self._cliente().chat.completions.create(**kwargs)
+                    resp = await self._crear(kwargs)
                 except BadRequestError as e:
                     if getattr(e, "param", None) == "reasoning_effort" and "reasoning_effort" in kwargs:
                         kwargs.pop("reasoning_effort")
@@ -350,6 +571,8 @@ class ClasificadorIA:
                     break
                 except AuthenticationError as e:
                     raise ErrorClasificador(f"OPENAI_API_KEY inválida o sin permisos: {e}") from e
+                except APITimeoutError:
+                    raise   # transitorio: se reintenta en las rondas finales
                 except APIConnectionError as e:
                     raise ErrorClasificador(f"No hay conexión con la API de OpenAI: {e}") from e
 
@@ -385,43 +608,89 @@ class ClasificadorIA:
         resumenes: Sequence[str],
         construir: Callable[[str, str], tuple],
         on_progress: Optional[Callable[[int, int], None]],
+        fijos: Optional[Dict[int, str]] = None,
     ) -> List[str]:
+        """Clasifica cada texto único. `fijos` = {índice: valor} que no necesitan la API."""
         n = len(titulos)
+        fijos = fijos or {}
         claves = [_clave_texto(titulos[i], resumenes[i]) for i in range(n)]
         unicos: Dict[str, int] = {}
         for i, k in enumerate(claves):
-            unicos.setdefault(k, i)
+            if i not in fijos:
+                unicos.setdefault(k, i)
 
-        sem = asyncio.Semaphore(self.concurrencia)
         resultados: Dict[str, str] = {}
+        fallos: Dict[str, Exception] = {}
         hechos = 0
         total = len(unicos)
 
-        async def trabajar(k: str, i: int):
+        async def trabajar(sem: asyncio.Semaphore, k: str, i: int, contar: bool):
             nonlocal hechos
             async with sem:
                 try:
                     resultados[k] = await self._json(*construir(str(titulos[i] or ""), str(resumenes[i] or "")))
+                    fallos.pop(k, None)
                 except ErrorClasificador:
                     raise
-                except Exception as e:  # error puntual de una noticia: se registra, no se oculta
-                    self.errores.append(f"fila {i + 2}: {type(e).__name__}: {e}")
-                    resultados[k] = SIN_CLASIFICAR
-                hechos += 1
-                if on_progress:
-                    on_progress(hechos, total)
+                except Exception as e:  # error puntual: se reintenta en las rondas finales
+                    fallos[k] = e
+                if contar:
+                    hechos += 1
+                    if on_progress:
+                        on_progress(hechos, total)
 
-        await asyncio.gather(*(trabajar(k, i) for k, i in unicos.items()))
-        return [resultados[k] for k in claves]
+        sem = asyncio.Semaphore(self.concurrencia)
+        await asyncio.gather(*(trabajar(sem, k, i, True) for k, i in unicos.items()))
+
+        # Rondas de reintento con menos concurrencia para lo que falló (429 agotados, timeouts...).
+        for ronda in range(RONDAS_REINTENTO):
+            if not fallos:
+                break
+            await asyncio.sleep(self._espera_base * 5 * (ronda + 1))
+            sem = asyncio.Semaphore(CONCURRENCIA_REINTENTO)
+            await asyncio.gather(*(trabajar(sem, k, unicos[k], False) for k in list(fallos)))
+
+        for k, e in fallos.items():
+            self.errores.append(f"fila {unicos[k] + 2}: {type(e).__name__}: {e}")
+            resultados[k] = SIN_CLASIFICAR
+        return [fijos[i] if i in fijos else resultados[claves[i]] for i in range(n)]
 
     async def clasificar_temas(self, titulos, resumenes, on_progress=None) -> List[str]:
+        """Siempre devuelve temas de la taxonomía (nunca "Sin clasificar")."""
+        titulos, resumenes = list(titulos), list(resumenes)
+
         def construir(t: str, r: str):
             usuario = f"TÍTULO:\n{t[:300]}\n\nRESUMEN / CUERPO:\n{r[:TEXTO_MAX_TEMA]}"
             return SISTEMA_TEMA, usuario, "tema_ia", ESQUEMA_TEMA, "tema"
-        return await self._lote(list(titulos), list(resumenes), construir, on_progress)
+        n_err = len(self.errores)
+        temas = await self._lote(titulos, resumenes, construir, on_progress)
+        # Las noticias que la API no pudo clasificar reciben un tema por palabras clave.
+        nuevos = self.errores[n_err:]
+        del self.errores[n_err:]
+        for i, tema in enumerate(temas):
+            if tema not in TAXONOMIA_TEMAS:
+                temas[i] = tema_por_palabras_clave(titulos[i], resumenes[i])
+        if nuevos:
+            self.avisos.append(
+                f"{len(nuevos)} tema(s) asignados por palabras clave porque la API no respondió "
+                f"tras {RONDAS_REINTENTO + 1} intentos:\n" + "\n".join(nuevos[:50])
+            )
+        return temas
+
+    def tono_fijo(self, titulo: str, resumen: str) -> Optional[str]:
+        """Tono determinado por reglas (voceros positivos) o None si debe decidirlo el modelo."""
+        return "Positivo" if menciona_vocero(titulo, resumen, self.voceros) else None
 
     async def clasificar_tonos(self, titulos, resumenes, on_progress=None) -> List[str]:
+        titulos, resumenes = list(titulos), list(resumenes)
+        fijos = {}
+        for i in range(len(titulos)):
+            tono = self.tono_fijo(titulos[i], resumenes[i])
+            if tono:
+                fijos[i] = tono
+        self.tonos_por_vocero += len(fijos)
+
         def construir(t: str, r: str):
             usuario = f"TÍTULO:\n{t[:300]}\n\nRESUMEN / CUERPO:\n{r[:TEXTO_MAX_TONO]}"
             return self._sistema_tono, usuario, "tono_ia", ESQUEMA_TONO, "tono"
-        return await self._lote(list(titulos), list(resumenes), construir, on_progress)
+        return await self._lote(titulos, resumenes, construir, on_progress, fijos)
